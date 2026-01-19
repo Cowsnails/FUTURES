@@ -298,12 +298,22 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                     # Convert DataFrame to list of dicts
                     data_list = historical_data.to_dict('records')
 
-                    # Send historical data
+                    # Calculate indicators if any are active
+                    indicators_data = {}
+                    if indicator_manager and len(indicator_manager.active_indicators) > 0:
+                        try:
+                            indicators_data = indicator_manager.calculate_all(historical_data)
+                            logger.info(f"Calculated {len(indicators_data)} indicators for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Error calculating indicators: {e}")
+
+                    # Send historical data with indicators
                     await connection_manager.send_to_client(websocket, {
                         'type': 'historical',
                         'data': data_list,
                         'symbol': symbol,
-                        'bar_count': len(data_list)
+                        'bar_count': len(data_list),
+                        'indicators': indicators_data
                     })
 
                     logger.info(f"Sent {len(data_list)} historical bars to client")
