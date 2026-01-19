@@ -8,7 +8,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Set, Dict, Optional
+from typing import Set, Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -21,6 +21,7 @@ from .contracts import get_current_contract, get_contract_info
 from .historical_data import HistoricalDataFetcher
 from .realtime import RealtimeManager
 from .cache import DataCache
+from .indicators import IndicatorManager, list_available_indicators
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +40,7 @@ ib_manager: Optional[IBConnectionManager] = None
 realtime_manager: Optional[RealtimeManager] = None
 historical_fetcher: Optional[HistoricalDataFetcher] = None
 cache: Optional[DataCache] = None
+indicator_manager: Optional[IndicatorManager] = None
 
 
 class ConnectionManager:
@@ -99,12 +101,15 @@ connection_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
-    global ib_manager, realtime_manager, historical_fetcher, cache
+    global ib_manager, realtime_manager, historical_fetcher, cache, indicator_manager
 
     logger.info("Starting application...")
 
     # Initialize cache
     cache = DataCache(cache_dir=config['data']['cache_dir'])
+
+    # Initialize indicator manager
+    indicator_manager = IndicatorManager()
 
     # Connect to IB Gateway
     ib_manager = IBConnectionManager(
@@ -388,6 +393,96 @@ async def get_statistics():
     }
 
     return stats
+
+
+@app.get("/api/indicators")
+async def get_available_indicators():
+    """Get list of available indicators"""
+    return {
+        "indicators": list_available_indicators()
+    }
+
+
+@app.get("/api/indicators/active")
+async def get_active_indicators():
+    """Get list of active indicators"""
+    if not indicator_manager:
+        raise HTTPException(status_code=503, detail="Indicator manager not initialized")
+
+    return {
+        "indicators": indicator_manager.list_active_indicators()
+    }
+
+
+@app.post("/api/indicators/{indicator_type}")
+async def add_indicator(
+    indicator_type: str,
+    params: Optional[Dict[str, Any]] = None
+):
+    """
+    Add an indicator.
+
+    Example:
+        POST /api/indicators/sma
+        Body: {"period": 20, "color": "#2962FF"}
+    """
+    if not indicator_manager:
+        raise HTTPException(status_code=503, detail="Indicator manager not initialized")
+
+    indicator = indicator_manager.add_indicator(indicator_type, params)
+
+    if indicator:
+        return {
+            "success": True,
+            "indicator": indicator.to_dict()
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to add indicator: {indicator_type}"
+        )
+
+
+@app.delete("/api/indicators/{indicator_id}")
+async def remove_indicator(indicator_id: str):
+    """Remove an indicator by ID"""
+    if not indicator_manager:
+        raise HTTPException(status_code=503, detail="Indicator manager not initialized")
+
+    success = indicator_manager.remove_indicator(indicator_id)
+
+    if success:
+        return {"success": True, "message": f"Indicator {indicator_id} removed"}
+    else:
+        raise HTTPException(status_code=404, detail=f"Indicator not found: {indicator_id}")
+
+
+@app.get("/api/indicators/calculate/{symbol}")
+async def calculate_indicators(symbol: str):
+    """Calculate all active indicators for a symbol"""
+    if not indicator_manager:
+        raise HTTPException(status_code=503, detail="Indicator manager not initialized")
+
+    if not cache:
+        raise HTTPException(status_code=503, detail="Cache not initialized")
+
+    # Load cached data
+    cached_data = cache.load(symbol, bar_size='1min', max_age_hours=24)
+
+    if cached_data is None or len(cached_data) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached data available for {symbol}"
+        )
+
+    # Calculate all indicators
+    results = indicator_manager.calculate_all(cached_data)
+
+    return {
+        "symbol": symbol,
+        "indicators": results,
+        "data_points": len(cached_data)
+    }
 
 
 if __name__ == '__main__':
