@@ -1,0 +1,401 @@
+"""
+FastAPI WebSocket Backend for Futures Charting
+
+Provides WebSocket streaming of real-time and historical market data.
+"""
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Set, Dict, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import yaml
+from pathlib import Path
+
+from .ib_service import IBConnectionManager
+from .contracts import get_current_contract, get_contract_info
+from .historical_data import HistoricalDataFetcher
+from .realtime import RealtimeManager
+from .cache import DataCache
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Load configuration
+CONFIG_PATH = Path(__file__).parent.parent / 'config.yaml'
+with open(CONFIG_PATH, 'r') as f:
+    config = yaml.safe_load(f)
+
+# Global instances
+ib_manager: Optional[IBConnectionManager] = None
+realtime_manager: Optional[RealtimeManager] = None
+historical_fetcher: Optional[HistoricalDataFetcher] = None
+cache: Optional[DataCache] = None
+
+
+class ConnectionManager:
+    """Manages WebSocket connections to clients"""
+
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, symbol: str):
+        """Accept a new WebSocket connection"""
+        await websocket.accept()
+
+        if symbol not in self.active_connections:
+            self.active_connections[symbol] = set()
+
+        self.active_connections[symbol].add(websocket)
+        logger.info(f"Client connected to {symbol} (total: {len(self.active_connections[symbol])})")
+
+    def disconnect(self, websocket: WebSocket, symbol: str):
+        """Remove a WebSocket connection"""
+        if symbol in self.active_connections:
+            self.active_connections[symbol].discard(websocket)
+            logger.info(f"Client disconnected from {symbol} (remaining: {len(self.active_connections[symbol])})")
+
+            # Clean up empty symbol entries
+            if not self.active_connections[symbol]:
+                del self.active_connections[symbol]
+
+    async def send_to_client(self, websocket: WebSocket, message: dict):
+        """Send message to a specific client"""
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Error sending to client: {e}")
+
+    async def broadcast(self, symbol: str, message: dict):
+        """Broadcast message to all clients subscribed to symbol"""
+        if symbol not in self.active_connections:
+            return
+
+        disconnected = set()
+
+        for websocket in self.active_connections[symbol]:
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                logger.error(f"Error broadcasting to client: {e}")
+                disconnected.add(websocket)
+
+        # Clean up disconnected clients
+        for websocket in disconnected:
+            self.disconnect(websocket, symbol)
+
+
+connection_manager = ConnectionManager()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: startup and shutdown"""
+    global ib_manager, realtime_manager, historical_fetcher, cache
+
+    logger.info("Starting application...")
+
+    # Initialize cache
+    cache = DataCache(cache_dir=config['data']['cache_dir'])
+
+    # Connect to IB Gateway
+    ib_manager = IBConnectionManager(
+        host=config['ib_gateway']['host'],
+        port=config['ib_gateway']['port'],
+        client_id=config['ib_gateway']['client_id'],
+        timeout=config['ib_gateway']['timeout']
+    )
+
+    connected = await ib_manager.connect()
+
+    if not connected:
+        logger.error("Failed to connect to IB Gateway - application will not function")
+        # Continue anyway to allow health checks
+    else:
+        # Initialize real-time manager (use keepUpToDate by default)
+        realtime_manager = RealtimeManager(
+            ib=ib_manager.ib,
+            use_tick_by_tick=False,  # Can be made configurable
+            bar_size_minutes=1
+        )
+
+        # Initialize historical data fetcher
+        historical_fetcher = HistoricalDataFetcher(
+            ib=ib_manager.ib,
+            cache=cache
+        )
+
+        logger.info("Application started successfully")
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down application...")
+
+    if realtime_manager:
+        realtime_manager.stop_all_streams()
+
+    if ib_manager:
+        ib_manager.disconnect()
+
+    logger.info("Application shutdown complete")
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="Futures Charting API",
+    description="Real-time futures charting with IB Gateway",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files
+static_dir = Path(__file__).parent.parent / 'frontend' / 'static'
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/")
+async def root():
+    """Serve the main HTML page"""
+    html_path = Path(__file__).parent.parent / 'frontend' / 'templates' / 'index.html'
+
+    if html_path.exists():
+        return FileResponse(html_path)
+    else:
+        return {"message": "Futures Charting API", "status": "running"}
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint.
+
+    Returns application health status including IB Gateway connection.
+    """
+    if not ib_manager:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "reason": "IB manager not initialized"
+            }
+        )
+
+    health = ib_manager.get_health_status()
+
+    is_healthy = health.get('connected', False)
+
+    # Check data staleness if we have subscriptions
+    if 'data_stale' in health and health['data_stale']:
+        is_healthy = False
+
+    status_code = 200 if is_healthy else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "healthy" if is_healthy else "unhealthy",
+            "ib_gateway": health,
+            "realtime_streams": (
+                len(realtime_manager.streamers) if realtime_manager else 0
+            ),
+            "cache_info": cache.get_cache_size() if cache else {}
+        }
+    )
+
+
+@app.get("/api/contracts")
+async def list_contracts():
+    """List available contracts"""
+    return {
+        "contracts": [
+            {
+                "symbol": symbol,
+                **get_contract_info(symbol)
+            }
+            for symbol in ['MNQ', 'MES', 'MGC']
+        ]
+    }
+
+
+@app.get("/api/cache/{symbol}")
+async def get_cache_info(symbol: str):
+    """Get cache information for a symbol"""
+    if not cache:
+        raise HTTPException(status_code=503, detail="Cache not initialized")
+
+    metadata = cache.get_metadata(symbol, '1min')
+
+    if metadata:
+        return metadata
+    else:
+        raise HTTPException(status_code=404, detail=f"No cache found for {symbol}")
+
+
+@app.websocket("/ws/{symbol}")
+async def websocket_endpoint(websocket: WebSocket, symbol: str):
+    """
+    WebSocket endpoint for real-time market data.
+
+    Protocol:
+    - Sends historical data on connection
+    - Streams real-time bar updates
+    - Messages: {type: 'historical'|'bar_update', data: {...}, is_new_bar: bool}
+    """
+    # Validate symbol
+    if symbol not in ['MNQ', 'MES', 'MGC']:
+        await websocket.close(code=1003, reason=f"Invalid symbol: {symbol}")
+        return
+
+    # Check if IB Gateway is connected
+    if not ib_manager or not ib_manager.is_connected():
+        await websocket.close(code=1011, reason="IB Gateway not connected")
+        return
+
+    # Accept connection
+    await connection_manager.connect(websocket, symbol)
+
+    try:
+        # Get contract
+        contract = get_current_contract(symbol)
+        await ib_manager.ib.qualifyContractsAsync(contract)
+
+        logger.info(f"Starting data stream for {symbol}")
+
+        # Step 1: Send cached or fetch historical data
+        if historical_fetcher:
+            try:
+                historical_data = await historical_fetcher.fetch_year(
+                    contract,
+                    use_cache=True,
+                    cache_max_age_hours=config['data']['cache_max_age_hours']
+                )
+
+                if historical_data is not None and len(historical_data) > 0:
+                    # Convert DataFrame to list of dicts
+                    data_list = historical_data.to_dict('records')
+
+                    # Send historical data
+                    await connection_manager.send_to_client(websocket, {
+                        'type': 'historical',
+                        'data': data_list,
+                        'symbol': symbol,
+                        'bar_count': len(data_list)
+                    })
+
+                    logger.info(f"Sent {len(data_list)} historical bars to client")
+                else:
+                    logger.warning(f"No historical data available for {symbol}")
+
+            except Exception as e:
+                logger.error(f"Error fetching historical data: {e}")
+                await connection_manager.send_to_client(websocket, {
+                    'type': 'error',
+                    'message': f"Failed to fetch historical data: {str(e)}"
+                })
+
+        # Step 2: Start real-time streaming
+        if realtime_manager:
+            # Callback for bar updates
+            async def on_bar_update(bar_data: dict, is_new_bar: bool):
+                """Called on every bar update"""
+                await connection_manager.broadcast(symbol, {
+                    'type': 'bar_update',
+                    'data': bar_data,
+                    'is_new_bar': is_new_bar,
+                    'symbol': symbol
+                })
+
+            # Start streaming
+            success = await realtime_manager.start_stream(contract, on_bar_update)
+
+            if success:
+                logger.info(f"Real-time stream started for {symbol}")
+            else:
+                logger.error(f"Failed to start real-time stream for {symbol}")
+                await connection_manager.send_to_client(websocket, {
+                    'type': 'error',
+                    'message': "Failed to start real-time stream"
+                })
+
+        # Keep connection alive and handle incoming messages
+        while True:
+            try:
+                # Receive messages from client (for keepalive or commands)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+
+                # Handle client commands here if needed
+                # For now, just log
+                logger.debug(f"Received from client: {data}")
+
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await websocket.send_json({'type': 'ping'})
+
+    except WebSocketDisconnect:
+        logger.info(f"Client disconnected from {symbol}")
+
+    except Exception as e:
+        logger.error(f"WebSocket error for {symbol}: {e}")
+
+    finally:
+        # Clean up
+        connection_manager.disconnect(websocket, symbol)
+
+        # Stop streaming if no more clients for this symbol
+        if realtime_manager and symbol not in connection_manager.active_connections:
+            realtime_manager.stop_stream(symbol)
+            logger.info(f"Stopped real-time stream for {symbol} (no clients)")
+
+
+@app.get("/api/statistics")
+async def get_statistics():
+    """Get application statistics"""
+    stats = {
+        "ib_gateway": ib_manager.get_health_status() if ib_manager else {},
+        "realtime_streams": (
+            realtime_manager.get_all_statistics() if realtime_manager else {}
+        ),
+        "historical_fetcher": (
+            historical_fetcher.get_statistics() if historical_fetcher else {}
+        ),
+        "cache": {
+            "size": cache.get_cache_size() if cache else {},
+            "symbols": cache.list_cached_symbols() if cache else []
+        },
+        "active_connections": {
+            symbol: len(connections)
+            for symbol, connections in connection_manager.active_connections.items()
+        }
+    }
+
+    return stats
+
+
+if __name__ == '__main__':
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=config['server']['host'],
+        port=config['server']['port'],
+        log_level=config['server']['log_level']
+    )
