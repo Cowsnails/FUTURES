@@ -44,10 +44,22 @@ indicator_manager: Optional[IndicatorManager] = None
 
 
 class ConnectionManager:
-    """Manages WebSocket connections to clients"""
+    """Manages WebSocket connections to clients with message batching"""
 
-    def __init__(self):
+    def __init__(self, batch_interval: float = 0.1, max_batch_size: int = 50):
+        """
+        Initialize connection manager with batching support.
+
+        Args:
+            batch_interval: Time in seconds to wait before sending batched messages (default: 0.1s)
+            max_batch_size: Maximum number of messages to batch before sending (default: 50)
+        """
         self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self.message_queues: Dict[str, Dict[WebSocket, list]] = {}
+        self.batch_interval = batch_interval
+        self.max_batch_size = max_batch_size
+        self.batch_tasks: Dict[str, asyncio.Task] = {}
+        self.batching_enabled = True
 
     async def connect(self, websocket: WebSocket, symbol: str):
         """Accept a new WebSocket connection"""
@@ -55,44 +67,160 @@ class ConnectionManager:
 
         if symbol not in self.active_connections:
             self.active_connections[symbol] = set()
+            self.message_queues[symbol] = {}
 
         self.active_connections[symbol].add(websocket)
+        self.message_queues[symbol][websocket] = []
+
         logger.info(f"Client connected to {symbol} (total: {len(self.active_connections[symbol])})")
+
+        # Start batch processor for this symbol if not already running
+        if symbol not in self.batch_tasks and self.batching_enabled:
+            self.batch_tasks[symbol] = asyncio.create_task(self._batch_processor(symbol))
 
     def disconnect(self, websocket: WebSocket, symbol: str):
         """Remove a WebSocket connection"""
         if symbol in self.active_connections:
             self.active_connections[symbol].discard(websocket)
+
+            # Clean up message queue
+            if symbol in self.message_queues and websocket in self.message_queues[symbol]:
+                del self.message_queues[symbol][websocket]
+
             logger.info(f"Client disconnected from {symbol} (remaining: {len(self.active_connections[symbol])})")
 
             # Clean up empty symbol entries
             if not self.active_connections[symbol]:
                 del self.active_connections[symbol]
 
-    async def send_to_client(self, websocket: WebSocket, message: dict):
-        """Send message to a specific client"""
+                # Stop batch processor
+                if symbol in self.batch_tasks:
+                    self.batch_tasks[symbol].cancel()
+                    del self.batch_tasks[symbol]
+
+                if symbol in self.message_queues:
+                    del self.message_queues[symbol]
+
+    async def send_to_client(self, websocket: WebSocket, message: dict, immediate: bool = True):
+        """
+        Send message to a specific client.
+
+        Args:
+            websocket: WebSocket connection
+            message: Message to send
+            immediate: If True, send immediately. If False, batch the message.
+        """
         try:
-            await websocket.send_json(message)
+            if immediate or not self.batching_enabled:
+                await websocket.send_json(message)
+            else:
+                # Find symbol for this websocket
+                for symbol, connections in self.active_connections.items():
+                    if websocket in connections:
+                        if symbol in self.message_queues and websocket in self.message_queues[symbol]:
+                            self.message_queues[symbol][websocket].append(message)
+
+                            # If batch is full, send immediately
+                            if len(self.message_queues[symbol][websocket]) >= self.max_batch_size:
+                                await self._flush_client_queue(symbol, websocket)
+                        break
         except Exception as e:
             logger.error(f"Error sending to client: {e}")
 
-    async def broadcast(self, symbol: str, message: dict):
-        """Broadcast message to all clients subscribed to symbol"""
+    async def broadcast(self, symbol: str, message: dict, immediate: bool = False):
+        """
+        Broadcast message to all clients subscribed to symbol.
+
+        Args:
+            symbol: Symbol to broadcast to
+            message: Message to send
+            immediate: If True, send immediately. If False, batch the message.
+        """
         if symbol not in self.active_connections:
             return
 
-        disconnected = set()
+        if immediate or not self.batching_enabled:
+            # Send immediately without batching
+            disconnected = set()
 
-        for websocket in self.active_connections[symbol]:
-            try:
-                await websocket.send_json(message)
-            except Exception as e:
-                logger.error(f"Error broadcasting to client: {e}")
-                disconnected.add(websocket)
+            for websocket in self.active_connections[symbol]:
+                try:
+                    await websocket.send_json(message)
+                except Exception as e:
+                    logger.error(f"Error broadcasting to client: {e}")
+                    disconnected.add(websocket)
 
-        # Clean up disconnected clients
-        for websocket in disconnected:
+            # Clean up disconnected clients
+            for websocket in disconnected:
+                self.disconnect(websocket, symbol)
+        else:
+            # Add to batch queues
+            if symbol in self.message_queues:
+                for websocket in self.active_connections[symbol]:
+                    if websocket in self.message_queues[symbol]:
+                        self.message_queues[symbol][websocket].append(message)
+
+                        # If batch is full, flush immediately
+                        if len(self.message_queues[symbol][websocket]) >= self.max_batch_size:
+                            await self._flush_client_queue(symbol, websocket)
+
+    async def _flush_client_queue(self, symbol: str, websocket: WebSocket):
+        """Flush message queue for a specific client"""
+        if symbol not in self.message_queues or websocket not in self.message_queues[symbol]:
+            return
+
+        messages = self.message_queues[symbol][websocket]
+        if not messages:
+            return
+
+        try:
+            # Send batched messages
+            if len(messages) == 1:
+                await websocket.send_json(messages[0])
+            else:
+                await websocket.send_json({
+                    'type': 'batch',
+                    'messages': messages,
+                    'count': len(messages)
+                })
+
+            # Clear queue
+            self.message_queues[symbol][websocket] = []
+
+        except Exception as e:
+            logger.error(f"Error flushing client queue: {e}")
             self.disconnect(websocket, symbol)
+
+    async def _batch_processor(self, symbol: str):
+        """Background task to flush message queues at regular intervals"""
+        try:
+            while True:
+                await asyncio.sleep(self.batch_interval)
+
+                if symbol not in self.message_queues:
+                    break
+
+                # Flush all client queues for this symbol
+                disconnected = set()
+                for websocket in list(self.message_queues[symbol].keys()):
+                    try:
+                        await self._flush_client_queue(symbol, websocket)
+                    except Exception as e:
+                        logger.error(f"Error in batch processor: {e}")
+                        disconnected.add(websocket)
+
+                # Clean up disconnected clients
+                for websocket in disconnected:
+                    self.disconnect(websocket, symbol)
+
+        except asyncio.CancelledError:
+            # Final flush before shutdown
+            if symbol in self.message_queues:
+                for websocket in list(self.message_queues[symbol].keys()):
+                    try:
+                        await self._flush_client_queue(symbol, websocket)
+                    except:
+                        pass
 
 
 connection_manager = ConnectionManager()
