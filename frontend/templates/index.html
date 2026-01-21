@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Futures Chart - Real-Time Trading</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: #131722;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            color: #d1d4dc;
+            overflow: hidden;
+        }
+
+        #chart-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        #chart {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Status bar */
+        .status-bar {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .status-indicator {
+            padding: 8px 16px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #758696;
+        }
+
+        .status-dot.connecting {
+            background-color: #f0ad4e;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .status-dot.connected {
+            background-color: #26a69a;
+        }
+
+        .status-dot.disconnected {
+            background-color: #ef5350;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Symbol selector */
+        .symbol-selector {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 100;
+        }
+
+        .symbol-selector select {
+            padding: 8px 16px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            color: #d1d4dc;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .symbol-selector select:hover {
+            border-color: #3a3e49;
+        }
+
+        .symbol-selector select option {
+            background: #1a1d27;
+            color: #d1d4dc;
+        }
+
+        /* Loading overlay */
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(19, 23, 34, 0.95);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 200;
+            transition: opacity 0.3s;
+        }
+
+        .loading-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid #2a2e39;
+            border-top-color: #26a69a;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #758696;
+        }
+
+        /* Error message */
+        .error-message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(239, 83, 80, 0.95);
+            color: white;
+            padding: 20px 30px;
+            border-radius: 8px;
+            font-size: 14px;
+            max-width: 400px;
+            text-align: center;
+            z-index: 300;
+            display: none;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        /* Info panel */
+        .info-panel {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 100;
+            padding: 8px 16px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            font-size: 11px;
+            color: #758696;
+            display: none;
+        }
+
+        /* Indicator Controls */
+        .indicator-controls {
+            position: absolute;
+            top: 50px;
+            right: 10px;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .indicator-btn {
+            padding: 6px 12px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 4px;
+            color: #d1d4dc;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: left;
+        }
+
+        .indicator-btn:hover {
+            background: rgba(41, 98, 255, 0.2);
+            border-color: #2962FF;
+        }
+
+        .indicator-btn.active {
+            background: rgba(41, 98, 255, 0.3);
+            border-color: #2962FF;
+            color: #2962FF;
+        }
+
+        .indicator-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div id="chart-container">
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Connecting...</span>
+            </div>
+            <div class="status-indicator" id="bar-count" style="display: none;">
+                <span>Bars: <strong id="bar-count-value">0</strong></span>
+            </div>
+        </div>
+
+        <!-- Symbol Selector -->
+        <div class="symbol-selector">
+            <select id="symbol-select">
+                <option value="MNQ" selected>MNQ - Micro E-mini Nasdaq-100</option>
+                <option value="MES">MES - Micro E-mini S&P 500</option>
+                <option value="MGC">MGC - Micro Gold</option>
+            </select>
+        </div>
+
+        <!-- Indicator Controls -->
+        <div class="indicator-controls">
+            <button class="indicator-btn" data-indicator="sma" data-params='{"period":20}'>SMA(20)</button>
+            <button class="indicator-btn" data-indicator="ema" data-params='{"period":20}'>EMA(20)</button>
+            <button class="indicator-btn" data-indicator="rsi" data-params='{"period":14}'>RSI(14)</button>
+            <button class="indicator-btn" data-indicator="macd" data-params='{}'>MACD</button>
+            <button class="indicator-btn" data-indicator="bb" data-params='{"period":20}'>BB(20)</button>
+        </div>
+
+        <!-- Chart -->
+        <div id="chart"></div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay" id="loading-overlay">
+            <div class="spinner"></div>
+            <div class="loading-text" id="loading-text">Loading historical data...</div>
+        </div>
+
+        <!-- Error Message -->
+        <div class="error-message" id="error-message"></div>
+
+        <!-- Info Panel -->
+        <div class="info-panel" id="info-panel">
+            <span id="info-text"></span>
+        </div>
+    </div>
+
+    <script type="module">
+        import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@5.0.0/dist/lightweight-charts.standalone.production.mjs';
+        import { IndicatorRenderer, IndicatorManager } from '/static/js/indicators.js';
+
+        // ═══════════════════════════════════════════════════════════
+        // TRADINGVIEW EXACT COLOR SCHEME
+        // ═══════════════════════════════════════════════════════════
+        const COLORS = {
+            UP: '#26a69a',              // TradingView green
+            DOWN: '#ef5350',            // TradingView red
+            VOLUME_UP: 'rgba(38, 166, 154, 0.5)',
+            VOLUME_DOWN: 'rgba(239, 83, 80, 0.5)',
+            BACKGROUND: '#131722',
+            TEXT: '#d1d4dc',
+            GRID: '#1e222d',
+            CROSSHAIR: '#758696'
+        };
+
+        // ═══════════════════════════════════════════════════════════
+        // STATE
+        // ═══════════════════════════════════════════════════════════
+        let chart = null;
+        let candleSeries = null;
+        let volumeSeries = null;
+        let ws = null;
+        let currentSymbol = 'MNQ';
+        let reconnectAttempts = 0;
+        let barCount = 0;
+        let indicatorRenderer = null;
+        let indicatorManager = null;
+
+        // ═══════════════════════════════════════════════════════════
+        // CHART INITIALIZATION
+        // ═══════════════════════════════════════════════════════════
+        function initializeChart() {
+            const container = document.getElementById('chart');
+
+            chart = createChart(container, {
+                width: container.clientWidth,
+                height: container.clientHeight,
+                layout: {
+                    background: { type: ColorType.Solid, color: COLORS.BACKGROUND },
+                    textColor: COLORS.TEXT,
+                },
+                grid: {
+                    vertLines: { color: COLORS.GRID },
+                    horzLines: { color: COLORS.GRID },
+                },
+                crosshair: {
+                    vertLine: {
+                        color: COLORS.CROSSHAIR,
+                        labelBackgroundColor: '#2a2e39'
+                    },
+                    horzLine: {
+                        color: COLORS.CROSSHAIR,
+                        labelBackgroundColor: '#2a2e39'
+                    },
+                },
+                rightPriceScale: {
+                    borderColor: '#2a2e39',
+                    scaleMargins: { top: 0.1, bottom: 0.2 },
+                },
+                timeScale: {
+                    borderColor: '#2a2e39',
+                    timeVisible: true,
+                    secondsVisible: false,
+                },
+            });
+
+            // Candlestick series
+            candleSeries = chart.addCandlestickSeries({
+                upColor: COLORS.UP,
+                downColor: COLORS.DOWN,
+                borderVisible: false,
+                wickUpColor: COLORS.UP,
+                wickDownColor: COLORS.DOWN,
+            });
+
+            // Volume series (overlay at bottom)
+            volumeSeries = chart.addHistogramSeries({
+                priceFormat: { type: 'volume' },
+                priceScaleId: '',
+            });
+            volumeSeries.priceScale().applyOptions({
+                scaleMargins: { top: 0.85, bottom: 0 },
+            });
+
+            // Responsive resize
+            window.addEventListener('resize', () => {
+                chart.applyOptions({
+                    width: container.clientWidth,
+                    height: container.clientHeight
+                });
+            });
+
+            // Initialize indicator system
+            indicatorRenderer = new IndicatorRenderer(chart);
+            indicatorManager = new IndicatorManager();
+
+            console.log('Chart initialized');
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // WEBSOCKET CONNECTION
+        // ═══════════════════════════════════════════════════════════
+        function connect(symbol) {
+            currentSymbol = symbol;
+            updateStatus('connecting', `Connecting to ${symbol}...`);
+            showLoading(`Loading ${symbol} data...`);
+
+            // Close existing connection
+            if (ws) {
+                ws.close();
+            }
+
+            // Create WebSocket connection
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/${symbol}`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log(`WebSocket connected to ${symbol}`);
+                updateStatus('connected', `${symbol} Connected`);
+                reconnectAttempts = 0;
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    handleMessage(msg);
+                } catch (error) {
+                    console.error('Error parsing message:', error);
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus('disconnected', 'Disconnected');
+
+                // Attempt reconnection
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+                reconnectAttempts++;
+
+                console.log(`Reconnecting in ${delay/1000}s...`);
+                setTimeout(() => connect(currentSymbol), delay);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                showError('WebSocket connection error. Check IB Gateway connection.');
+            };
+        }
+
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'historical':
+                    handleHistoricalData(msg);
+                    break;
+
+                case 'bar_update':
+                    handleBarUpdate(msg);
+                    break;
+
+                case 'error':
+                    showError(msg.message);
+                    break;
+
+                case 'ping':
+                    // Keepalive - ignore
+                    break;
+
+                default:
+                    console.warn('Unknown message type:', msg.type);
+            }
+        }
+
+        function handleHistoricalData(msg) {
+            console.log(`Received ${msg.data.length} historical bars`);
+
+            // Set candlestick data
+            candleSeries.setData(msg.data);
+
+            // Set volume data with colors
+            const volumeData = msg.data.map(bar => ({
+                time: bar.time,
+                value: bar.volume,
+                color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
+            }));
+            volumeSeries.setData(volumeData);
+
+            // Render indicators if present
+            if (msg.indicators && Object.keys(msg.indicators).length > 0) {
+                console.log(`Rendering ${Object.keys(msg.indicators).length} indicators`);
+                for (const [indicatorId, indicatorData] of Object.entries(msg.indicators)) {
+                    try {
+                        indicatorRenderer.addIndicator(
+                            indicatorId,
+                            indicatorData.config,
+                            indicatorData.data
+                        );
+                    } catch (error) {
+                        console.error(`Error rendering indicator ${indicatorId}:`, error);
+                    }
+                }
+            }
+
+            // Fit content and hide loading
+            chart.timeScale().fitContent();
+            hideLoading();
+
+            // Update bar count
+            barCount = msg.data.length;
+            updateBarCount(barCount);
+
+            console.log('Historical data loaded successfully');
+        }
+
+        function handleBarUpdate(msg) {
+            const bar = msg.data;
+            const isNewBar = msg.is_new_bar;
+
+            // Update candlestick
+            candleSeries.update(bar);
+
+            // Update volume
+            volumeSeries.update({
+                time: bar.time,
+                value: bar.volume,
+                color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
+            });
+
+            // Update bar count if new bar
+            if (isNewBar) {
+                barCount++;
+                updateBarCount(barCount);
+            }
+
+            // Optional: Log updates (can be noisy)
+            // console.log(`Bar ${isNewBar ? 'NEW' : 'UPDATE'}:`, bar);
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // UI UPDATES
+        // ═══════════════════════════════════════════════════════════
+        function updateStatus(state, text) {
+            const dot = document.getElementById('status-dot');
+            const statusText = document.getElementById('status-text');
+
+            dot.className = `status-dot ${state}`;
+            statusText.textContent = text;
+        }
+
+        function updateBarCount(count) {
+            const barCountEl = document.getElementById('bar-count');
+            const barCountValue = document.getElementById('bar-count-value');
+
+            barCountValue.textContent = count.toLocaleString();
+            barCountEl.style.display = 'flex';
+        }
+
+        function showLoading(text) {
+            const overlay = document.getElementById('loading-overlay');
+            const loadingText = document.getElementById('loading-text');
+
+            loadingText.textContent = text;
+            overlay.classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            const overlay = document.getElementById('loading-overlay');
+            overlay.classList.add('hidden');
+        }
+
+        function showError(message) {
+            const errorEl = document.getElementById('error-message');
+            errorEl.textContent = message;
+            errorEl.classList.add('show');
+
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                errorEl.classList.remove('show');
+            }, 5000);
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // EVENT HANDLERS
+        // ═══════════════════════════════════════════════════════════
+        document.getElementById('symbol-select').addEventListener('change', (e) => {
+            const newSymbol = e.target.value;
+            console.log(`Switching to ${newSymbol}`);
+
+            // Clear chart
+            candleSeries.setData([]);
+            volumeSeries.setData([]);
+            barCount = 0;
+            updateBarCount(0);
+
+            // Clear indicators
+            if (indicatorRenderer) {
+                indicatorRenderer.removeAllIndicators();
+            }
+
+            // Reconnect with new symbol
+            connect(newSymbol);
+        });
+
+        // Indicator button handlers
+        document.querySelectorAll('.indicator-btn').forEach(btn => {
+            btn.addEventListener('click', async function() {
+                const indicatorType = this.dataset.indicator;
+                const params = JSON.parse(this.dataset.params || '{}');
+
+                if (this.classList.contains('active')) {
+                    // Remove indicator (not implemented yet - would need to track IDs)
+                    console.log(`Remove indicator ${indicatorType} not yet implemented`);
+                    return;
+                }
+
+                try {
+                    // Add indicator via API
+                    console.log(`Adding indicator: ${indicatorType}`, params);
+                    const result = await indicatorManager.addIndicator(indicatorType, params);
+
+                    if (result) {
+                        this.classList.add('active');
+                        console.log(`Indicator ${indicatorType} added successfully`);
+
+                        // Calculate and render for current symbol
+                        const indicators = await indicatorManager.calculateIndicators(currentSymbol);
+                        if (indicators && indicators[result.id]) {
+                            const indicatorData = indicators[result.id];
+                            indicatorRenderer.addIndicator(
+                                result.id,
+                                indicatorData.config,
+                                indicatorData.data
+                            );
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error adding indicator ${indicatorType}:`, error);
+                    alert(`Failed to add indicator: ${error.message}`);
+                }
+            });
+        });
+
+        // ═══════════════════════════════════════════════════════════
+        // INITIALIZATION
+        // ═══════════════════════════════════════════════════════════
+        window.addEventListener('DOMContentLoaded', () => {
+            console.log('Application starting...');
+
+            // Initialize chart
+            initializeChart();
+
+            // Connect to WebSocket
+            connect(currentSymbol);
+
+            console.log('Application initialized');
+        });
+
+        // ═══════════════════════════════════════════════════════════
+        // CLEANUP
+        // ═══════════════════════════════════════════════════════════
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+    </script>
+</body>
+</html>

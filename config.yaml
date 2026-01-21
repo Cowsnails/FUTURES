@@ -1,0 +1,71 @@
+ib_gateway:
+  host: 127.0.0.1
+  port: 4002  # Paper trading port (4001 for live)
+  client_id: 1
+  timeout: 10
+  auto_restart_time: "11:45 PM"
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  reload: false
+  log_level: info
+
+data:
+  cache_dir: ./data/cache
+  max_bars_in_memory: 10000
+  cache_max_age_hours: 24
+  default_duration: "1 Y"
+  bar_size: "1 min"
+
+contracts:
+  # Futures contracts with expiration dates
+  # Update these quarterly as contracts roll
+  MNQ:
+    symbol: MNQ
+    exchange: CME
+    currency: USD
+    last_trade_date: "202503"  # March 2025
+    description: "Micro E-mini Nasdaq-100"
+    tick_size: 0.25
+    multiplier: 2
+
+  MES:
+    symbol: MES
+    exchange: CME
+    currency: USD
+    last_trade_date: "202503"  # March 2025
+    description: "Micro E-mini S&P 500"
+    tick_size: 0.25
+    multiplier: 5
+
+  MGC:
+    symbol: MGC
+    exchange: COMEX
+    currency: USD
+    last_trade_date: "202502"  # February 2025
+    description: "Micro Gold"
+    tick_size: 0.10
+    multiplier: 10
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: ./logs/app.log
+  max_bytes: 104857600  # 100MB
+  backup_count: 10
+
+performance:
+  data_freshness_threshold_seconds: 30
+  pacing_min_interval_seconds: 15
+  max_historical_requests_per_minute: 50
+  websocket_max_updates_per_second: 20
+
+indicators:
+  defaults:
+    sma_period: 20
+    ema_period: 20
+    rsi_period: 14
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9

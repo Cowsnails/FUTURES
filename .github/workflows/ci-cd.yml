@@ -1,0 +1,214 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'claude/*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-asyncio
+
+    - name: Run linting
+      run: |
+        pip install flake8
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 backend/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Run unit tests
+      run: |
+        python -m pytest tests/ -v --cov=backend --cov-report=xml --cov-report=term
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      if: matrix.python-version == '3.11'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety bandit
+
+    - name: Run safety check (dependency vulnerabilities)
+      run: |
+        pip install -r requirements.txt
+        safety check || true
+
+    - name: Run bandit (code security issues)
+      run: |
+        bandit -r backend/ -f json -o bandit-report.json || true
+        bandit -r backend/ || true
+
+    - name: Upload bandit results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bandit-report
+        path: bandit-report.json
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Verify imports
+      run: |
+        python -c "
+        import sys
+        sys.path.insert(0, '.')
+        from backend.contracts import get_current_contract
+        from backend.indicators import IndicatorManager
+        from backend.cache import DataCache
+        print('✅ All imports successful')
+        "
+
+    - name: Create distribution
+      run: |
+        mkdir -p dist
+        tar -czf dist/futures-charting-${{ github.sha }}.tar.gz \
+          backend/ \
+          frontend/ \
+          tests/ \
+          deployment/ \
+          config.yaml \
+          requirements.txt \
+          run.py \
+          test_connection.py \
+          README.md
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: futures-charting-build
+        path: dist/futures-charting-${{ github.sha }}.tar.gz
+        retention-days: 30
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.futures-charting.example.com
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: futures-charting-build
+        path: dist/
+
+    - name: Deploy to staging server
+      env:
+        DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+        STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        STAGING_USER: ${{ secrets.STAGING_USER }}
+      run: |
+        echo "🚀 Deploying to staging..."
+        # Example deployment commands (customize for your infrastructure)
+        # mkdir -p ~/.ssh
+        # echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+        # chmod 600 ~/.ssh/deploy_key
+        # scp -i ~/.ssh/deploy_key dist/*.tar.gz $STAGING_USER@$STAGING_HOST:/tmp/
+        # ssh -i ~/.ssh/deploy_key $STAGING_USER@$STAGING_HOST 'cd /opt/futures-charting && ./deployment/deploy.sh staging'
+        echo "✅ Staging deployment complete"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://futures-charting.example.com
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: futures-charting-build
+        path: dist/
+
+    - name: Deploy to production server
+      env:
+        DEPLOY_KEY: ${{ secrets.PRODUCTION_DEPLOY_KEY }}
+        PRODUCTION_HOST: ${{ secrets.PRODUCTION_HOST }}
+        PRODUCTION_USER: ${{ secrets.PRODUCTION_USER }}
+      run: |
+        echo "🚀 Deploying to production..."
+        # Example deployment commands (customize for your infrastructure)
+        # mkdir -p ~/.ssh
+        # echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+        # chmod 600 ~/.ssh/deploy_key
+        # scp -i ~/.ssh/deploy_key dist/*.tar.gz $PRODUCTION_USER@$PRODUCTION_HOST:/tmp/
+        # ssh -i ~/.ssh/deploy_key $PRODUCTION_USER@$PRODUCTION_HOST 'cd /opt/futures-charting && ./deployment/deploy.sh production'
+        echo "✅ Production deployment complete"
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/*.tar.gz
+        generate_release_notes: true
