@@ -22,6 +22,14 @@ from .historical_data import HistoricalDataFetcher
 from .realtime import RealtimeManager
 from .cache import DataCache
 from .indicators import IndicatorManager, list_available_indicators
+from .security import (
+    RateLimiter,
+    SecurityHeadersMiddleware,
+    RateLimitMiddleware,
+    validate_symbol,
+    validate_bar_size,
+    validate_indicator_params
+)
 
 # Configure logging
 logging.basicConfig(
@@ -298,6 +306,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add security middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add rate limiting middleware
+rate_limiter = RateLimiter(
+    requests_per_minute=os.getenv("RATE_LIMIT_PER_MINUTE", 100),
+    requests_per_hour=os.getenv("RATE_LIMIT_PER_HOUR", 1000)
+)
+app.add_middleware(RateLimitMiddleware, rate_limiter=rate_limiter)
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / 'frontend' / 'static'
@@ -620,6 +638,145 @@ async def calculate_indicators(symbol: str):
         "symbol": symbol,
         "indicators": results,
         "data_points": len(cached_data)
+    }
+
+
+@app.get("/ready")
+async def readiness_check():
+    """
+    Readiness check endpoint for Kubernetes/container orchestration.
+
+    Returns 200 if the application is ready to serve requests,
+    503 if it's still starting up or has critical issues.
+    """
+    checks = {
+        "ib_gateway": False,
+        "cache": False,
+        "indicators": False,
+    }
+
+    # Check IB Gateway connection
+    if ib_manager and ib_manager.is_connected():
+        checks["ib_gateway"] = True
+
+    # Check cache
+    if cache:
+        checks["cache"] = True
+
+    # Check indicator manager
+    if indicator_manager:
+        checks["indicators"] = True
+
+    all_ready = all(checks.values())
+    status_code = 200 if all_ready else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ready": all_ready,
+            "checks": checks
+        }
+    )
+
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Prometheus-compatible metrics endpoint.
+
+    Returns metrics in Prometheus text format.
+    """
+    import time
+    import psutil
+    import os
+
+    # Get process info
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+
+    # Build metrics
+    metrics_text = []
+
+    # Help and type declarations
+    metrics_text.append("# HELP futures_charting_info Application information")
+    metrics_text.append("# TYPE futures_charting_info gauge")
+    metrics_text.append('futures_charting_info{version="0.1.0"} 1')
+
+    # Memory metrics
+    metrics_text.append("# HELP process_memory_bytes Process memory usage in bytes")
+    metrics_text.append("# TYPE process_memory_bytes gauge")
+    metrics_text.append(f"process_memory_bytes {{type=\"rss\"}} {memory_info.rss}")
+    metrics_text.append(f"process_memory_bytes {{type=\"vms\"}} {memory_info.vms}")
+
+    # CPU metrics
+    metrics_text.append("# HELP process_cpu_percent Process CPU usage percentage")
+    metrics_text.append("# TYPE process_cpu_percent gauge")
+    metrics_text.append(f"process_cpu_percent {process.cpu_percent()}")
+
+    # IB Gateway connection
+    if ib_manager:
+        connected = 1 if ib_manager.is_connected() else 0
+        metrics_text.append("# HELP ib_gateway_connected IB Gateway connection status")
+        metrics_text.append("# TYPE ib_gateway_connected gauge")
+        metrics_text.append(f"ib_gateway_connected {connected}")
+
+    # Active WebSocket connections
+    total_connections = sum(
+        len(connections)
+        for connections in connection_manager.active_connections.values()
+    )
+    metrics_text.append("# HELP websocket_connections_total Total active WebSocket connections")
+    metrics_text.append("# TYPE websocket_connections_total gauge")
+    metrics_text.append(f"websocket_connections_total {total_connections}")
+
+    # Per-symbol connections
+    for symbol, connections in connection_manager.active_connections.items():
+        metrics_text.append(f'websocket_connections{{symbol="{symbol}"}} {len(connections)}')
+
+    # Realtime streams
+    if realtime_manager:
+        stream_count = len(realtime_manager.streamers)
+        metrics_text.append("# HELP realtime_streams_active Active real-time data streams")
+        metrics_text.append("# TYPE realtime_streams_active gauge")
+        metrics_text.append(f"realtime_streams_active {stream_count}")
+
+    # Cache statistics
+    if cache:
+        cache_stats = cache.get_cache_size()
+        if 'total_size' in cache_stats:
+            metrics_text.append("# HELP cache_size_bytes Total cache size in bytes")
+            metrics_text.append("# TYPE cache_size_bytes gauge")
+            metrics_text.append(f"cache_size_bytes {cache_stats['total_size']}")
+
+        if 'total_bars' in cache_stats:
+            metrics_text.append("# HELP cache_bars_total Total bars cached")
+            metrics_text.append("# TYPE cache_bars_total gauge")
+            metrics_text.append(f"cache_bars_total {cache_stats['total_bars']}")
+
+    # Active indicators
+    if indicator_manager:
+        indicator_count = len(indicator_manager.active_indicators)
+        metrics_text.append("# HELP indicators_active_total Active indicators")
+        metrics_text.append("# TYPE indicators_active_total gauge")
+        metrics_text.append(f"indicators_active_total {indicator_count}")
+
+    return Response(
+        content="\n".join(metrics_text) + "\n",
+        media_type="text/plain; version=0.0.4"
+    )
+
+
+@app.get("/api/rate-limit-info")
+async def rate_limit_info():
+    """Get rate limiting information for the current client"""
+    # This would need access to the client IP from the request
+    # For now, return general rate limit configuration
+    return {
+        "limits": {
+            "per_minute": int(os.getenv("RATE_LIMIT_PER_MINUTE", 100)),
+            "per_hour": int(os.getenv("RATE_LIMIT_PER_HOUR", 1000))
+        },
+        "note": "Rate limits are per IP address"
     }
 
 

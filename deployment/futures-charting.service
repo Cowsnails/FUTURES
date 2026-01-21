@@ -1,0 +1,36 @@
+[Unit]
+Description=Futures Charting Application
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/futures-charting
+Environment="PATH=/opt/futures-charting/venv/bin"
+ExecStart=/opt/futures-charting/venv/bin/python /opt/futures-charting/run.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/var/log/futures-charting/app.log
+StandardError=append:/var/log/futures-charting/error.log
+SyslogIdentifier=futures-charting
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/futures-charting/data /opt/futures-charting/logs /var/log/futures-charting
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Performance
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
