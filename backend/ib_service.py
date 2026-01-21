@@ -8,6 +8,7 @@ for Interactive Brokers Gateway.
 import asyncio
 import logging
 import random
+import sys
 import time
 from enum import Enum
 from typing import Optional, Callable, Set, Any
@@ -43,6 +44,7 @@ class IBConnectionManager:
     - Error code classification and handling
     - Re-subscription after connection loss
     - Health monitoring
+    - Windows compatibility with event loop handling
     """
 
     def __init__(
@@ -110,19 +112,45 @@ class IBConnectionManager:
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
 
-                await self.ib.connectAsync(
-                    host=self.host,
-                    port=self.port,
-                    clientId=self.client_id,
-                    timeout=self.timeout
-                )
+                # Use synchronous connect on Windows to avoid event loop issues
+                if sys.platform == 'win32':
+                    # On Windows, use synchronous connect to avoid event loop conflicts
+                    logger.debug("Using synchronous connect for Windows")
+
+                    # Run synchronous connect in executor to not block
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.ib.connect(
+                            self.host,
+                            self.port,
+                            clientId=self.client_id,
+                            timeout=self.timeout
+                        )
+                    )
+                else:
+                    # On Linux/Mac, use async connect
+                    await self.ib.connectAsync(
+                        host=self.host,
+                        port=self.port,
+                        clientId=self.client_id,
+                        timeout=self.timeout
+                    )
 
                 if self.ib.isConnected():
                     self.state = ConnectionState.CONNECTED
                     self.last_connection_time = datetime.now()
-                    logger.info(
-                        f"Connected successfully! Server version: {self.ib.serverVersion()}"
-                    )
+
+                    # Safely get server version
+                    try:
+                        if hasattr(self.ib, 'client') and hasattr(self.ib.client, 'serverVersion'):
+                            version = self.ib.client.serverVersion
+                            logger.info(f"✓ Connected to IB Gateway! Server version: {version}")
+                        else:
+                            logger.info("✓ Connected to IB Gateway successfully!")
+                    except Exception as ve:
+                        logger.info("✓ Connected to IB Gateway successfully!")
+
                     return True
 
             except Exception as e:
