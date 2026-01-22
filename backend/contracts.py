@@ -116,11 +116,11 @@ def get_current_contract(symbol: str) -> Future:
         Front month futures contract
     """
     # These dates should be updated quarterly
-    # Current front months as of January 2025:
+    # Current front months as of January 2026:
     CURRENT_CONTRACTS = {
-        'MNQ': '202503',  # March 2025
-        'MES': '202503',  # March 2025
-        'MGC': '202502',  # February 2025 (rolls monthly)
+        'MNQ': '202603',  # March 2026 (H26)
+        'MES': '202603',  # March 2026 (H26)
+        'MGC': '202602',  # February 2026 (G26 - rolls monthly)
     }
 
     if symbol not in CURRENT_CONTRACTS:
