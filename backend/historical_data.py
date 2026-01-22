@@ -402,6 +402,11 @@ class HistoricalDataFetcher:
             if bars:
                 df = self._bars_to_dataframe(bars)
                 logger.info(f"Fetched {len(df)} recent bars for {contract.symbol}")
+
+                # Save to cache
+                self.cache.save(contract.symbol, df, bar_size='1min')
+                logger.info(f"Saved {len(df)} bars to cache for {contract.symbol}")
+
                 return df
             else:
                 logger.warning(f"No recent data for {contract.symbol}")
