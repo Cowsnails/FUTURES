@@ -6,6 +6,7 @@ Downloads historical futures data from IB Gateway with proper rate limiting and 
 
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, List
 import pandas as pd
@@ -368,18 +369,35 @@ class HistoricalDataFetcher:
             # Wait for pacing
             await self.pacing_manager.wait_if_needed(pacing_request)
 
-            # Request data
-            bars = await ib_request_with_retry(
-                self.ib.reqHistoricalDataAsync,
-                contract,
-                endDateTime='',
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow='TRADES',
-                useRTH=False,
-                formatDate=1,
-                timeout=60
-            )
+            # Request data - use synchronous method on Windows to avoid event loop issues
+            if sys.platform == 'win32':
+                # Windows: Use synchronous method wrapped in executor
+                loop = asyncio.get_event_loop()
+                bars = await loop.run_in_executor(
+                    None,
+                    lambda: self.ib.reqHistoricalData(
+                        contract,
+                        endDateTime='',
+                        durationStr=duration,
+                        barSizeSetting=bar_size,
+                        whatToShow='TRADES',
+                        useRTH=False,
+                        formatDate=1
+                    )
+                )
+            else:
+                # Linux/Mac: Use async method
+                bars = await ib_request_with_retry(
+                    self.ib.reqHistoricalDataAsync,
+                    contract,
+                    endDateTime='',
+                    durationStr=duration,
+                    barSizeSetting=bar_size,
+                    whatToShow='TRADES',
+                    useRTH=False,
+                    formatDate=1,
+                    timeout=60
+                )
 
             if bars:
                 df = self._bars_to_dataframe(bars)
