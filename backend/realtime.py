@@ -229,15 +229,34 @@ class KeepUpToDateStreamer:
 
         try:
             # Request historical data with keepUpToDate=True
-            self.bars = await self.ib.reqHistoricalDataAsync(
-                self.contract,
-                endDateTime='',
-                durationStr=self.initial_duration,
-                barSizeSetting=self.bar_size,
-                whatToShow='TRADES',
-                useRTH=False,  # Include extended hours for futures
-                keepUpToDate=True  # This enables real-time updates
-            )
+            # Windows: Use synchronous method to avoid event loop issues
+            import sys
+            if sys.platform == 'win32':
+                # Run synchronous method in executor to avoid blocking
+                loop = asyncio.get_event_loop()
+                self.bars = await loop.run_in_executor(
+                    None,
+                    lambda: self.ib.reqHistoricalData(
+                        self.contract,
+                        endDateTime='',
+                        durationStr=self.initial_duration,
+                        barSizeSetting=self.bar_size,
+                        whatToShow='TRADES',
+                        useRTH=False,
+                        keepUpToDate=True
+                    )
+                )
+            else:
+                # Linux/Mac: Use async method
+                self.bars = await self.ib.reqHistoricalDataAsync(
+                    self.contract,
+                    endDateTime='',
+                    durationStr=self.initial_duration,
+                    barSizeSetting=self.bar_size,
+                    whatToShow='TRADES',
+                    useRTH=False,  # Include extended hours for futures
+                    keepUpToDate=True  # This enables real-time updates
+                )
 
             # Subscribe to bar updates
             self.bars.updateEvent += self._on_update
