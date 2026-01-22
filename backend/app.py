@@ -411,17 +411,22 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
     - Streams real-time bar updates
     - Messages: {type: 'historical'|'bar_update', data: {...}, is_new_bar: bool}
     """
+    logger.info(f"WebSocket connection request for {symbol}")
+
     # Validate symbol
     if symbol not in ['MNQ', 'MES', 'MGC']:
+        logger.error(f"Invalid symbol: {symbol}")
         await websocket.close(code=1003, reason=f"Invalid symbol: {symbol}")
         return
 
     # Check if IB Gateway is connected
     if not ib_manager or not ib_manager.is_connected():
+        logger.error("IB Gateway not connected - closing WebSocket")
         await websocket.close(code=1011, reason="IB Gateway not connected")
         return
 
     # Accept connection
+    logger.info(f"Accepting WebSocket connection for {symbol}")
     await connection_manager.connect(websocket, symbol)
 
     try:
@@ -431,13 +436,14 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
 
         logger.info(f"Starting data stream for {symbol}")
 
-        # Step 1: Send cached or fetch historical data
+        # Step 1: Send cached or fetch historical data (5 days for fast loading)
         if historical_fetcher:
             try:
-                historical_data = await historical_fetcher.fetch_year(
+                logger.info(f"Fetching historical data for {symbol}...")
+                historical_data = await historical_fetcher.fetch_recent(
                     contract,
-                    use_cache=True,
-                    cache_max_age_hours=config['data']['cache_max_age_hours']
+                    duration='5 D',  # 5 days of data for fast loading
+                    bar_size='1 min'
                 )
 
                 if historical_data is not None and len(historical_data) > 0:
