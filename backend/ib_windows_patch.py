@@ -8,49 +8,57 @@ import sys
 import asyncio
 
 if sys.platform == 'win32':
-    import ib_insync.util as util_module
+    # Patch ib_insync.connection module
+    import ib_insync.connection as connection_module
 
-    # Store original functions
-    _original_run = util_module.run
-    _original_schedule = util_module.schedule
+    # Store original Connection class
+    _OriginalConnection = connection_module.Connection
 
-    def patched_run(*awaitables, timeout=None):
-        """Patched run() that uses current event loop"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop, create one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    class PatchedConnection(_OriginalConnection):
+        """Windows-patched Connection that uses current event loop"""
 
-        if not awaitables:
-            return []
-
-        # Run the awaitables
-        results = []
-        for awaitable in awaitables:
+        def __init__(self, host, port):
+            # Get or create event loop before calling parent init
             try:
-                if asyncio.iscoroutine(awaitable):
-                    result = loop.run_until_complete(asyncio.wait_for(awaitable, timeout))
-                else:
-                    result = awaitable
-                results.append(result)
-            except Exception as e:
-                results.append(e)
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                if loop is None or loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
-        return results[0] if len(results) == 1 else results
+            super().__init__(host, port)
 
-    def patched_schedule(time, callback, *args):
-        """Patched schedule() that uses current event loop"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
+        async def connectAsync(self):
+            """Override connectAsync to ensure it uses the correct event loop"""
+            # Ensure we're using the current event loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
 
-        return loop.call_later(time, callback, *args)
+            # Call parent's connectAsync
+            return await super().connectAsync()
 
-    # Apply patches
-    util_module.run = patched_run
-    util_module.schedule = patched_schedule
+    # Replace the Connection class
+    connection_module.Connection = PatchedConnection
+
+    # Also patch IB class to use patched Connection
+    import ib_insync.ib as ib_module
+    _OriginalIB = ib_module.IB
+
+    class PatchedIB(_OriginalIB):
+        """Windows-patched IB that ensures correct event loop"""
+
+        def connect(self, host='127.0.0.1', port=7497, clientId=1, timeout=4,
+                   readonly=False, account=''):
+            """Override connect to use current event loop"""
+            # Create a new connection with patched Connection class
+            self._createConnection()
+            return super().connect(host, port, clientId, timeout, readonly, account)
+
+    # Replace IB class
+    ib_module.IB = PatchedIB
 
     print("✓ Applied Windows-specific ib_insync patches")
+
