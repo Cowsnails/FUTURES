@@ -112,22 +112,43 @@ class IBConnectionManager:
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
 
-                # Use synchronous connect on Windows to avoid event loop issues
+                # Windows fix: Run connection in separate thread with its own event loop
                 if sys.platform == 'win32':
-                    # On Windows, use synchronous connect to avoid event loop conflicts
-                    logger.debug("Using synchronous connect for Windows")
+                    def _connect_sync():
+                        """Run connection in thread with its own event loop"""
+                        # Create new event loop for this thread
+                        thread_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(thread_loop)
 
-                    # Run synchronous connect in executor to not block
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
-                        None,
-                        lambda: self.ib.connect(
-                            self.host,
-                            self.port,
-                            clientId=self.client_id,
-                            timeout=self.timeout
-                        )
-                    )
+                        try:
+                            # Run the async connect in the thread's event loop
+                            thread_loop.run_until_complete(
+                                self.ib.connectAsync(
+                                    self.host,
+                                    self.port,
+                                    clientId=self.client_id,
+                                    timeout=self.timeout
+                                )
+                            )
+                            return self.ib.isConnected()
+                        except Exception as e:
+                            logger.error(f"Thread connection error: {e}")
+                            return False
+                        finally:
+                            # Don't close the loop - ib_insync needs it for callbacks
+                            pass
+
+                    # Run in thread pool
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(_connect_sync)
+                        try:
+                            connected = future.result(timeout=self.timeout + 10)
+                        except concurrent.futures.TimeoutError:
+                            logger.error(f"Connection timeout after {self.timeout + 10}s")
+                            connected = False
+
+                    if not connected:
+                        raise Exception("Connection failed in thread")
                 else:
                     # On Linux/Mac, use async connect
                     await self.ib.connectAsync(
