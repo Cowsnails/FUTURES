@@ -38,12 +38,13 @@ class LiveCandlestickBuilder:
             ib: Connected IB instance
             contract: Futures contract to stream
             bar_size_minutes: Candlestick duration in minutes (default: 1)
-            on_bar_callback: Callback(bar_data: dict, is_new_bar: bool)
+            on_bar_callback: Async callback(bar_data: dict, is_new_bar: bool)
         """
         self.ib = ib
         self.contract = contract
         self.bar_size = timedelta(minutes=bar_size_minutes)
         self.on_bar = on_bar_callback
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.ticker: Optional[Ticker] = None
         self.current_bar: Optional[Dict[str, Any]] = None
@@ -60,6 +61,9 @@ class LiveCandlestickBuilder:
         logger.info(f"Starting tick-by-tick stream for {self.contract.symbol}")
 
         try:
+            # Store event loop reference for scheduling async callbacks
+            self.loop = asyncio.get_event_loop()
+
             # Request tick-by-tick data
             # 'AllLast' captures all trade types (more comprehensive than 'Last')
             self.ticker = self.ib.reqTickByTickData(
@@ -105,8 +109,18 @@ class LiveCandlestickBuilder:
         """Process a single tick and update current bar"""
         self.stats['ticks_processed'] += 1
 
+        # Log tick processing stats every 100 ticks
+        if self.stats['ticks_processed'] % 100 == 0:
+            logger.debug(
+                f"[{self.contract.symbol}] Processed {self.stats['ticks_processed']} ticks, "
+                f"{self.stats['bars_completed']} bars completed"
+            )
+
         # Determine which bar this tick belongs to
         bar_start = self._get_bar_start_time(tick_time)
+
+        # Determine if this is a new bar
+        is_new_bar = False
 
         # Check if we need to finalize previous bar and start new one
         if self.current_bar_start_time and bar_start > self.current_bar_start_time:
@@ -115,19 +129,29 @@ class LiveCandlestickBuilder:
 
             # Start new bar
             self._start_new_bar(bar_start, price, size)
+            is_new_bar = True
 
         elif self.current_bar is None:
             # Initialize first bar
             self._start_new_bar(bar_start, price, size)
+            is_new_bar = True
 
         else:
             # Update current bar
             self._update_bar(price, size)
+            is_new_bar = False
 
-        # Send update to callback
-        if self.on_bar and self.current_bar:
-            is_new = self.stats['bars_updated'] == 0
-            self.on_bar(self.current_bar.copy(), is_new_bar=is_new)
+        # Send update to callback (schedule async callback on event loop)
+        if self.on_bar and self.current_bar and self.loop:
+            bar_data = self.current_bar.copy()
+
+            # Schedule the async callback on the event loop
+            # This avoids "event loop already running" errors on Windows
+            asyncio.run_coroutine_threadsafe(
+                self.on_bar(bar_data, is_new_bar),
+                self.loop
+            )
+
             self.stats['bars_updated'] += 1
 
     def _get_bar_start_time(self, tick_time: datetime) -> datetime:
@@ -152,7 +176,10 @@ class LiveCandlestickBuilder:
             'volume': size
         }
 
-        logger.debug(f"New bar started at {bar_start} with price {price}")
+        logger.info(
+            f"[{self.contract.symbol}] New bar started at {bar_start.strftime('%H:%M:%S')} "
+            f"| Open: {price:.2f}"
+        )
 
     def _update_bar(self, price: float, size: int):
         """Update the current bar with new tick data"""
@@ -168,13 +195,14 @@ class LiveCandlestickBuilder:
         """Finalize the current bar"""
         if self.current_bar:
             self.stats['bars_completed'] += 1
-            logger.debug(
-                f"Bar finalized: {self.current_bar['time']} "
-                f"O={self.current_bar['open']:.2f} "
-                f"H={self.current_bar['high']:.2f} "
-                f"L={self.current_bar['low']:.2f} "
-                f"C={self.current_bar['close']:.2f} "
-                f"V={self.current_bar['volume']}"
+            bar_time = datetime.fromtimestamp(self.current_bar['time'])
+            logger.info(
+                f"[{self.contract.symbol}] Bar completed at {bar_time.strftime('%H:%M:%S')} "
+                f"| O: {self.current_bar['open']:.2f} "
+                f"H: {self.current_bar['high']:.2f} "
+                f"L: {self.current_bar['low']:.2f} "
+                f"C: {self.current_bar['close']:.2f} "
+                f"V: {self.current_bar['volume']}"
             )
 
     def get_statistics(self) -> dict:
@@ -359,6 +387,12 @@ class RealtimeManager:
             f"RealtimeManager initialized "
             f"(mode: {'tick-by-tick' if use_tick_by_tick else 'keepUpToDate'})"
         )
+
+        if use_tick_by_tick:
+            logger.warning(
+                "Tick-by-tick mode has a limit of 3 simultaneous subscriptions. "
+                "Each ticker uses one subscription. Current tickers: MNQ, MES, MGC (3/3 used)"
+            )
 
     async def start_stream(
         self,
