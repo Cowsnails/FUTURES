@@ -5,9 +5,16 @@ Provides WebSocket streaming of real-time and historical market data.
 """
 
 import asyncio
+import sys
+
+# CRITICAL: Windows-specific event loop configuration - MUST be first
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    import nest_asyncio
+    nest_asyncio.apply()
+
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from typing import Set, Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
