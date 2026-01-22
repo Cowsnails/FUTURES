@@ -6,17 +6,9 @@ for Interactive Brokers Gateway.
 """
 
 import asyncio
-import sys
-
-# CRITICAL: Windows-specific event loop configuration - MUST be first
-if sys.platform == 'win32':
-    # Use ProactorEventLoop (default on Windows) - works better with nest_asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    import nest_asyncio
-    nest_asyncio.apply()
-
 import logging
 import random
+import sys
 import time
 from enum import Enum
 from typing import Optional, Callable, Set, Any
