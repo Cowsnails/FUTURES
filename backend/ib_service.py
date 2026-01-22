@@ -10,7 +10,8 @@ import sys
 
 # CRITICAL: Windows-specific event loop configuration - MUST be first
 if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Use ProactorEventLoop (default on Windows) - works better with nest_asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     import nest_asyncio
     nest_asyncio.apply()
 
