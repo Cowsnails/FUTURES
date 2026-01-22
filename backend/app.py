@@ -245,6 +245,36 @@ class ConnectionManager:
 connection_manager = ConnectionManager()
 
 
+async def prefetch_all_tickers():
+    """Pre-fetch historical data for all tickers at startup"""
+    symbols = ['MNQ', 'MES', 'MGC']
+    duration = config['data']['default_duration']
+
+    for symbol in symbols:
+        try:
+            logger.info(f"Pre-fetching {symbol} historical data...")
+            contract = get_current_contract(symbol)
+
+            # Fetch and cache data
+            data = await historical_fetcher.fetch_recent(
+                contract,
+                duration=duration,
+                bar_size='1 min'
+            )
+
+            if data is not None and len(data) > 0:
+                logger.info(f"✓ Pre-fetched {len(data)} bars for {symbol}")
+            else:
+                logger.warning(f"⚠ No data fetched for {symbol}")
+
+            # Small delay between requests to avoid pacing violations
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Error pre-fetching {symbol}: {e}")
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
@@ -284,6 +314,10 @@ async def lifespan(app: FastAPI):
             ib=ib_manager.ib,
             cache=cache
         )
+
+        # Pre-fetch all tickers at startup to avoid fetching on ticker switch
+        logger.info("Pre-fetching historical data for all tickers...")
+        await prefetch_all_tickers()
 
         logger.info("Application started successfully")
 
@@ -446,14 +480,15 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
 
         logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
 
-        # Step 1: Send cached or fetch historical data (5 days for fast loading)
-        if historical_fetcher:
+        # Step 1: Load ONLY from cache (pre-fetched at startup)
+        if cache:
             try:
-                logger.info(f"Fetching historical data for {symbol}...")
-                historical_data = await historical_fetcher.fetch_recent(
-                    contract,
-                    duration='5 D',  # 5 days of data for fast loading
-                    bar_size='1 min'
+                logger.info(f"Loading cached historical data for {symbol}...")
+                # ONLY load from cache, NEVER fetch from IB Gateway
+                historical_data = cache.load(
+                    symbol,
+                    bar_size='1min',
+                    max_age_hours=config['data']['cache_max_age_hours']
                 )
 
                 if historical_data is not None and len(historical_data) > 0:
@@ -478,12 +513,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                         'indicators': indicators_data
                     })
 
-                    logger.info(f"Sent {len(data_list)} historical bars to client")
+                    logger.info(f"Sent {len(data_list)} cached historical bars to client")
                 else:
-                    logger.warning(f"No historical data available for {symbol}")
+                    logger.warning(f"No cached data available for {symbol} - was it pre-fetched at startup?")
 
             except Exception as e:
-                logger.error(f"Error fetching historical data: {e}")
+                logger.error(f"Error loading cached data: {e}")
                 await connection_manager.send_to_client(websocket, {
                     'type': 'error',
                     'message': f"Failed to fetch historical data: {str(e)}"

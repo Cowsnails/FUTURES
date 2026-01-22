@@ -1,6 +1,6 @@
 ib_gateway:
   host: 127.0.0.1
-  port: 4002  # Paper trading port (4001 for live)
+  port: 4001  # Paper trading port (4001 for live, 4002 for paper)
   client_id: 1
   timeout: 10
   auto_restart_time: "11:45 PM"
@@ -12,10 +12,10 @@ server:
   log_level: info
 
 data:
-  cache_dir: ./data/cache
+  cache_dir: C:\Users\jacem\Downloads\futures_data
   max_bars_in_memory: 10000
-  cache_max_age_hours: 24
-  default_duration: "1 Y"
+  cache_max_age_hours: 168  # 7 days - keep data for a week
+  default_duration: "5 D"  # Fetch 5 days at startup
   bar_size: "1 min"
 
 contracts:
