@@ -7,6 +7,7 @@ Provides WebSocket streaming of real-time and historical market data.
 import asyncio
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Set, Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -432,7 +433,13 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
     try:
         # Get contract
         contract = get_current_contract(symbol)
-        await ib_manager.ib.qualifyContractsAsync(contract)
+
+        # Qualify contract - use synchronous version on Windows to avoid event loop conflicts
+        if sys.platform == 'win32':
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: ib_manager.ib.qualifyContracts(contract))
+        else:
+            await ib_manager.ib.qualifyContractsAsync(contract)
 
         logger.info(f"Starting data stream for {symbol}")
 
