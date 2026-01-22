@@ -434,14 +434,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
         # Get contract
         contract = get_current_contract(symbol)
 
-        # Qualify contract - use synchronous version on Windows to avoid event loop conflicts
-        if sys.platform == 'win32':
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: ib_manager.ib.qualifyContracts(contract))
-        else:
-            await ib_manager.ib.qualifyContractsAsync(contract)
-
-        logger.info(f"Starting data stream for {symbol}")
+        logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
 
         # Step 1: Send cached or fetch historical data (5 days for fast loading)
         if historical_fetcher:
