@@ -219,6 +219,31 @@
             opacity: 0.5;
             cursor: not-allowed;
         }
+
+        /* Countdown Timer */
+        .countdown-timer {
+            padding: 8px 16px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            font-size: 12px;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .countdown-timer .timer-value {
+            color: #26a69a;
+            font-weight: 600;
+            font-size: 14px;
+            min-width: 45px;
+            text-align: center;
+        }
+
+        .countdown-timer .timer-label {
+            color: #758696;
+        }
     </style>
 </head>
 <body>
@@ -228,6 +253,10 @@
             <div class="status-indicator">
                 <div class="status-dot" id="status-dot"></div>
                 <span id="status-text">Connecting...</span>
+            </div>
+            <div class="countdown-timer" id="countdown-timer">
+                <span class="timer-label">Next bar in</span>
+                <span class="timer-value" id="timer-value">0:00</span>
             </div>
             <div class="status-indicator" id="bar-count" style="display: none;">
                 <span>Bars: <strong id="bar-count-value">0</strong></span>
@@ -300,6 +329,9 @@
         let barCount = 0;
         let indicatorRenderer = null;
         let indicatorManager = null;
+        let latestBarTime = null;
+        let countdownInterval = null;
+        const BAR_SIZE_SECONDS = 60; // 1-minute bars
 
         // ═══════════════════════════════════════════════════════════
         // CHART INITIALIZATION
@@ -485,6 +517,12 @@
             barCount = msg.data.length;
             updateBarCount(barCount);
 
+            // Start countdown timer with latest bar
+            if (msg.data.length > 0) {
+                const latestBar = msg.data[msg.data.length - 1];
+                startCountdown(latestBar.time);
+            }
+
             console.log('Historical data loaded successfully');
         }
 
@@ -506,6 +544,12 @@
             if (isNewBar) {
                 barCount++;
                 updateBarCount(barCount);
+
+                // Reset countdown for new bar
+                startCountdown(bar.time);
+            } else {
+                // Just update the latest bar time for countdown calculation
+                latestBarTime = bar.time;
             }
 
             // Optional: Log updates (can be noisy)
@@ -529,6 +573,53 @@
 
             barCountValue.textContent = count.toLocaleString();
             barCountEl.style.display = 'flex';
+        }
+
+        function updateCountdown() {
+            if (!latestBarTime) return;
+
+            const now = Math.floor(Date.now() / 1000);
+            const nextBarTime = latestBarTime + BAR_SIZE_SECONDS;
+            const remaining = nextBarTime - now;
+
+            if (remaining <= 0) {
+                // Bar should have completed, wait for update
+                document.getElementById('timer-value').textContent = '0:00';
+                return;
+            }
+
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            const display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+            document.getElementById('timer-value').textContent = display;
+        }
+
+        function startCountdown(barTime) {
+            latestBarTime = barTime;
+
+            // Show countdown timer
+            document.getElementById('countdown-timer').style.display = 'flex';
+
+            // Clear existing interval
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+
+            // Update immediately
+            updateCountdown();
+
+            // Update every second
+            countdownInterval = setInterval(updateCountdown, 1000);
+        }
+
+        function stopCountdown() {
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+                countdownInterval = null;
+            }
+            document.getElementById('countdown-timer').style.display = 'none';
+            latestBarTime = null;
         }
 
         function showLoading(text) {
@@ -567,6 +658,9 @@
             volumeSeries.setData([]);
             barCount = 0;
             updateBarCount(0);
+
+            // Stop countdown
+            stopCountdown();
 
             // Clear indicators
             if (indicatorRenderer) {
