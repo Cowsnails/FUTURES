@@ -276,6 +276,7 @@
         let latestBarTime = null;
         let countdownInterval = null;
         let intentionalDisconnect = false;  // Track if user is closing page
+        let futureMarkersSeries = null;  // Series for future time vertical lines
         const BAR_SIZE_SECONDS = 60; // 1-minute bars
 
         // ═══════════════════════════════════════════════════════════
@@ -332,6 +333,14 @@
             });
             volumeSeries.priceScale().applyOptions({
                 scaleMargins: { top: 0.85, bottom: 0 },
+            });
+
+            // Future time markers (invisible line series for extending time scale)
+            futureMarkersSeries = chart.addLineSeries({
+                color: 'transparent',
+                lineWidth: 0,
+                lastValueVisible: false,
+                priceLineVisible: false,
             });
 
             // Responsive resize
@@ -431,6 +440,62 @@
             }
         }
 
+        function generateFutureTimeMarkers(lastBarTime, avgPrice) {
+            /**
+             * Generate future time markers extending ~1 month ahead
+             * This creates empty space on the chart for future time
+             *
+             * @param {number} lastBarTime - Unix timestamp of last bar (seconds)
+             * @param {number} avgPrice - Average price for invisible markers
+             */
+            if (!futureMarkersSeries || !lastBarTime) return;
+
+            const futureMarkers = [];
+            const SECONDS_IN_DAY = 86400;
+            const DAYS_TO_EXTEND = 30; // Extend ~1 month into future
+
+            // Generate a marker point every 6 hours for the next month
+            // This ensures smooth gridlines even at different zoom levels
+            const HOURS_INTERVAL = 6;
+            const SECONDS_INTERVAL = HOURS_INTERVAL * 3600;
+            const totalIntervals = (DAYS_TO_EXTEND * 24) / HOURS_INTERVAL;
+
+            for (let i = 1; i <= totalIntervals; i++) {
+                const futureTime = lastBarTime + (i * SECONDS_INTERVAL);
+                futureMarkers.push({
+                    time: futureTime,
+                    value: avgPrice // Use average price so it doesn't affect scale
+                });
+            }
+
+            // Set future markers (this extends the time scale)
+            futureMarkersSeries.setData(futureMarkers);
+
+            // Configure time scale to show significant future space
+            // This makes the chart show ~1 month of future time with vertical gridlines
+            chart.timeScale().applyOptions({
+                rightOffset: 5, // Bars from right edge
+                barSpacing: 3, // Tighter spacing to fit more data
+                minBarSpacing: 0.5, // Allow zooming in close
+                fixLeftEdge: false,
+                fixRightEdge: false,
+                lockVisibleTimeRangeOnResize: false,
+                shiftVisibleRangeOnNewBar: true, // Auto-scroll as new bars arrive
+            });
+
+            // Set visible range to show historical + future
+            // This ensures we see both past data and the full month ahead
+            const firstTime = lastBarTime - (7 * SECONDS_IN_DAY); // Show last 7 days of history
+            const lastTime = lastBarTime + (DAYS_TO_EXTEND * SECONDS_IN_DAY); // Plus 30 days future
+
+            chart.timeScale().setVisibleRange({
+                from: firstTime,
+                to: lastTime,
+            });
+
+            console.log(`Generated ${futureMarkers.length} future time markers extending ${DAYS_TO_EXTEND} days`);
+        }
+
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
@@ -459,6 +524,14 @@
                         console.error(`Error rendering indicator ${indicatorId}:`, error);
                     }
                 }
+            }
+
+            // Generate future time markers (extend chart ~1 month ahead)
+            if (msg.data.length > 0) {
+                const latestBar = msg.data[msg.data.length - 1];
+                // Use closing price of last bar for invisible markers
+                const avgPrice = latestBar.close;
+                generateFutureTimeMarkers(latestBar.time, avgPrice);
             }
 
             // Fit content and hide loading
@@ -499,6 +572,9 @@
 
                 // Reset countdown for new bar
                 startCountdown(bar.time);
+
+                // Update future markers with new latest bar
+                generateFutureTimeMarkers(bar.time, bar.close);
             } else {
                 // Just update the latest bar time for countdown calculation
                 latestBarTime = bar.time;
