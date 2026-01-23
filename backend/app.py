@@ -592,7 +592,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                         'data': bar_data,
                         'is_new_bar': is_new_bar,
                         'symbol': symbol
-                    })
+                    }, immediate=True)  # Send immediately, no batching for real-time price updates
 
                 # Start streaming
                 logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")

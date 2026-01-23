@@ -108,7 +108,7 @@ class LiveCandlestickBuilder:
             self.ticker.updateEvent += self._on_tick
 
             # CRITICAL: Give ib_insync a moment to process the subscription
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)  # Reduced from 100ms to 10ms for lower latency
 
             # Check if updateEvent has subscribers
             logger.info(
@@ -120,18 +120,6 @@ class LiveCandlestickBuilder:
                 f"✓ [{self.contract.symbol}] Tick-by-tick stream started successfully! "
                 f"(expected latency: 50-300ms) - waiting for ticks..."
             )
-
-            # Keep checking for ticks for 10 seconds to debug
-            logger.info(f"[{self.contract.symbol}] Starting 10-second tick monitoring...")
-            for i in range(10):
-                await asyncio.sleep(1)
-                tick_count = len(self.ticker.tickByTicks) if self.ticker.tickByTicks else 0
-                logger.info(
-                    f"[{self.contract.symbol}] [{i+1}s] tickByTicks count: {tick_count}, "
-                    f"ticks processed: {self.stats['ticks_processed']}"
-                )
-                if tick_count > 0:
-                    logger.info(f"[{self.contract.symbol}] tickByTicks content: {self.ticker.tickByTicks}")
 
         except Exception as e:
             logger.error(f"❌ [{self.contract.symbol}] Failed to start tick-by-tick stream: {e}", exc_info=True)
