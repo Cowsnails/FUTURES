@@ -174,45 +174,6 @@
             display: none;
         }
 
-        /* Indicator Controls */
-        .indicator-controls {
-            position: absolute;
-            top: 50px;
-            right: 10px;
-            z-index: 100;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-
-        .indicator-btn {
-            padding: 6px 12px;
-            background: rgba(26, 29, 39, 0.9);
-            border: 1px solid #2a2e39;
-            border-radius: 4px;
-            color: #d1d4dc;
-            font-size: 11px;
-            cursor: pointer;
-            transition: all 0.2s;
-            text-align: left;
-        }
-
-        .indicator-btn:hover {
-            background: rgba(41, 98, 255, 0.2);
-            border-color: #2962FF;
-        }
-
-        .indicator-btn.active {
-            background: rgba(41, 98, 255, 0.3);
-            border-color: #2962FF;
-            color: #2962FF;
-        }
-
-        .indicator-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
         /* Countdown Timer */
         .countdown-timer {
             padding: 8px 16px;
@@ -262,15 +223,6 @@
                     <option value="MGC">MGC - Micro Gold</option>
                 </select>
             </div>
-        </div>
-
-        <!-- Indicator Controls -->
-        <div class="indicator-controls">
-            <button class="indicator-btn" data-indicator="sma" data-params='{"period":20}'>SMA(20)</button>
-            <button class="indicator-btn" data-indicator="ema" data-params='{"period":20}'>EMA(20)</button>
-            <button class="indicator-btn" data-indicator="rsi" data-params='{"period":14}'>RSI(14)</button>
-            <button class="indicator-btn" data-indicator="macd" data-params='{}'>MACD</button>
-            <button class="indicator-btn" data-indicator="bb" data-params='{"period":20}'>BB(20)</button>
         </div>
 
         <!-- Chart -->
@@ -669,45 +621,6 @@
 
             // Reconnect with new symbol
             connect(newSymbol);
-        });
-
-        // Indicator button handlers
-        document.querySelectorAll('.indicator-btn').forEach(btn => {
-            btn.addEventListener('click', async function() {
-                const indicatorType = this.dataset.indicator;
-                const params = JSON.parse(this.dataset.params || '{}');
-
-                if (this.classList.contains('active')) {
-                    // Remove indicator (not implemented yet - would need to track IDs)
-                    console.log(`Remove indicator ${indicatorType} not yet implemented`);
-                    return;
-                }
-
-                try {
-                    // Add indicator via API
-                    console.log(`Adding indicator: ${indicatorType}`, params);
-                    const result = await indicatorManager.addIndicator(indicatorType, params);
-
-                    if (result) {
-                        this.classList.add('active');
-                        console.log(`Indicator ${indicatorType} added successfully`);
-
-                        // Calculate and render for current symbol
-                        const indicators = await indicatorManager.calculateIndicators(currentSymbol);
-                        if (indicators && indicators[result.id]) {
-                            const indicatorData = indicators[result.id];
-                            indicatorRenderer.addIndicator(
-                                result.id,
-                                indicatorData.config,
-                                indicatorData.data
-                            );
-                        }
-                    }
-                } catch (error) {
-                    console.error(`Error adding indicator ${indicatorType}:`, error);
-                    alert(`Failed to add indicator: ${error.message}`);
-                }
-            });
         });
 
         // ═══════════════════════════════════════════════════════════
