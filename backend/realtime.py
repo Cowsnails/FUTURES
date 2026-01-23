@@ -478,7 +478,7 @@ class RealtimeManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start stream for {symbol}: {e}")
+            logger.error(f"❌ Failed to start stream for {symbol}: {e}", exc_info=True)
             return False
 
     def stop_stream(self, symbol: str):

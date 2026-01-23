@@ -474,6 +474,7 @@
                     break;
 
                 case 'error':
+                    hideLoading();  // CRITICAL: Hide loading overlay on error!
                     showError(msg.message);
                     break;
 

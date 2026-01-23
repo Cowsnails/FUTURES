@@ -481,7 +481,18 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
         # CRITICAL: Qualify contract before starting tick-by-tick stream
         # Without this, IB Gateway doesn't know which exact contract to stream
         logger.info(f"Qualifying contract for {symbol}...")
-        await ib_manager.ib.qualifyContractsAsync(contract)
+
+        # Windows: Use synchronous method to avoid event loop issues
+        import sys
+        if sys.platform == 'win32':
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: ib_manager.ib.qualifyContracts(contract)
+            )
+        else:
+            await ib_manager.ib.qualifyContractsAsync(contract)
+
         logger.info(f"Contract qualified: {contract.localSymbol} (conId: {contract.conId})")
 
         logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
