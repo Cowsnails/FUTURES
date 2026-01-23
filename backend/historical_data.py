@@ -19,9 +19,6 @@ from .ib_service import ib_request_with_retry
 
 logger = logging.getLogger(__name__)
 
-# IB Gateway returns times in US Eastern Time
-US_EASTERN = pytz.timezone('US/Eastern')
-
 
 class HistoricalDataFetcher:
     """
@@ -242,20 +239,19 @@ class HistoricalDataFetcher:
         """
         Parse bar date (handles both datetime and string formats).
 
-        IB Gateway returns times in US Eastern Time, so we localize them properly
-        before converting to UTC timestamps for the frontend.
+        IB Gateway returns timezone-aware datetime objects in UTC.
+        We just need to ensure they're timezone-aware before converting to timestamps.
         """
         if isinstance(date, datetime):
-            # If already a datetime, check if it's timezone-aware
-            if date.tzinfo is None:
-                # Naive datetime - assume US Eastern Time from IB
-                date = US_EASTERN.localize(date)
+            # IB returns timezone-aware datetimes in UTC - use as-is
+            # Don't localize if already timezone-aware
             return date
         elif isinstance(date, str):
             # Format: 'YYYYMMDD  HH:MM:SS'
+            # String format is typically in UTC
             naive_dt = datetime.strptime(date, '%Y%m%d  %H:%M:%S')
-            # IB times are in US Eastern Time
-            return US_EASTERN.localize(naive_dt)
+            # Assume UTC for string dates from IB
+            return pytz.UTC.localize(naive_dt)
         else:
             raise ValueError(f"Unknown date format: {type(date)}")
 
