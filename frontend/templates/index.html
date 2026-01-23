@@ -77,13 +77,6 @@
         }
 
         /* Symbol selector */
-        .symbol-selector {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            z-index: 100;
-        }
-
         .symbol-selector select {
             padding: 8px 16px;
             background: rgba(26, 29, 39, 0.9);
@@ -261,15 +254,14 @@
             <div class="status-indicator" id="bar-count" style="display: none;">
                 <span>Bars: <strong id="bar-count-value">0</strong></span>
             </div>
-        </div>
-
-        <!-- Symbol Selector -->
-        <div class="symbol-selector">
-            <select id="symbol-select">
-                <option value="MNQ" selected>MNQ - Micro E-mini Nasdaq-100</option>
-                <option value="MES">MES - Micro E-mini S&P 500</option>
-                <option value="MGC">MGC - Micro Gold</option>
-            </select>
+            <!-- Symbol Selector -->
+            <div class="symbol-selector">
+                <select id="symbol-select">
+                    <option value="MNQ" selected>MNQ - Micro E-mini Nasdaq-100</option>
+                    <option value="MES">MES - Micro E-mini S&P 500</option>
+                    <option value="MGC">MGC - Micro Gold</option>
+                </select>
+            </div>
         </div>
 
         <!-- Indicator Controls -->
