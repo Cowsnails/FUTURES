@@ -369,35 +369,18 @@ class HistoricalDataFetcher:
             # Wait for pacing
             await self.pacing_manager.wait_if_needed(pacing_request)
 
-            # Request data - use synchronous method on Windows to avoid event loop issues
-            if sys.platform == 'win32':
-                # Windows: Use synchronous method wrapped in executor
-                loop = asyncio.get_event_loop()
-                bars = await loop.run_in_executor(
-                    None,
-                    lambda: self.ib.reqHistoricalData(
-                        contract,
-                        endDateTime='',
-                        durationStr=duration,
-                        barSizeSetting=bar_size,
-                        whatToShow='TRADES',
-                        useRTH=False,
-                        formatDate=1
-                    )
-                )
-            else:
-                # Linux/Mac: Use async method
-                bars = await ib_request_with_retry(
-                    self.ib.reqHistoricalDataAsync,
-                    contract,
-                    endDateTime='',
-                    durationStr=duration,
-                    barSizeSetting=bar_size,
-                    whatToShow='TRADES',
-                    useRTH=False,
-                    formatDate=1,
-                    timeout=60
-                )
+            # Request data using async method for proper event loop integration
+            bars = await ib_request_with_retry(
+                self.ib.reqHistoricalDataAsync,
+                contract,
+                endDateTime='',
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow='TRADES',
+                useRTH=False,
+                formatDate=1,
+                timeout=60
+            )
 
             if bars:
                 df = self._bars_to_dataframe(bars)

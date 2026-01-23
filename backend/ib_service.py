@@ -112,27 +112,14 @@ class IBConnectionManager:
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
 
-                # Windows: Use synchronous connect to avoid event loop issues
-                if sys.platform == 'win32':
-                    # Run synchronous connect in executor to avoid blocking
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
-                        None,
-                        lambda: self.ib.connect(
-                            self.host,
-                            self.port,
-                            clientId=self.client_id,
-                            timeout=self.timeout
-                        )
-                    )
-                else:
-                    # Linux/Mac: Use async connect
-                    await self.ib.connectAsync(
-                        host=self.host,
-                        port=self.port,
-                        clientId=self.client_id,
-                        timeout=self.timeout
-                    )
+                # Use async connect for proper event loop integration
+                # This is required for tick-by-tick callbacks to work
+                await self.ib.connectAsync(
+                    host=self.host,
+                    port=self.port,
+                    clientId=self.client_id,
+                    timeout=self.timeout
+                )
 
                 if self.ib.isConnected():
                     self.state = ConnectionState.CONNECTED

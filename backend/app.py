@@ -302,11 +302,10 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to connect to IB Gateway - application will not function")
         # Continue anyway to allow health checks
     else:
-        # Initialize real-time manager (use keepUpToDate - works with Level 1 data)
-        # NOTE: Tick-by-tick requires Level 2 / Depth of Market subscription from IB
+        # Initialize real-time manager (use tick-by-tick with L2 data)
         realtime_manager = RealtimeManager(
             ib=ib_manager.ib,
-            use_tick_by_tick=False,  # False = keepUpToDate (~5s updates)
+            use_tick_by_tick=True,  # User has CME Real-Time L2 subscription
             bar_size_minutes=1
         )
 
@@ -482,18 +481,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
         # CRITICAL: Qualify contract before starting tick-by-tick stream
         # Without this, IB Gateway doesn't know which exact contract to stream
         logger.info(f"Qualifying contract for {symbol}...")
-
-        # Windows: Use synchronous method to avoid event loop issues
-        import sys
-        if sys.platform == 'win32':
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: ib_manager.ib.qualifyContracts(contract)
-            )
-        else:
-            await ib_manager.ib.qualifyContractsAsync(contract)
-
+        await ib_manager.ib.qualifyContractsAsync(contract)
         logger.info(f"Contract qualified: {contract.localSymbol} (conId: {contract.conId})")
 
         logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
