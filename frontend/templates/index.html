@@ -331,6 +331,7 @@
         let indicatorManager = null;
         let latestBarTime = null;
         let countdownInterval = null;
+        let intentionalDisconnect = false;  // Track if user is closing page
         const BAR_SIZE_SECONDS = 60; // 1-minute bars
 
         // ═══════════════════════════════════════════════════════════
@@ -438,9 +439,15 @@
                 }
             };
 
-            ws.onclose = () => {
-                console.log('WebSocket disconnected');
+            ws.onclose = (event) => {
+                console.log(`WebSocket disconnected (code: ${event.code}, reason: ${event.reason || 'none'})`);
                 updateStatus('disconnected', 'Disconnected');
+
+                // Don't reconnect if user intentionally closed the page
+                if (intentionalDisconnect) {
+                    console.log('Page is closing - not reconnecting');
+                    return;
+                }
 
                 // Attempt reconnection
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
@@ -729,8 +736,11 @@
         // CLEANUP
         // ═══════════════════════════════════════════════════════════
         window.addEventListener('beforeunload', () => {
-            if (ws) {
-                ws.close();
+            console.log('Page is closing - cleaning up WebSocket...');
+            intentionalDisconnect = true;  // Prevent reconnection attempts
+            stopCountdown();  // Stop countdown timer
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close(1000, 'Page closing');  // Normal closure
             }
         });
     </script>

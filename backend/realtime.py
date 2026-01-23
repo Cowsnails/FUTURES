@@ -58,17 +58,27 @@ class LiveCandlestickBuilder:
 
     async def start(self):
         """Start streaming tick-by-tick data"""
-        logger.info(f"Starting tick-by-tick stream for {self.contract.symbol}")
+        logger.info(f"[{self.contract.symbol}] Starting tick-by-tick stream...")
 
         try:
             # Store event loop reference for scheduling async callbacks
             self.loop = asyncio.get_event_loop()
+            logger.debug(f"[{self.contract.symbol}] Event loop stored: {self.loop}")
+
+            # Check contract is qualified
+            if not self.contract.conId or self.contract.conId == 0:
+                raise Exception(
+                    f"Contract not qualified! conId={self.contract.conId}, "
+                    f"localSymbol={self.contract.localSymbol}. "
+                    f"Call qualifyContractsAsync() first."
+                )
 
             # Request tick-by-tick data
             # 'AllLast' captures all trade types (more comprehensive than 'Last')
             logger.info(
-                f"[{self.contract.symbol}] Requesting tick-by-tick data "
-                f"(conId: {self.contract.conId}, localSymbol: {self.contract.localSymbol})"
+                f"[{self.contract.symbol}] Requesting tick-by-tick data from IB Gateway... "
+                f"(conId: {self.contract.conId}, localSymbol: {self.contract.localSymbol}, "
+                f"exchange: {self.contract.exchange})"
             )
 
             self.ticker = self.ib.reqTickByTickData(
@@ -78,19 +88,22 @@ class LiveCandlestickBuilder:
                 ignoreSize=False
             )
 
+            logger.info(f"[{self.contract.symbol}] reqTickByTickData() returned ticker object: {self.ticker}")
+
             if not self.ticker:
                 raise Exception("reqTickByTickData returned None - subscription failed")
 
             # Subscribe to tick updates
+            logger.info(f"[{self.contract.symbol}] Subscribing to ticker.updateEvent...")
             self.ticker.updateEvent += self._on_tick
 
             logger.info(
-                f"✓ Tick-by-tick stream started for {self.contract.symbol} "
+                f"✓ [{self.contract.symbol}] Tick-by-tick stream started successfully! "
                 f"(expected latency: 50-300ms) - waiting for ticks..."
             )
 
         except Exception as e:
-            logger.error(f"Failed to start tick-by-tick stream: {e}")
+            logger.error(f"❌ [{self.contract.symbol}] Failed to start tick-by-tick stream: {e}", exc_info=True)
             raise
 
     def stop(self):
@@ -431,10 +444,14 @@ class RealtimeManager:
         symbol = contract.symbol
 
         if symbol in self.streamers:
-            logger.warning(f"Stream already active for {symbol}")
-            return False
+            logger.info(
+                f"Stream already active for {symbol} - reusing existing stream "
+                f"(multiple WebSocket clients share the same tick stream)"
+            )
+            return True  # Stream exists, other clients will receive updates via broadcast
 
         try:
+            logger.info(f"Creating new tick-by-tick stream for {symbol}...")
             if self.use_tick_by_tick:
                 # Use tick-by-tick streaming
                 streamer = LiveCandlestickBuilder(

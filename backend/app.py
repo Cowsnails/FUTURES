@@ -532,27 +532,38 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
 
         # Step 2: Start real-time streaming
         if realtime_manager:
-            # Callback for bar updates
-            async def on_bar_update(bar_data: dict, is_new_bar: bool):
-                """Called on every bar update"""
-                await connection_manager.broadcast(symbol, {
-                    'type': 'bar_update',
-                    'data': bar_data,
-                    'is_new_bar': is_new_bar,
-                    'symbol': symbol
-                })
+            try:
+                # Callback for bar updates
+                async def on_bar_update(bar_data: dict, is_new_bar: bool):
+                    """Called on every bar update"""
+                    logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
+                    await connection_manager.broadcast(symbol, {
+                        'type': 'bar_update',
+                        'data': bar_data,
+                        'is_new_bar': is_new_bar,
+                        'symbol': symbol
+                    })
 
-            # Start streaming
-            success = await realtime_manager.start_stream(contract, on_bar_update)
+                # Start streaming
+                logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")
+                success = await realtime_manager.start_stream(contract, on_bar_update)
 
-            if success:
-                logger.info(f"Real-time stream started for {symbol}")
-            else:
-                logger.error(f"Failed to start real-time stream for {symbol}")
+                if success:
+                    logger.info(f"✓ Real-time stream started successfully for {symbol}")
+                else:
+                    logger.error(f"❌ start_stream() returned False for {symbol}")
+                    await connection_manager.send_to_client(websocket, {
+                        'type': 'error',
+                        'message': "Failed to start real-time stream"
+                    })
+            except Exception as e:
+                logger.error(f"❌ Exception starting real-time stream for {symbol}: {e}", exc_info=True)
                 await connection_manager.send_to_client(websocket, {
                     'type': 'error',
-                    'message': "Failed to start real-time stream"
+                    'message': f"Failed to start real-time stream: {str(e)}"
                 })
+        else:
+            logger.warning("realtime_manager is None - cannot start streaming")
 
         # Keep connection alive and handle incoming messages
         while True:
@@ -569,19 +580,25 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                 await websocket.send_json({'type': 'ping'})
 
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected from {symbol}")
+        logger.info(f"Client disconnected from {symbol} (WebSocket close event)")
 
     except Exception as e:
-        logger.error(f"WebSocket error for {symbol}: {e}")
+        logger.error(f"WebSocket error for {symbol}: {e}", exc_info=True)
 
     finally:
-        # Clean up
+        # Check if this is the last client BEFORE disconnecting
+        remaining_clients = len(connection_manager.active_connections.get(symbol, set())) - 1
+
+        # Clean up connection
         connection_manager.disconnect(websocket, symbol)
+        logger.info(f"Cleaned up WebSocket for {symbol} ({remaining_clients} clients remaining)")
 
         # Stop streaming if no more clients for this symbol
-        if realtime_manager and symbol not in connection_manager.active_connections:
+        if realtime_manager and remaining_clients == 0:
+            logger.info(f"Last client disconnected - stopping stream for {symbol}")
             realtime_manager.stop_stream(symbol)
-            logger.info(f"Stopped real-time stream for {symbol} (no clients)")
+        elif remaining_clients > 0:
+            logger.info(f"Keeping stream alive for {symbol} ({remaining_clients} clients still connected)")
 
 
 @app.get("/api/statistics")
