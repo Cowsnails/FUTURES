@@ -88,19 +88,50 @@ class LiveCandlestickBuilder:
                 ignoreSize=False
             )
 
-            logger.info(f"[{self.contract.symbol}] reqTickByTickData() returned ticker object: {self.ticker}")
+            logger.info(
+                f"[{self.contract.symbol}] reqTickByTickData() returned ticker object: {self.ticker}"
+            )
 
             if not self.ticker:
                 raise Exception("reqTickByTickData returned None - subscription failed")
+
+            # Check if ticker has tickByTicks attribute
+            logger.info(
+                f"[{self.contract.symbol}] Ticker attributes: {dir(self.ticker)}"
+            )
+            logger.info(
+                f"[{self.contract.symbol}] Initial tickByTicks: {self.ticker.tickByTicks}"
+            )
 
             # Subscribe to tick updates
             logger.info(f"[{self.contract.symbol}] Subscribing to ticker.updateEvent...")
             self.ticker.updateEvent += self._on_tick
 
+            # CRITICAL: Give ib_insync a moment to process the subscription
+            await asyncio.sleep(0.1)
+
+            # Check if updateEvent has subscribers
+            logger.info(
+                f"[{self.contract.symbol}] updateEvent subscribers: "
+                f"{len(self.ticker.updateEvent) if hasattr(self.ticker.updateEvent, '__len__') else 'unknown'}"
+            )
+
             logger.info(
                 f"✓ [{self.contract.symbol}] Tick-by-tick stream started successfully! "
                 f"(expected latency: 50-300ms) - waiting for ticks..."
             )
+
+            # Keep checking for ticks for 10 seconds to debug
+            logger.info(f"[{self.contract.symbol}] Starting 10-second tick monitoring...")
+            for i in range(10):
+                await asyncio.sleep(1)
+                tick_count = len(self.ticker.tickByTicks) if self.ticker.tickByTicks else 0
+                logger.info(
+                    f"[{self.contract.symbol}] [{i+1}s] tickByTicks count: {tick_count}, "
+                    f"ticks processed: {self.stats['ticks_processed']}"
+                )
+                if tick_count > 0:
+                    logger.info(f"[{self.contract.symbol}] tickByTicks content: {self.ticker.tickByTicks}")
 
         except Exception as e:
             logger.error(f"❌ [{self.contract.symbol}] Failed to start tick-by-tick stream: {e}", exc_info=True)
