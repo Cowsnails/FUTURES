@@ -12,8 +12,12 @@ from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
 from collections import deque
 from ib_insync import IB, Contract, Ticker, TickByTickAllLast
+import pytz
 
 logger = logging.getLogger(__name__)
+
+# IB Gateway returns times in US Eastern Time
+US_EASTERN = pytz.timezone('US/Eastern')
 
 
 class LiveCandlestickBuilder:
@@ -206,13 +210,22 @@ class LiveCandlestickBuilder:
             self.stats['bars_updated'] += 1
 
     def _get_bar_start_time(self, tick_time: datetime) -> datetime:
-        """Get the start time of the bar this tick belongs to"""
+        """
+        Get the start time of the bar this tick belongs to.
+
+        Ensures timezone-aware datetime handling for proper timestamp conversion.
+        """
+        # Ensure tick_time is timezone-aware (IB returns US Eastern Time)
+        if tick_time.tzinfo is None:
+            tick_time = US_EASTERN.localize(tick_time)
+
         # Round down to nearest bar_size interval
         bar_size_seconds = int(self.bar_size.total_seconds())
         timestamp = int(tick_time.timestamp())
         bar_timestamp = (timestamp // bar_size_seconds) * bar_size_seconds
 
-        return datetime.fromtimestamp(bar_timestamp)
+        # Return timezone-aware datetime
+        return datetime.fromtimestamp(bar_timestamp, tz=pytz.UTC)
 
     def _start_new_bar(self, bar_start: datetime, price: float, size: int):
         """Initialize a new candlestick bar"""
@@ -366,13 +379,24 @@ class KeepUpToDateStreamer:
             self.on_bar(bar_data, is_new_bar=hasNewBar)
 
     def _convert_bar(self, bar) -> Dict[str, Any]:
-        """Convert IB bar to standard format"""
+        """
+        Convert IB bar to standard format.
+
+        Ensures timezone-aware datetime handling for proper timestamp conversion.
+        """
         # Parse date
         if isinstance(bar.date, datetime):
-            timestamp = int(bar.date.timestamp())
+            # Ensure timezone-aware
+            if bar.date.tzinfo is None:
+                dt = US_EASTERN.localize(bar.date)
+            else:
+                dt = bar.date
+            timestamp = int(dt.timestamp())
         else:
             # String format: 'YYYYMMDD  HH:MM:SS'
-            dt = datetime.strptime(bar.date, '%Y%m%d  %H:%M:%S')
+            naive_dt = datetime.strptime(bar.date, '%Y%m%d  %H:%M:%S')
+            # IB times are in US Eastern Time
+            dt = US_EASTERN.localize(naive_dt)
             timestamp = int(dt.timestamp())
 
         return {

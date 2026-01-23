@@ -442,30 +442,26 @@
 
         function generateFutureTimeMarkers(lastBarTime, avgPrice) {
             /**
-             * Generate future time markers extending to end of current day
-             * This creates empty space on the chart for rest of day with gridlines
+             * Generate future time markers extending rest of current trading day
+             * This creates empty space on the chart with gridlines
              *
              * @param {number} lastBarTime - Unix timestamp of last bar (seconds)
              * @param {number} avgPrice - Average price for invisible markers
              */
-            if (!futureMarkersSeries || !lastBarTime) return;
+            if (!futureMarkersSeries || !lastBarTime) {
+                console.log('Cannot generate future markers - series not initialized or no time');
+                return;
+            }
 
             const futureMarkers = [];
 
-            // Calculate end of current day (midnight tonight) in UTC
-            const lastBarDate = new Date(lastBarTime * 1000);
-            const endOfDay = new Date(lastBarDate);
-            endOfDay.setUTCHours(23, 59, 59, 999);
-            const endOfDayTimestamp = Math.floor(endOfDay.getTime() / 1000);
+            // Extend 12 hours ahead (covers rest of any trading day)
+            const HOURS_TO_EXTEND = 12;
+            const SECONDS_TO_EXTEND = HOURS_TO_EXTEND * 3600;
+            const targetEndTime = lastBarTime + SECONDS_TO_EXTEND;
 
-            // If we're already at or past end of day, extend to next day
-            let targetEndTime = endOfDayTimestamp;
-            if (lastBarTime >= endOfDayTimestamp) {
-                targetEndTime = endOfDayTimestamp + 86400; // Add 24 hours
-            }
-
-            // Generate marker every 15 minutes to ensure detailed gridlines
-            const MINUTES_INTERVAL = 15;
+            // Generate marker every 1 minute for detailed gridlines
+            const MINUTES_INTERVAL = 1;
             const SECONDS_INTERVAL = MINUTES_INTERVAL * 60;
 
             let currentTime = lastBarTime + SECONDS_INTERVAL;
@@ -477,19 +473,14 @@
                 currentTime += SECONDS_INTERVAL;
             }
 
-            // Add final marker at end of day
-            if (futureMarkers.length === 0 || futureMarkers[futureMarkers.length - 1].time < targetEndTime) {
-                futureMarkers.push({
-                    time: targetEndTime,
-                    value: avgPrice
-                });
-            }
+            console.log(`Generating ${futureMarkers.length} future time markers (${HOURS_TO_EXTEND}h ahead)`);
+            console.log(`Last bar time: ${new Date(lastBarTime * 1000).toLocaleString()}`);
+            console.log(`End time: ${new Date(targetEndTime * 1000).toLocaleString()}`);
 
             // Set future markers (this extends the time scale)
             futureMarkersSeries.setData(futureMarkers);
 
-            const endDate = new Date(targetEndTime * 1000);
-            console.log(`Generated ${futureMarkers.length} future time markers to end of day: ${endDate.toLocaleString()}`);
+            console.log('Future markers set successfully');
         }
 
         function handleHistoricalData(msg) {
@@ -522,16 +513,18 @@
                 }
             }
 
+            // Fit content first, then add future time markers
+            chart.timeScale().fitContent();
+
             // Generate future time markers (extend chart to end of day)
             if (msg.data.length > 0) {
                 const latestBar = msg.data[msg.data.length - 1];
+                console.log(`Latest bar time from backend: ${latestBar.time}, which is ${new Date(latestBar.time * 1000).toLocaleString()}`);
                 // Use closing price of last bar for invisible markers
                 const avgPrice = latestBar.close;
                 generateFutureTimeMarkers(latestBar.time, avgPrice);
             }
 
-            // Fit content to show both historical and future time
-            chart.timeScale().fitContent();
             hideLoading();
 
             // Update bar count

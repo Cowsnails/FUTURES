@@ -11,12 +11,16 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 import pandas as pd
 from ib_insync import IB, Contract, BarDataList, util
+import pytz
 
 from .pacing import PacingManager, HistoricalRequest
 from .cache import DataCache, optimize_dataframe
 from .ib_service import ib_request_with_retry
 
 logger = logging.getLogger(__name__)
+
+# IB Gateway returns times in US Eastern Time
+US_EASTERN = pytz.timezone('US/Eastern')
 
 
 class HistoricalDataFetcher:
@@ -235,12 +239,23 @@ class HistoricalDataFetcher:
         return df
 
     def _parse_bar_date(self, date) -> datetime:
-        """Parse bar date (handles both datetime and string formats)"""
+        """
+        Parse bar date (handles both datetime and string formats).
+
+        IB Gateway returns times in US Eastern Time, so we localize them properly
+        before converting to UTC timestamps for the frontend.
+        """
         if isinstance(date, datetime):
+            # If already a datetime, check if it's timezone-aware
+            if date.tzinfo is None:
+                # Naive datetime - assume US Eastern Time from IB
+                date = US_EASTERN.localize(date)
             return date
         elif isinstance(date, str):
             # Format: 'YYYYMMDD  HH:MM:SS'
-            return datetime.strptime(date, '%Y%m%d  %H:%M:%S')
+            naive_dt = datetime.strptime(date, '%Y%m%d  %H:%M:%S')
+            # IB times are in US Eastern Time
+            return US_EASTERN.localize(naive_dt)
         else:
             raise ValueError(f"Unknown date format: {type(date)}")
 
