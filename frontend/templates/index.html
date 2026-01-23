@@ -442,8 +442,8 @@
 
         function generateFutureTimeMarkers(lastBarTime, avgPrice) {
             /**
-             * Generate future time markers extending ~1 month ahead
-             * This creates empty space on the chart for future time
+             * Generate future time markers extending to end of current day
+             * This creates empty space on the chart for rest of day with gridlines
              *
              * @param {number} lastBarTime - Unix timestamp of last bar (seconds)
              * @param {number} avgPrice - Average price for invisible markers
@@ -451,49 +451,45 @@
             if (!futureMarkersSeries || !lastBarTime) return;
 
             const futureMarkers = [];
-            const SECONDS_IN_DAY = 86400;
-            const DAYS_TO_EXTEND = 30; // Extend ~1 month into future
 
-            // Generate a marker point every 6 hours for the next month
-            // This ensures smooth gridlines even at different zoom levels
-            const HOURS_INTERVAL = 6;
-            const SECONDS_INTERVAL = HOURS_INTERVAL * 3600;
-            const totalIntervals = (DAYS_TO_EXTEND * 24) / HOURS_INTERVAL;
+            // Calculate end of current day (midnight tonight) in UTC
+            const lastBarDate = new Date(lastBarTime * 1000);
+            const endOfDay = new Date(lastBarDate);
+            endOfDay.setUTCHours(23, 59, 59, 999);
+            const endOfDayTimestamp = Math.floor(endOfDay.getTime() / 1000);
 
-            for (let i = 1; i <= totalIntervals; i++) {
-                const futureTime = lastBarTime + (i * SECONDS_INTERVAL);
+            // If we're already at or past end of day, extend to next day
+            let targetEndTime = endOfDayTimestamp;
+            if (lastBarTime >= endOfDayTimestamp) {
+                targetEndTime = endOfDayTimestamp + 86400; // Add 24 hours
+            }
+
+            // Generate marker every 15 minutes to ensure detailed gridlines
+            const MINUTES_INTERVAL = 15;
+            const SECONDS_INTERVAL = MINUTES_INTERVAL * 60;
+
+            let currentTime = lastBarTime + SECONDS_INTERVAL;
+            while (currentTime <= targetEndTime) {
                 futureMarkers.push({
-                    time: futureTime,
-                    value: avgPrice // Use average price so it doesn't affect scale
+                    time: currentTime,
+                    value: avgPrice
+                });
+                currentTime += SECONDS_INTERVAL;
+            }
+
+            // Add final marker at end of day
+            if (futureMarkers.length === 0 || futureMarkers[futureMarkers.length - 1].time < targetEndTime) {
+                futureMarkers.push({
+                    time: targetEndTime,
+                    value: avgPrice
                 });
             }
 
             // Set future markers (this extends the time scale)
             futureMarkersSeries.setData(futureMarkers);
 
-            // Configure time scale to show significant future space
-            // This makes the chart show ~1 month of future time with vertical gridlines
-            chart.timeScale().applyOptions({
-                rightOffset: 5, // Bars from right edge
-                barSpacing: 3, // Tighter spacing to fit more data
-                minBarSpacing: 0.5, // Allow zooming in close
-                fixLeftEdge: false,
-                fixRightEdge: false,
-                lockVisibleTimeRangeOnResize: false,
-                shiftVisibleRangeOnNewBar: true, // Auto-scroll as new bars arrive
-            });
-
-            // Set visible range to show historical + future
-            // This ensures we see both past data and the full month ahead
-            const firstTime = lastBarTime - (7 * SECONDS_IN_DAY); // Show last 7 days of history
-            const lastTime = lastBarTime + (DAYS_TO_EXTEND * SECONDS_IN_DAY); // Plus 30 days future
-
-            chart.timeScale().setVisibleRange({
-                from: firstTime,
-                to: lastTime,
-            });
-
-            console.log(`Generated ${futureMarkers.length} future time markers extending ${DAYS_TO_EXTEND} days`);
+            const endDate = new Date(targetEndTime * 1000);
+            console.log(`Generated ${futureMarkers.length} future time markers to end of day: ${endDate.toLocaleString()}`);
         }
 
         function handleHistoricalData(msg) {
@@ -526,7 +522,7 @@
                 }
             }
 
-            // Generate future time markers (extend chart ~1 month ahead)
+            // Generate future time markers (extend chart to end of day)
             if (msg.data.length > 0) {
                 const latestBar = msg.data[msg.data.length - 1];
                 // Use closing price of last bar for invisible markers
@@ -534,7 +530,7 @@
                 generateFutureTimeMarkers(latestBar.time, avgPrice);
             }
 
-            // Fit content and hide loading
+            // Fit content to show both historical and future time
             chart.timeScale().fitContent();
             hideLoading();
 
