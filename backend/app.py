@@ -9,8 +9,9 @@ import sys
 
 # CRITICAL: Windows-specific event loop configuration - MUST be first
 if sys.platform == 'win32':
-    # Use ProactorEventLoop (default on Windows) - works better with nest_asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    # Use SelectorEventLoop on Windows for compatibility with ib_insync
+    # ProactorEventLoop causes "Future attached to different loop" errors
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     import nest_asyncio
     nest_asyncio.apply()
     # Apply Windows-specific ib_insync patches
@@ -26,6 +27,55 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yaml
 from pathlib import Path
+
+# CRITICAL: Monkey-patch ib_insync.util.getLoop() to fix "Future attached to different loop" error
+import ib_insync.util as ib_util
+import ib_insync.connection as ib_conn
+
+_original_getLoop = ib_util.getLoop
+_original_connectAsync = ib_conn.Connection.connectAsync
+
+def patched_getLoop():
+    """
+    Patched getLoop that always returns the running loop if available.
+
+    The original getLoop() calls get_event_loop() which may return a different
+    loop than the one currently running (especially in uvicorn), causing
+    "Future attached to different loop" errors.
+    """
+    try:
+        # If we're inside an async context, use the running loop
+        loop = asyncio.get_running_loop()
+        print(f"DEBUG patched_getLoop: returning running loop {id(loop)}")
+        return loop
+    except RuntimeError:
+        # No running loop, fall back to original behavior
+        original_loop = _original_getLoop()
+        print(f"DEBUG patched_getLoop: no running loop, returning original {id(original_loop)}")
+        return original_loop
+
+async def patched_connectAsync(self, host, port):
+    """Patched connectAsync with detailed debugging"""
+    if self.transport:
+        self.disconnect()
+        await self.disconnected
+    self.reset()
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    loop = ib_util.getLoop()
+
+    print(f"DEBUG connectAsync: running_loop={id(running_loop) if running_loop else 'None'}, getLoop={id(loop)}, same={running_loop is loop}")
+
+    self.transport, _ = await loop.create_connection(
+        lambda: self, host, port)
+
+ib_util.getLoop = patched_getLoop
+ib_conn.Connection.connectAsync = patched_connectAsync
+print("✓ Patched ib_insync.util.getLoop() and Connection.connectAsync() with debugging")
 
 from .ib_service import IBConnectionManager
 from .contracts import get_current_contract, get_contract_info

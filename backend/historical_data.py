@@ -369,7 +369,7 @@ class HistoricalDataFetcher:
             # Wait for pacing
             await self.pacing_manager.wait_if_needed(pacing_request)
 
-            # Request data using async method for proper event loop integration
+            # Request data using async method (Windows patches handle event loop)
             bars = await ib_request_with_retry(
                 self.ib.reqHistoricalDataAsync,
                 contract,

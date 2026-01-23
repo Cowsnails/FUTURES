@@ -112,8 +112,15 @@ class IBConnectionManager:
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
 
-                # Use async connect for proper event loop integration
-                # This is required for tick-by-tick callbacks to work
+                # Debug: Check which event loop we're using
+                try:
+                    running_loop = asyncio.get_running_loop()
+                    default_loop = asyncio.get_event_loop()
+                    logger.info(f"DEBUG: Running loop: {id(running_loop)}, Default loop: {id(default_loop)}, Same: {running_loop is default_loop}")
+                except Exception as e:
+                    logger.error(f"DEBUG: Error getting loops: {e}")
+
+                # Use async connect on all platforms
                 await self.ib.connectAsync(
                     host=self.host,
                     port=self.port,
@@ -150,6 +157,24 @@ class IBConnectionManager:
         self.state = ConnectionState.DISCONNECTED
         logger.error("Failed to connect after all retry attempts")
         return False
+
+    async def _process_ib_events(self):
+        """
+        Background task to process ib_insync events on Windows.
+
+        This is required for tick-by-tick callbacks to work when using
+        synchronous connect() on Windows.
+        """
+        logger.info("IB event processing task started")
+        try:
+            while self.is_connected():
+                # Process ib_insync events - this allows callbacks to fire
+                self.ib.sleep(0.01)  # Process events every 10ms
+                await asyncio.sleep(0.01)  # Yield to asyncio event loop
+        except Exception as e:
+            logger.error(f"IB event processing task error: {e}")
+        finally:
+            logger.info("IB event processing task stopped")
 
     def disconnect(self):
         """Disconnect from IB Gateway"""
