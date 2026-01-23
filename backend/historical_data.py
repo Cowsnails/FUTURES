@@ -267,10 +267,18 @@ class HistoricalDataFetcher:
         """
         data = []
 
-        for bar in bars:
+        for i, bar in enumerate(bars):
             # Parse date to Unix timestamp
             bar_time = self._parse_bar_date(bar.date)
             timestamp = int(bar_time.timestamp())
+
+            # Debug logging for first and last bars
+            if i == 0 or i == len(bars) - 1:
+                logger.info(
+                    f"Bar {i}: IB date={bar.date} (type={type(bar.date).__name__}), "
+                    f"parsed={bar_time}, timestamp={timestamp}, "
+                    f"timezone={bar_time.tzinfo if hasattr(bar_time, 'tzinfo') else 'None'}"
+                )
 
             data.append({
                 'time': timestamp,

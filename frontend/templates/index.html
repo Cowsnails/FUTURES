@@ -486,6 +486,20 @@
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
+            // Debug: Check first and last bar timestamps
+            if (msg.data.length > 0) {
+                const firstBar = msg.data[0];
+                const lastBar = msg.data[msg.data.length - 1];
+                const now = new Date();
+
+                console.log('=== TIMESTAMP DEBUG ===');
+                console.log(`Current browser time: ${now.toLocaleString()} (${now.getTime() / 1000})`);
+                console.log(`First bar timestamp: ${firstBar.time} = ${new Date(firstBar.time * 1000).toLocaleString()}`);
+                console.log(`Last bar timestamp: ${lastBar.time} = ${new Date(lastBar.time * 1000).toLocaleString()}`);
+                console.log(`Timezone offset: ${now.getTimezoneOffset()} minutes`);
+                console.log('=====================');
+            }
+
             // Set candlestick data
             candleSeries.setData(msg.data);
 
