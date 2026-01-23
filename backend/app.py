@@ -478,6 +478,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
         # Get contract
         contract = get_current_contract(symbol)
 
+        # CRITICAL: Qualify contract before starting tick-by-tick stream
+        # Without this, IB Gateway doesn't know which exact contract to stream
+        logger.info(f"Qualifying contract for {symbol}...")
+        await ib_manager.ib.qualifyContractsAsync(contract)
+        logger.info(f"Contract qualified: {contract.localSymbol} (conId: {contract.conId})")
+
         logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
 
         # Step 1: Load ONLY from cache (pre-fetched at startup)

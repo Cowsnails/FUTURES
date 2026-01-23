@@ -66,6 +66,11 @@ class LiveCandlestickBuilder:
 
             # Request tick-by-tick data
             # 'AllLast' captures all trade types (more comprehensive than 'Last')
+            logger.info(
+                f"[{self.contract.symbol}] Requesting tick-by-tick data "
+                f"(conId: {self.contract.conId}, localSymbol: {self.contract.localSymbol})"
+            )
+
             self.ticker = self.ib.reqTickByTickData(
                 self.contract,
                 'AllLast',
@@ -73,12 +78,15 @@ class LiveCandlestickBuilder:
                 ignoreSize=False
             )
 
+            if not self.ticker:
+                raise Exception("reqTickByTickData returned None - subscription failed")
+
             # Subscribe to tick updates
             self.ticker.updateEvent += self._on_tick
 
             logger.info(
-                f"Tick-by-tick stream started for {self.contract.symbol} "
-                f"(expected latency: 50-300ms)"
+                f"✓ Tick-by-tick stream started for {self.contract.symbol} "
+                f"(expected latency: 50-300ms) - waiting for ticks..."
             )
 
         except Exception as e:
@@ -98,12 +106,23 @@ class LiveCandlestickBuilder:
 
         Called on every trade (multiple times per second during active trading).
         """
-        # Process new ticks
-        for tick in ticker.tickByTicks:
-            if not isinstance(tick, TickByTickAllLast):
-                continue
+        try:
+            # Log first tick received to confirm stream is working
+            if self.stats['ticks_processed'] == 0:
+                logger.info(f"[{self.contract.symbol}] ✓ First tick received! Stream is live.")
 
-            self._process_tick(tick.price, tick.size, tick.time)
+            # Process new ticks
+            if not ticker.tickByTicks or len(ticker.tickByTicks) == 0:
+                logger.debug(f"[{self.contract.symbol}] No ticks in update")
+                return
+
+            for tick in ticker.tickByTicks:
+                if not isinstance(tick, TickByTickAllLast):
+                    continue
+
+                self._process_tick(tick.price, tick.size, tick.time)
+        except Exception as e:
+            logger.error(f"[{self.contract.symbol}] Error in _on_tick callback: {e}", exc_info=True)
 
     def _process_tick(self, price: float, size: int, tick_time: datetime):
         """Process a single tick and update current bar"""
