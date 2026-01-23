@@ -302,10 +302,11 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to connect to IB Gateway - application will not function")
         # Continue anyway to allow health checks
     else:
-        # Initialize real-time manager (use tick-by-tick for true real-time updates)
+        # Initialize real-time manager (use keepUpToDate - works with Level 1 data)
+        # NOTE: Tick-by-tick requires Level 2 / Depth of Market subscription from IB
         realtime_manager = RealtimeManager(
             ib=ib_manager.ib,
-            use_tick_by_tick=True,  # True = 50-300ms latency, False = ~5s updates
+            use_tick_by_tick=False,  # False = keepUpToDate (~5s updates)
             bar_size_minutes=1
         )
 
