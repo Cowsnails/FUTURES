@@ -443,7 +443,6 @@
         function generateFutureTimeMarkers(lastBarTime, avgPrice) {
             /**
              * Generate future time markers extending rest of current trading day
-             * Uses SYSTEM TIME to verify marker positions are accurate
              *
              * @param {number} lastBarTime - Unix timestamp of last bar (seconds)
              * @param {number} avgPrice - Average price for invisible markers
@@ -454,7 +453,6 @@
             }
 
             const futureMarkers = [];
-            const systemTimeSeconds = Math.floor(Date.now() / 1000);
 
             // Extend 12 hours ahead (covers rest of any trading day)
             const HOURS_TO_EXTEND = 12;
@@ -475,10 +473,8 @@
             }
 
             console.log(`Generating ${futureMarkers.length} future time markers (${HOURS_TO_EXTEND}h ahead)`);
-            console.log(`System time: ${new Date(systemTimeSeconds * 1000).toLocaleString()} (Unix: ${systemTimeSeconds})`);
-            console.log(`Last bar time: ${new Date(lastBarTime * 1000).toLocaleString()} (Unix: ${lastBarTime})`);
-            console.log(`End time: ${new Date(targetEndTime * 1000).toLocaleString()} (Unix: ${targetEndTime})`);
-            console.log(`Difference (system - last bar): ${systemTimeSeconds - lastBarTime} seconds`);
+            console.log(`Last bar: ${new Date(lastBarTime * 1000).toLocaleString()}`);
+            console.log(`Extending to: ${new Date(targetEndTime * 1000).toLocaleString()}`);
 
             // Set future markers (this extends the time scale)
             futureMarkersSeries.setData(futureMarkers);
@@ -489,19 +485,15 @@
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
-            // Debug: Check first and last bar timestamps using SYSTEM TIME
+            // Debug: Check first and last bar timestamps
             if (msg.data.length > 0) {
                 const firstBar = msg.data[0];
                 const lastBar = msg.data[msg.data.length - 1];
-                const systemTime = new Date();
-                const systemTimestamp = Math.floor(systemTime.getTime() / 1000);
 
-                console.log('=== SYSTEM TIME VERIFICATION ===');
-                console.log(`System time (browser): ${systemTime.toLocaleString()} (Unix: ${systemTimestamp})`);
-                console.log(`First bar: ${firstBar.time} = ${new Date(firstBar.time * 1000).toLocaleString()}`);
-                console.log(`Last bar: ${lastBar.time} = ${new Date(lastBar.time * 1000).toLocaleString()}`);
-                console.log(`Time difference (system vs last bar): ${systemTimestamp - lastBar.time} seconds`);
-                console.log('================================');
+                console.log('=== HISTORICAL DATA ===');
+                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()}`);
+                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()}`);
+                console.log('=======================');
             }
 
             // Set candlestick data
@@ -613,10 +605,9 @@
         function updateCountdown() {
             if (!latestBarTime) return;
 
-            // Use SYSTEM TIME for accurate countdown
-            const systemTimeSeconds = Math.floor(Date.now() / 1000);
+            const now = Math.floor(Date.now() / 1000);
             const nextBarTime = latestBarTime + BAR_SIZE_SECONDS;
-            const remaining = nextBarTime - systemTimeSeconds;
+            const remaining = nextBarTime - now;
 
             if (remaining <= 0) {
                 // Bar should have completed, wait for update

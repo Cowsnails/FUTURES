@@ -257,10 +257,10 @@ class HistoricalDataFetcher:
 
     def _bars_to_dataframe(self, bars: List) -> pd.DataFrame:
         """
-        Convert IB bars to DataFrame using SYSTEM TIME for accuracy.
+        Convert IB bars to DataFrame.
 
-        CRITICAL: IB timestamps can be unreliable. We use the current system time
-        for the most recent bar and work backwards by 1 minute intervals.
+        IB's timestamps are CORRECT - they show when bars were actually traded.
+        Use them as-is!
 
         Args:
             bars: List of IB Bar objects
@@ -270,33 +270,16 @@ class HistoricalDataFetcher:
         """
         data = []
 
-        # Use SYSTEM TIME for the most recent bar
-        current_time = datetime.now()
-        current_timestamp = int(current_time.timestamp())
-
-        # Round down to the current minute (bars close on minute boundaries)
-        current_timestamp = (current_timestamp // 60) * 60
-
-        # Calculate timestamps working BACKWARDS from current time
-        num_bars = len(bars)
-
-        logger.info(
-            f"Using SYSTEM TIME for timestamp generation: {current_time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(Unix: {current_timestamp})"
-        )
-
         for i, bar in enumerate(bars):
-            # Calculate timestamp: most recent bar gets current time,
-            # each previous bar is 60 seconds earlier
-            bars_from_end = num_bars - 1 - i
-            timestamp = current_timestamp - (bars_from_end * 60)
+            # Parse IB's timestamp - it's CORRECT!
+            bar_time = self._parse_bar_date(bar.date)
+            timestamp = int(bar_time.timestamp())
 
             # Debug logging for first and last bars
             if i == 0 or i == len(bars) - 1:
-                readable_time = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
                 logger.info(
-                    f"Bar {i}: SYSTEM timestamp={timestamp} ({readable_time}), "
-                    f"IB date was={bar.date} (IGNORED)"
+                    f"Bar {i}: time={bar_time.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
+                    f"timestamp={timestamp}, IB date={bar.date}"
                 )
 
             data.append({
