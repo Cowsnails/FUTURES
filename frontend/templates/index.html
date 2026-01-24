@@ -326,6 +326,89 @@
         };
 
         // ═══════════════════════════════════════════════════════════
+        // BAR AGGREGATOR - CLIENT-SIDE AGGREGATION
+        // ═══════════════════════════════════════════════════════════
+        class BarAggregator {
+            constructor(timeframeSeconds) {
+                this.timeframeSeconds = timeframeSeconds;
+                this.currentBar = null;
+                this.lastCompletedBar = null;
+            }
+
+            /**
+             * Get the start time of the aggregated bar that contains the given timestamp
+             * @param {number} timestamp - Unix timestamp in seconds
+             * @returns {number} - Start time of the aggregated bar
+             */
+            getBarStartTime(timestamp) {
+                return Math.floor(timestamp / this.timeframeSeconds) * this.timeframeSeconds;
+            }
+
+            /**
+             * Process an incoming 1-minute bar
+             * @param {Object} bar - The 1-minute bar {time, open, high, low, close, volume}
+             * @returns {Object} - {completedBar, partialBar, isNewBar}
+             */
+            processBar(bar) {
+                const barStartTime = this.getBarStartTime(bar.time);
+
+                // If this is the first bar or starts a new aggregated bar
+                if (!this.currentBar || this.currentBar.time !== barStartTime) {
+                    // Save the previous bar as completed
+                    const completedBar = this.currentBar ? {...this.currentBar} : null;
+
+                    // Start a new aggregated bar
+                    this.currentBar = {
+                        time: barStartTime,
+                        open: bar.open,
+                        high: bar.high,
+                        low: bar.low,
+                        close: bar.close,
+                        volume: bar.volume
+                    };
+
+                    return {
+                        completedBar: completedBar,
+                        partialBar: {...this.currentBar},
+                        isNewBar: true
+                    };
+                } else {
+                    // Update the current aggregated bar
+                    this.currentBar.high = Math.max(this.currentBar.high, bar.high);
+                    this.currentBar.low = Math.min(this.currentBar.low, bar.low);
+                    this.currentBar.close = bar.close;
+                    this.currentBar.volume += bar.volume;
+
+                    return {
+                        completedBar: null,
+                        partialBar: {...this.currentBar},
+                        isNewBar: false
+                    };
+                }
+            }
+
+            /**
+             * Reset the aggregator (e.g., when changing timeframes)
+             */
+            reset() {
+                this.currentBar = null;
+                this.lastCompletedBar = null;
+            }
+
+            /**
+             * Set the timeframe
+             * @param {number} timeframeSeconds - New timeframe in seconds
+             */
+            setTimeframe(timeframeSeconds) {
+                this.timeframeSeconds = timeframeSeconds;
+                this.reset();
+            }
+        }
+
+        // Create global bar aggregator
+        let barAggregator = new BarAggregator(TIMEFRAME_SECONDS[currentTimeframe]);
+
+        // ═══════════════════════════════════════════════════════════
         // CHART INITIALIZATION
         // ═══════════════════════════════════════════════════════════
         function initializeChart() {
@@ -532,6 +615,9 @@
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
+            // Reset the bar aggregator for fresh start
+            barAggregator.reset();
+
             // Debug: Check first and last bar timestamps
             if (msg.data.length > 0) {
                 const firstBar = msg.data[0];
@@ -598,36 +684,75 @@
         }
 
         function handleBarUpdate(msg) {
-            const bar = msg.data;
-            const isNewBar = msg.is_new_bar;
+            const incomingBar = msg.data;  // This is a 1-minute bar from the backend
 
-            // Update candlestick
-            candleSeries.update(bar);
+            // For 1-minute timeframe, use the bar directly (no aggregation needed)
+            if (currentTimeframe === '1min') {
+                const isNewBar = msg.is_new_bar;
 
-            // Update volume
-            volumeSeries.update({
-                time: bar.time,
-                value: bar.volume,
-                color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
-            });
+                // Update candlestick
+                candleSeries.update(incomingBar);
 
-            // Update bar count if new bar
-            if (isNewBar) {
-                barCount++;
-                updateBarCount(barCount);
+                // Update volume
+                volumeSeries.update({
+                    time: incomingBar.time,
+                    value: incomingBar.volume,
+                    color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
+                });
 
-                // Reset countdown for new bar
-                startCountdown(bar.time);
+                // Update bar count if new bar
+                if (isNewBar) {
+                    barCount++;
+                    updateBarCount(barCount);
 
-                // Update future markers with new latest bar
-                generateFutureTimeMarkers(bar.time, bar.close);
+                    // Reset countdown for new bar
+                    startCountdown(incomingBar.time);
+
+                    // Update future markers with new latest bar
+                    generateFutureTimeMarkers(incomingBar.time, incomingBar.close);
+                } else {
+                    // Just update the latest bar time for countdown calculation
+                    latestBarTime = incomingBar.time;
+                }
             } else {
-                // Just update the latest bar time for countdown calculation
-                latestBarTime = bar.time;
+                // For higher timeframes, aggregate 1-minute bars
+                const result = barAggregator.processBar(incomingBar);
+
+                // Update the partial bar in real-time (shows the bar building)
+                if (result.partialBar) {
+                    candleSeries.update(result.partialBar);
+
+                    volumeSeries.update({
+                        time: result.partialBar.time,
+                        value: result.partialBar.volume,
+                        color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
+                    });
+
+                    // Update latest bar time for countdown
+                    latestBarTime = result.partialBar.time;
+                }
+
+                // If a bar completed, increment bar count and update markers
+                if (result.isNewBar && result.completedBar) {
+                    barCount++;
+                    updateBarCount(barCount);
+
+                    console.log(`Aggregated bar completed: ${new Date(result.completedBar.time * 1000).toLocaleString()}`);
+                }
+
+                // Start or update countdown with the current aggregated bar time
+                if (result.partialBar) {
+                    startCountdown(result.partialBar.time);
+
+                    // Update future markers with latest aggregated bar
+                    if (result.isNewBar) {
+                        generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
+                    }
+                }
             }
 
             // Optional: Log updates (can be noisy)
-            // console.log(`Bar ${isNewBar ? 'NEW' : 'UPDATE'}:`, bar);
+            // console.log(`Bar ${msg.is_new_bar ? 'NEW' : 'UPDATE'}:`, incomingBar);
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -753,6 +878,9 @@
 
             // Update current timeframe
             currentTimeframe = newTimeframe;
+
+            // Reset bar aggregator with new timeframe
+            barAggregator.setTimeframe(TIMEFRAME_SECONDS[newTimeframe]);
 
             // Clear chart
             candleSeries.setData([]);
