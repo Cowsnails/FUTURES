@@ -208,16 +208,16 @@ class LiveCandlestickBuilder:
 
     def _get_bar_start_time(self, tick_time: datetime) -> datetime:
         """
-        Get the start time of the bar this tick belongs to.
+        Get the start time of the bar this tick belongs to using SYSTEM TIME.
 
-        IB Gateway returns timezone-aware datetime objects in UTC.
+        CRITICAL: We use system time, not IB's potentially incorrect tick times.
         """
-        # IB returns timezone-aware datetimes - use as-is
-        # Don't localize if already timezone-aware
+        # Use SYSTEM TIME instead of IB's potentially incorrect tick time
+        current_time = datetime.now()
+        timestamp = int(current_time.timestamp())
 
         # Round down to nearest bar_size interval
         bar_size_seconds = int(self.bar_size.total_seconds())
-        timestamp = int(tick_time.timestamp())
         bar_timestamp = (timestamp // bar_size_seconds) * bar_size_seconds
 
         # Return timezone-aware datetime in UTC
@@ -376,20 +376,15 @@ class KeepUpToDateStreamer:
 
     def _convert_bar(self, bar) -> Dict[str, Any]:
         """
-        Convert IB bar to standard format.
+        Convert IB bar to standard format using SYSTEM TIME.
 
-        IB Gateway returns timezone-aware datetime objects in UTC.
+        CRITICAL: We use the current system time for the timestamp,
+        not IB's potentially incorrect times.
         """
-        # Parse date
-        if isinstance(bar.date, datetime):
-            # IB returns timezone-aware datetimes in UTC - use as-is
-            timestamp = int(bar.date.timestamp())
-        else:
-            # String format: 'YYYYMMDD  HH:MM:SS'
-            # Assume UTC for string dates from IB
-            naive_dt = datetime.strptime(bar.date, '%Y%m%d  %H:%M:%S')
-            dt = pytz.UTC.localize(naive_dt)
-            timestamp = int(dt.timestamp())
+        # Use SYSTEM TIME - round down to current minute
+        current_time = datetime.now()
+        timestamp = int(current_time.timestamp())
+        timestamp = (timestamp // 60) * 60  # Round to minute
 
         return {
             'time': timestamp,

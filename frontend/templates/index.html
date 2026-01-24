@@ -443,7 +443,7 @@
         function generateFutureTimeMarkers(lastBarTime, avgPrice) {
             /**
              * Generate future time markers extending rest of current trading day
-             * This creates empty space on the chart with gridlines
+             * Uses SYSTEM TIME to verify marker positions are accurate
              *
              * @param {number} lastBarTime - Unix timestamp of last bar (seconds)
              * @param {number} avgPrice - Average price for invisible markers
@@ -454,6 +454,7 @@
             }
 
             const futureMarkers = [];
+            const systemTimeSeconds = Math.floor(Date.now() / 1000);
 
             // Extend 12 hours ahead (covers rest of any trading day)
             const HOURS_TO_EXTEND = 12;
@@ -474,30 +475,33 @@
             }
 
             console.log(`Generating ${futureMarkers.length} future time markers (${HOURS_TO_EXTEND}h ahead)`);
-            console.log(`Last bar time: ${new Date(lastBarTime * 1000).toLocaleString()}`);
-            console.log(`End time: ${new Date(targetEndTime * 1000).toLocaleString()}`);
+            console.log(`System time: ${new Date(systemTimeSeconds * 1000).toLocaleString()} (Unix: ${systemTimeSeconds})`);
+            console.log(`Last bar time: ${new Date(lastBarTime * 1000).toLocaleString()} (Unix: ${lastBarTime})`);
+            console.log(`End time: ${new Date(targetEndTime * 1000).toLocaleString()} (Unix: ${targetEndTime})`);
+            console.log(`Difference (system - last bar): ${systemTimeSeconds - lastBarTime} seconds`);
 
             // Set future markers (this extends the time scale)
             futureMarkersSeries.setData(futureMarkers);
 
-            console.log('Future markers set successfully');
+            console.log('✓ Future markers set successfully');
         }
 
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
-            // Debug: Check first and last bar timestamps
+            // Debug: Check first and last bar timestamps using SYSTEM TIME
             if (msg.data.length > 0) {
                 const firstBar = msg.data[0];
                 const lastBar = msg.data[msg.data.length - 1];
-                const now = new Date();
+                const systemTime = new Date();
+                const systemTimestamp = Math.floor(systemTime.getTime() / 1000);
 
-                console.log('=== TIMESTAMP DEBUG ===');
-                console.log(`Current browser time: ${now.toLocaleString()} (${now.getTime() / 1000})`);
-                console.log(`First bar timestamp: ${firstBar.time} = ${new Date(firstBar.time * 1000).toLocaleString()}`);
-                console.log(`Last bar timestamp: ${lastBar.time} = ${new Date(lastBar.time * 1000).toLocaleString()}`);
-                console.log(`Timezone offset: ${now.getTimezoneOffset()} minutes`);
-                console.log('=====================');
+                console.log('=== SYSTEM TIME VERIFICATION ===');
+                console.log(`System time (browser): ${systemTime.toLocaleString()} (Unix: ${systemTimestamp})`);
+                console.log(`First bar: ${firstBar.time} = ${new Date(firstBar.time * 1000).toLocaleString()}`);
+                console.log(`Last bar: ${lastBar.time} = ${new Date(lastBar.time * 1000).toLocaleString()}`);
+                console.log(`Time difference (system vs last bar): ${systemTimestamp - lastBar.time} seconds`);
+                console.log('================================');
             }
 
             // Set candlestick data
@@ -609,9 +613,10 @@
         function updateCountdown() {
             if (!latestBarTime) return;
 
-            const now = Math.floor(Date.now() / 1000);
+            // Use SYSTEM TIME for accurate countdown
+            const systemTimeSeconds = Math.floor(Date.now() / 1000);
             const nextBarTime = latestBarTime + BAR_SIZE_SECONDS;
-            const remaining = nextBarTime - now;
+            const remaining = nextBarTime - systemTimeSeconds;
 
             if (remaining <= 0) {
                 // Bar should have completed, wait for update
