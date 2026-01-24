@@ -379,7 +379,8 @@ class HistoricalDataFetcher:
         self,
         contract: Contract,
         duration: str = '1 D',
-        bar_size: str = '1 min'
+        bar_size: str = '1 min',
+        cache_all_timeframes: bool = True
     ) -> Optional[pd.DataFrame]:
         """
         Fetch recent data (useful for incremental cache updates).
@@ -388,6 +389,7 @@ class HistoricalDataFetcher:
             contract: Futures contract
             duration: Duration string (e.g., '1 D', '1 W')
             bar_size: Bar size (e.g., '1 min', '5 mins')
+            cache_all_timeframes: If True, aggregate and cache all timeframes
 
         Returns:
             DataFrame with recent data
@@ -423,9 +425,21 @@ class HistoricalDataFetcher:
                 df = self._bars_to_dataframe(bars)
                 logger.info(f"Fetched {len(df)} recent bars for {contract.symbol}")
 
-                # Save to cache
+                # Save 1-minute data to cache
                 self.cache.save(contract.symbol, df, bar_size='1min')
-                logger.info(f"Saved {len(df)} bars to cache for {contract.symbol}")
+                logger.info(f"Saved {len(df)} 1min bars to cache for {contract.symbol}")
+
+                # Aggregate and cache all timeframes
+                if cache_all_timeframes and bar_size == '1 min':
+                    for tf in ['5min', '15min', '30min', '1H', '2H', '4H']:
+                        try:
+                            aggregated = self.aggregate_bars(df, tf)
+                            self.cache.save(contract.symbol, aggregated, bar_size=tf)
+                            logger.info(
+                                f"Cached {len(aggregated)} {tf} bars for {contract.symbol}"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error aggregating {tf} bars: {e}")
 
                 return df
             else:
@@ -435,6 +449,66 @@ class HistoricalDataFetcher:
         except Exception as e:
             logger.error(f"Error fetching recent data: {e}")
             return None
+
+    def aggregate_bars(
+        self,
+        df: pd.DataFrame,
+        target_timeframe: str
+    ) -> pd.DataFrame:
+        """
+        Aggregate 1-minute bars to higher timeframe.
+
+        Args:
+            df: DataFrame with 1-minute OHLCV data
+            target_timeframe: Target timeframe ('5min', '15min', '30min', '1H', '2H', '4H')
+
+        Returns:
+            Aggregated DataFrame with same structure
+        """
+        if df.empty:
+            return df
+
+        # Map timeframe to minutes
+        timeframe_map = {
+            '5min': 5,
+            '15min': 15,
+            '30min': 30,
+            '1H': 60,
+            '2H': 120,
+            '4H': 240
+        }
+
+        minutes = timeframe_map.get(target_timeframe)
+        if not minutes:
+            raise ValueError(f"Unsupported timeframe: {target_timeframe}")
+
+        # Convert timestamp to datetime for resampling
+        df_copy = df.copy()
+        df_copy['timestamp'] = pd.to_datetime(df_copy['time'], unit='s')
+        df_copy.set_index('timestamp', inplace=True)
+
+        # Resample to target timeframe
+        # label='left' means bar is labeled with start time
+        # closed='left' means interval is closed on left side [09:30, 09:35)
+        aggregated = df_copy.resample(f'{minutes}T', label='left', closed='left').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+
+        # Convert back to unix timestamp
+        aggregated['time'] = aggregated.index.astype(int) // 10**9
+        aggregated.reset_index(drop=True, inplace=True)
+
+        result = aggregated[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+
+        logger.info(
+            f"Aggregated {len(df)} 1-min bars to {len(result)} {target_timeframe} bars"
+        )
+
+        return result
 
     def get_statistics(self) -> dict:
         """Get fetching statistics"""

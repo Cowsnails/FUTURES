@@ -482,6 +482,22 @@ async def list_contracts():
     }
 
 
+@app.get("/api/timeframes")
+async def list_timeframes():
+    """List available timeframes"""
+    return {
+        "timeframes": [
+            {"value": "1min", "label": "1 Minute", "seconds": 60},
+            {"value": "5min", "label": "5 Minutes", "seconds": 300},
+            {"value": "15min", "label": "15 Minutes", "seconds": 900},
+            {"value": "30min", "label": "30 Minutes", "seconds": 1800},
+            {"value": "1H", "label": "1 Hour", "seconds": 3600},
+            {"value": "2H", "label": "2 Hours", "seconds": 7200},
+            {"value": "4H", "label": "4 Hours", "seconds": 14400}
+        ]
+    }
+
+
 @app.get("/api/cache/{symbol}")
 async def get_cache_info(symbol: str):
     """Get cache information for a symbol"""
@@ -496,8 +512,8 @@ async def get_cache_info(symbol: str):
         raise HTTPException(status_code=404, detail=f"No cache found for {symbol}")
 
 
-@app.websocket("/ws/{symbol}")
-async def websocket_endpoint(websocket: WebSocket, symbol: str):
+@app.websocket("/ws/{symbol}/{timeframe}")
+async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str = "1min"):
     """
     WebSocket endpoint for real-time market data.
 
@@ -505,13 +521,24 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
     - Sends historical data on connection
     - Streams real-time bar updates
     - Messages: {type: 'historical'|'bar_update', data: {...}, is_new_bar: bool}
+
+    Args:
+        symbol: Trading symbol (MNQ, MES, MGC)
+        timeframe: Bar timeframe (1min, 5min, 15min, 30min, 1H, 2H, 4H)
     """
-    logger.info(f"WebSocket connection request for {symbol}")
+    logger.info(f"WebSocket connection request for {symbol} ({timeframe})")
 
     # Validate symbol
     if symbol not in ['MNQ', 'MES', 'MGC']:
         logger.error(f"Invalid symbol: {symbol}")
         await websocket.close(code=1003, reason=f"Invalid symbol: {symbol}")
+        return
+
+    # Validate timeframe
+    valid_timeframes = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
+    if timeframe not in valid_timeframes:
+        logger.error(f"Invalid timeframe: {timeframe}")
+        await websocket.close(code=1003, reason=f"Invalid timeframe: {timeframe}")
         return
 
     # Check if IB Gateway is connected
@@ -539,11 +566,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
         # Step 1: Load ONLY from cache (pre-fetched at startup)
         if cache:
             try:
-                logger.info(f"Loading cached historical data for {symbol}...")
+                logger.info(f"Loading cached historical data for {symbol} ({timeframe})...")
                 # ONLY load from cache, NEVER fetch from IB Gateway
                 historical_data = cache.load(
                     symbol,
-                    bar_size='1min',
+                    bar_size=timeframe,
                     max_age_hours=config['data']['cache_max_age_hours']
                 )
 

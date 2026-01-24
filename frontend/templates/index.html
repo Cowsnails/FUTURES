@@ -98,6 +98,29 @@
             color: #d1d4dc;
         }
 
+        /* Timeframe selector */
+        .timeframe-selector select {
+            padding: 8px 12px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            color: #d1d4dc;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            outline: none;
+            min-width: 70px;
+        }
+
+        .timeframe-selector select:hover {
+            border-color: #3a3e49;
+        }
+
+        .timeframe-selector select option {
+            background: #1a1d27;
+            color: #d1d4dc;
+        }
+
         /* Loading overlay */
         .loading-overlay {
             position: absolute;
@@ -223,6 +246,18 @@
                     <option value="MGC">MGC - Micro Gold</option>
                 </select>
             </div>
+            <!-- Timeframe Selector -->
+            <div class="timeframe-selector">
+                <select id="timeframe-select">
+                    <option value="1min" selected>1m</option>
+                    <option value="5min">5m</option>
+                    <option value="15min">15m</option>
+                    <option value="30min">30m</option>
+                    <option value="1H">1h</option>
+                    <option value="2H">2h</option>
+                    <option value="4H">4h</option>
+                </select>
+            </div>
         </div>
 
         <!-- Chart -->
@@ -269,6 +304,7 @@
         let volumeSeries = null;
         let ws = null;
         let currentSymbol = 'MNQ';
+        let currentTimeframe = '1min';
         let reconnectAttempts = 0;
         let barCount = 0;
         let indicatorRenderer = null;
@@ -277,7 +313,17 @@
         let countdownInterval = null;
         let intentionalDisconnect = false;  // Track if user is closing page
         let futureMarkersSeries = null;  // Series for future time vertical lines
-        const BAR_SIZE_SECONDS = 60; // 1-minute bars
+
+        // Timeframe to seconds mapping
+        const TIMEFRAME_SECONDS = {
+            '1min': 60,
+            '5min': 300,
+            '15min': 900,
+            '30min': 1800,
+            '1H': 3600,
+            '2H': 7200,
+            '4H': 14400
+        };
 
         // ═══════════════════════════════════════════════════════════
         // CHART INITIALIZATION
@@ -363,18 +409,19 @@
         // ═══════════════════════════════════════════════════════════
         function connect(symbol) {
             currentSymbol = symbol;
-            updateStatus('connecting', `Connecting to ${symbol}...`);
-            showLoading(`Loading ${symbol} data...`);
+            updateStatus('connecting', `Connecting to ${symbol} (${currentTimeframe})...`);
+            showLoading(`Loading ${symbol} data (${currentTimeframe})...`);
 
             // Close existing connection
             if (ws) {
                 ws.close();
             }
 
-            // Create WebSocket connection
+            // Create WebSocket connection with timeframe
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws/${symbol}`;
+            const wsUrl = `${protocol}//${window.location.host}/ws/${symbol}/${currentTimeframe}`;
 
+            console.log(`Connecting to: ${wsUrl}`);
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
@@ -606,7 +653,8 @@
             if (!latestBarTime) return;
 
             const now = Math.floor(Date.now() / 1000);
-            const nextBarTime = latestBarTime + BAR_SIZE_SECONDS;
+            const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
+            const nextBarTime = latestBarTime + barSizeSeconds;
             const remaining = nextBarTime - now;
 
             if (remaining <= 0) {
@@ -696,6 +744,32 @@
 
             // Reconnect with new symbol
             connect(newSymbol);
+        });
+
+        // Timeframe selector
+        document.getElementById('timeframe-select').addEventListener('change', (e) => {
+            const newTimeframe = e.target.value;
+            console.log(`Switching to ${newTimeframe} timeframe`);
+
+            // Update current timeframe
+            currentTimeframe = newTimeframe;
+
+            // Clear chart
+            candleSeries.setData([]);
+            volumeSeries.setData([]);
+            barCount = 0;
+            updateBarCount(0);
+
+            // Stop countdown
+            stopCountdown();
+
+            // Clear indicators
+            if (indicatorRenderer) {
+                indicatorRenderer.removeAllIndicators();
+            }
+
+            // Reconnect with new timeframe
+            connect(currentSymbol);
         });
 
         // ═══════════════════════════════════════════════════════════
