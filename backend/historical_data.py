@@ -257,10 +257,10 @@ class HistoricalDataFetcher:
 
     def _bars_to_dataframe(self, bars: List) -> pd.DataFrame:
         """
-        Convert IB bars to DataFrame.
+        Convert IB bars to DataFrame with Eastern time display.
 
-        IB's timestamps are CORRECT - they show when bars were actually traded.
-        Use them as-is!
+        CRITICAL: LightweightCharts displays timestamps in the browser's local timezone.
+        Since the user may be in UTC, we need to convert to Eastern time for display.
 
         Args:
             bars: List of IB Bar objects
@@ -269,17 +269,33 @@ class HistoricalDataFetcher:
             DataFrame with standardized format
         """
         data = []
+        eastern = pytz.timezone('US/Eastern')
 
         for i, bar in enumerate(bars):
-            # Parse IB's timestamp - it's CORRECT!
+            # Parse IB's timestamp
             bar_time = self._parse_bar_date(bar.date)
-            timestamp = int(bar_time.timestamp())
+
+            # Convert to Eastern time
+            bar_eastern = bar_time.astimezone(eastern)
+
+            # Create "display timestamp" - treat Eastern time as if it were UTC
+            # This makes the chart show 16:59 instead of 21:59 for a 4:59 PM Eastern bar
+            display_time = datetime(
+                bar_eastern.year,
+                bar_eastern.month,
+                bar_eastern.day,
+                bar_eastern.hour,
+                bar_eastern.minute,
+                bar_eastern.second,
+                tzinfo=pytz.UTC
+            )
+            timestamp = int(display_time.timestamp())
 
             # Debug logging for first and last bars
             if i == 0 or i == len(bars) - 1:
                 logger.info(
-                    f"Bar {i}: time={bar_time.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
-                    f"timestamp={timestamp}, IB date={bar.date}"
+                    f"Bar {i}: IB={bar.date}, Eastern={bar_eastern.strftime('%Y-%m-%d %H:%M %Z')}, "
+                    f"display={display_time.strftime('%Y-%m-%d %H:%M')}, timestamp={timestamp}"
                 )
 
             data.append({

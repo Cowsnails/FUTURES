@@ -225,8 +225,23 @@ class LiveCandlestickBuilder:
         """Initialize a new candlestick bar"""
         self.current_bar_start_time = bar_start
 
+        # Convert to Eastern time for display
+        eastern = pytz.timezone('US/Eastern')
+        bar_eastern = bar_start.astimezone(eastern)
+
+        # Create "display timestamp" - treat Eastern time as if it were UTC
+        display_time = datetime(
+            bar_eastern.year,
+            bar_eastern.month,
+            bar_eastern.day,
+            bar_eastern.hour,
+            bar_eastern.minute,
+            bar_eastern.second,
+            tzinfo=pytz.UTC
+        )
+
         self.current_bar = {
-            'time': int(bar_start.timestamp()),
+            'time': int(display_time.timestamp()),
             'open': price,
             'high': price,
             'low': price,
@@ -235,7 +250,7 @@ class LiveCandlestickBuilder:
         }
 
         logger.info(
-            f"[{self.contract.symbol}] New bar started at {bar_start.strftime('%H:%M:%S')} "
+            f"[{self.contract.symbol}] New bar started at {bar_eastern.strftime('%H:%M:%S %Z')} "
             f"| Open: {price:.2f}"
         )
 
@@ -374,18 +389,34 @@ class KeepUpToDateStreamer:
 
     def _convert_bar(self, bar) -> Dict[str, Any]:
         """
-        Convert IB bar to standard format.
+        Convert IB bar to standard format with Eastern time display.
 
-        IB's timestamps are CORRECT - use them!
+        CRITICAL: Convert to Eastern time for chart display.
         """
+        eastern = pytz.timezone('US/Eastern')
+
         # Parse IB's timestamp
         if isinstance(bar.date, datetime):
-            timestamp = int(bar.date.timestamp())
+            bar_time = bar.date
         else:
             # String format: 'YYYYMMDD  HH:MM:SS'
             naive_dt = datetime.strptime(bar.date, '%Y%m%d  %H:%M:%S')
-            dt = pytz.UTC.localize(naive_dt)
-            timestamp = int(dt.timestamp())
+            bar_time = pytz.UTC.localize(naive_dt)
+
+        # Convert to Eastern time
+        bar_eastern = bar_time.astimezone(eastern)
+
+        # Create "display timestamp" - treat Eastern time as if it were UTC
+        display_time = datetime(
+            bar_eastern.year,
+            bar_eastern.month,
+            bar_eastern.day,
+            bar_eastern.hour,
+            bar_eastern.minute,
+            bar_eastern.second,
+            tzinfo=pytz.UTC
+        )
+        timestamp = int(display_time.timestamp())
 
         return {
             'time': timestamp,
