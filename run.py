@@ -5,12 +5,22 @@ Futures Charting Application - Single Command Startup
 This script starts the FastAPI server and optionally opens a browser.
 """
 
+import asyncio
+import sys
+
+# Windows-specific event loop configuration - MUST be before other imports
+if sys.platform == 'win32':
+    # Use ProactorEventLoop (default on Windows) - works better with nest_asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    import nest_asyncio
+    nest_asyncio.apply()
+    print("✓ Applied Windows compatibility patches for ib_insync")
+
 import uvicorn
 import webbrowser
 import threading
 import time
 import argparse
-import sys
 import yaml
 from pathlib import Path
 

@@ -5,6 +5,18 @@ Provides WebSocket streaming of real-time and historical market data.
 """
 
 import asyncio
+import sys
+
+# CRITICAL: Windows-specific event loop configuration - MUST be first
+if sys.platform == 'win32':
+    # Use SelectorEventLoop on Windows for compatibility with ib_insync
+    # ProactorEventLoop causes "Future attached to different loop" errors
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    import nest_asyncio
+    nest_asyncio.apply()
+    # Apply Windows-specific ib_insync patches
+    import backend.ib_windows_patch
+
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -15,6 +27,55 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yaml
 from pathlib import Path
+
+# CRITICAL: Monkey-patch ib_insync.util.getLoop() to fix "Future attached to different loop" error
+import ib_insync.util as ib_util
+import ib_insync.connection as ib_conn
+
+_original_getLoop = ib_util.getLoop
+_original_connectAsync = ib_conn.Connection.connectAsync
+
+def patched_getLoop():
+    """
+    Patched getLoop that always returns the running loop if available.
+
+    The original getLoop() calls get_event_loop() which may return a different
+    loop than the one currently running (especially in uvicorn), causing
+    "Future attached to different loop" errors.
+    """
+    try:
+        # If we're inside an async context, use the running loop
+        loop = asyncio.get_running_loop()
+        print(f"DEBUG patched_getLoop: returning running loop {id(loop)}")
+        return loop
+    except RuntimeError:
+        # No running loop, fall back to original behavior
+        original_loop = _original_getLoop()
+        print(f"DEBUG patched_getLoop: no running loop, returning original {id(original_loop)}")
+        return original_loop
+
+async def patched_connectAsync(self, host, port):
+    """Patched connectAsync with detailed debugging"""
+    if self.transport:
+        self.disconnect()
+        await self.disconnected
+    self.reset()
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    loop = ib_util.getLoop()
+
+    print(f"DEBUG connectAsync: running_loop={id(running_loop) if running_loop else 'None'}, getLoop={id(loop)}, same={running_loop is loop}")
+
+    self.transport, _ = await loop.create_connection(
+        lambda: self, host, port)
+
+ib_util.getLoop = patched_getLoop
+ib_conn.Connection.connectAsync = patched_connectAsync
+print("✓ Patched ib_insync.util.getLoop() and Connection.connectAsync() with debugging")
 
 from .ib_service import IBConnectionManager
 from .contracts import get_current_contract, get_contract_info
@@ -234,6 +295,36 @@ class ConnectionManager:
 connection_manager = ConnectionManager()
 
 
+async def prefetch_all_tickers():
+    """Pre-fetch historical data for all tickers at startup"""
+    symbols = ['MNQ', 'MES', 'MGC']
+    duration = config['data']['default_duration']
+
+    for symbol in symbols:
+        try:
+            logger.info(f"Pre-fetching {symbol} historical data...")
+            contract = get_current_contract(symbol)
+
+            # Fetch and cache data
+            data = await historical_fetcher.fetch_recent(
+                contract,
+                duration=duration,
+                bar_size='1 min'
+            )
+
+            if data is not None and len(data) > 0:
+                logger.info(f"✓ Pre-fetched {len(data)} bars for {symbol}")
+            else:
+                logger.warning(f"⚠ No data fetched for {symbol}")
+
+            # Small delay between requests to avoid pacing violations
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Error pre-fetching {symbol}: {e}")
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
@@ -261,10 +352,10 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to connect to IB Gateway - application will not function")
         # Continue anyway to allow health checks
     else:
-        # Initialize real-time manager (use keepUpToDate by default)
+        # Initialize real-time manager (use tick-by-tick with L2 data)
         realtime_manager = RealtimeManager(
             ib=ib_manager.ib,
-            use_tick_by_tick=False,  # Can be made configurable
+            use_tick_by_tick=True,  # User has CME Real-Time L2 subscription
             bar_size_minutes=1
         )
 
@@ -273,6 +364,10 @@ async def lifespan(app: FastAPI):
             ib=ib_manager.ib,
             cache=cache
         )
+
+        # Pre-fetch all tickers at startup to avoid fetching on ticker switch
+        logger.info("Pre-fetching historical data for all tickers...")
+        await prefetch_all_tickers()
 
         logger.info("Application started successfully")
 
@@ -387,6 +482,22 @@ async def list_contracts():
     }
 
 
+@app.get("/api/timeframes")
+async def list_timeframes():
+    """List available timeframes"""
+    return {
+        "timeframes": [
+            {"value": "1min", "label": "1 Minute", "seconds": 60},
+            {"value": "5min", "label": "5 Minutes", "seconds": 300},
+            {"value": "15min", "label": "15 Minutes", "seconds": 900},
+            {"value": "30min", "label": "30 Minutes", "seconds": 1800},
+            {"value": "1H", "label": "1 Hour", "seconds": 3600},
+            {"value": "2H", "label": "2 Hours", "seconds": 7200},
+            {"value": "4H", "label": "4 Hours", "seconds": 14400}
+        ]
+    }
+
+
 @app.get("/api/cache/{symbol}")
 async def get_cache_info(symbol: str):
     """Get cache information for a symbol"""
@@ -401,8 +512,8 @@ async def get_cache_info(symbol: str):
         raise HTTPException(status_code=404, detail=f"No cache found for {symbol}")
 
 
-@app.websocket("/ws/{symbol}")
-async def websocket_endpoint(websocket: WebSocket, symbol: str):
+@app.websocket("/ws/{symbol}/{timeframe}")
+async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str = "1min"):
     """
     WebSocket endpoint for real-time market data.
 
@@ -410,34 +521,57 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
     - Sends historical data on connection
     - Streams real-time bar updates
     - Messages: {type: 'historical'|'bar_update', data: {...}, is_new_bar: bool}
+
+    Args:
+        symbol: Trading symbol (MNQ, MES, MGC)
+        timeframe: Bar timeframe (1min, 5min, 15min, 30min, 1H, 2H, 4H)
     """
+    logger.info(f"WebSocket connection request for {symbol} ({timeframe})")
+
     # Validate symbol
     if symbol not in ['MNQ', 'MES', 'MGC']:
+        logger.error(f"Invalid symbol: {symbol}")
         await websocket.close(code=1003, reason=f"Invalid symbol: {symbol}")
+        return
+
+    # Validate timeframe
+    valid_timeframes = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
+    if timeframe not in valid_timeframes:
+        logger.error(f"Invalid timeframe: {timeframe}")
+        await websocket.close(code=1003, reason=f"Invalid timeframe: {timeframe}")
         return
 
     # Check if IB Gateway is connected
     if not ib_manager or not ib_manager.is_connected():
+        logger.error("IB Gateway not connected - closing WebSocket")
         await websocket.close(code=1011, reason="IB Gateway not connected")
         return
 
     # Accept connection
+    logger.info(f"Accepting WebSocket connection for {symbol}")
     await connection_manager.connect(websocket, symbol)
 
     try:
         # Get contract
         contract = get_current_contract(symbol)
+
+        # CRITICAL: Qualify contract before starting tick-by-tick stream
+        # Without this, IB Gateway doesn't know which exact contract to stream
+        logger.info(f"Qualifying contract for {symbol}...")
         await ib_manager.ib.qualifyContractsAsync(contract)
+        logger.info(f"Contract qualified: {contract.localSymbol} (conId: {contract.conId})")
 
-        logger.info(f"Starting data stream for {symbol}")
+        logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
 
-        # Step 1: Send cached or fetch historical data
-        if historical_fetcher:
+        # Step 1: Load ONLY from cache (pre-fetched at startup)
+        if cache:
             try:
-                historical_data = await historical_fetcher.fetch_year(
-                    contract,
-                    use_cache=True,
-                    cache_max_age_hours=config['data']['cache_max_age_hours']
+                logger.info(f"Loading cached historical data for {symbol} ({timeframe})...")
+                # ONLY load from cache, NEVER fetch from IB Gateway
+                historical_data = cache.load(
+                    symbol,
+                    bar_size=timeframe,
+                    max_age_hours=config['data']['cache_max_age_hours']
                 )
 
                 if historical_data is not None and len(historical_data) > 0:
@@ -462,12 +596,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                         'indicators': indicators_data
                     })
 
-                    logger.info(f"Sent {len(data_list)} historical bars to client")
+                    logger.info(f"Sent {len(data_list)} cached historical bars to client")
                 else:
-                    logger.warning(f"No historical data available for {symbol}")
+                    logger.warning(f"No cached data available for {symbol} - was it pre-fetched at startup?")
 
             except Exception as e:
-                logger.error(f"Error fetching historical data: {e}")
+                logger.error(f"Error loading cached data: {e}")
                 await connection_manager.send_to_client(websocket, {
                     'type': 'error',
                     'message': f"Failed to fetch historical data: {str(e)}"
@@ -475,27 +609,38 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
 
         # Step 2: Start real-time streaming
         if realtime_manager:
-            # Callback for bar updates
-            async def on_bar_update(bar_data: dict, is_new_bar: bool):
-                """Called on every bar update"""
-                await connection_manager.broadcast(symbol, {
-                    'type': 'bar_update',
-                    'data': bar_data,
-                    'is_new_bar': is_new_bar,
-                    'symbol': symbol
-                })
+            try:
+                # Callback for bar updates
+                async def on_bar_update(bar_data: dict, is_new_bar: bool):
+                    """Called on every bar update"""
+                    logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
+                    await connection_manager.broadcast(symbol, {
+                        'type': 'bar_update',
+                        'data': bar_data,
+                        'is_new_bar': is_new_bar,
+                        'symbol': symbol
+                    }, immediate=True)  # Send immediately, no batching for real-time price updates
 
-            # Start streaming
-            success = await realtime_manager.start_stream(contract, on_bar_update)
+                # Start streaming
+                logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")
+                success = await realtime_manager.start_stream(contract, on_bar_update)
 
-            if success:
-                logger.info(f"Real-time stream started for {symbol}")
-            else:
-                logger.error(f"Failed to start real-time stream for {symbol}")
+                if success:
+                    logger.info(f"✓ Real-time stream started successfully for {symbol}")
+                else:
+                    logger.error(f"❌ start_stream() returned False for {symbol}")
+                    await connection_manager.send_to_client(websocket, {
+                        'type': 'error',
+                        'message': "Failed to start real-time stream"
+                    })
+            except Exception as e:
+                logger.error(f"❌ Exception starting real-time stream for {symbol}: {e}", exc_info=True)
                 await connection_manager.send_to_client(websocket, {
                     'type': 'error',
-                    'message': "Failed to start real-time stream"
+                    'message': f"Failed to start real-time stream: {str(e)}"
                 })
+        else:
+            logger.warning("realtime_manager is None - cannot start streaming")
 
         # Keep connection alive and handle incoming messages
         while True:
@@ -512,19 +657,25 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str):
                 await websocket.send_json({'type': 'ping'})
 
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected from {symbol}")
+        logger.info(f"Client disconnected from {symbol} (WebSocket close event)")
 
     except Exception as e:
-        logger.error(f"WebSocket error for {symbol}: {e}")
+        logger.error(f"WebSocket error for {symbol}: {e}", exc_info=True)
 
     finally:
-        # Clean up
+        # Check if this is the last client BEFORE disconnecting
+        remaining_clients = len(connection_manager.active_connections.get(symbol, set())) - 1
+
+        # Clean up connection
         connection_manager.disconnect(websocket, symbol)
+        logger.info(f"Cleaned up WebSocket for {symbol} ({remaining_clients} clients remaining)")
 
         # Stop streaming if no more clients for this symbol
-        if realtime_manager and symbol not in connection_manager.active_connections:
+        if realtime_manager and remaining_clients == 0:
+            logger.info(f"Last client disconnected - stopping stream for {symbol}")
             realtime_manager.stop_stream(symbol)
-            logger.info(f"Stopped real-time stream for {symbol} (no clients)")
+        elif remaining_clients > 0:
+            logger.info(f"Keeping stream alive for {symbol} ({remaining_clients} clients still connected)")
 
 
 @app.get("/api/statistics")

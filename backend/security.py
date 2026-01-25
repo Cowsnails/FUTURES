@@ -189,7 +189,7 @@ def validate_bar_size(bar_size: str) -> bool:
     Returns:
         True if valid, raises HTTPException otherwise
     """
-    valid_bar_sizes = ["1 min", "5 mins", "15 mins", "30 mins", "1 hour", "1 day"]
+    valid_bar_sizes = ["1 min", "5 mins", "15 mins", "30 mins", "1 hour", "2 hours", "4 hours", "1 day"]
 
     if bar_size not in valid_bar_sizes:
         raise HTTPException(

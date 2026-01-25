@@ -79,15 +79,15 @@ class DataCache:
             # Save data
             data.to_parquet(cache_path, compression='snappy', index=False)
 
-            # Create metadata
+            # Create metadata (convert numpy types to native Python types)
             meta = {
                 'symbol': symbol,
                 'bar_size': bar_size,
                 'fetch_time': datetime.now().isoformat(),
-                'bar_count': len(data),
-                'first_date': data['time'].min() if len(data) > 0 else None,
-                'last_date': data['time'].max() if len(data) > 0 else None,
-                'file_size_bytes': cache_path.stat().st_size,
+                'bar_count': int(len(data)),
+                'first_date': str(data['time'].min()) if len(data) > 0 else None,
+                'last_date': str(data['time'].max()) if len(data) > 0 else None,
+                'file_size_bytes': int(cache_path.stat().st_size),
             }
 
             # Add custom metadata
