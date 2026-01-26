@@ -611,22 +611,15 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
         if realtime_manager:
             try:
                 # Callback for bar updates
-                async def on_bar_update(bar_data: dict, is_new_bar: bool, analysis: dict = None):
-                    """Called on every bar update with comprehensive analysis"""
+                async def on_bar_update(bar_data: dict, is_new_bar: bool):
+                    """Called on every bar update"""
                     logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
-
-                    message = {
+                    await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
                         'is_new_bar': is_new_bar,
                         'symbol': symbol
-                    }
-
-                    # Include analysis if available
-                    if analysis:
-                        message['analysis'] = analysis
-
-                    await connection_manager.broadcast(symbol, message, immediate=True)  # Send immediately, no batching for real-time price updates
+                    }, immediate=True)  # Send immediately, no batching for real-time price updates
 
                 # Start streaming
                 logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")

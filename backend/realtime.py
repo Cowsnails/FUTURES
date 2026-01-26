@@ -4,12 +4,6 @@ Real-Time Data Streaming
 Provides real-time candlestick updates using two approaches:
 1. Tick-by-tick streaming (true real-time, 50-300ms latency)
 2. KeepUpToDate streaming (simpler, 5-second updates)
-
-NOW WITH INTEGRATED MULTI-FACTOR ANALYSIS:
-- Delta Flow (tick-by-tick)
-- GEX Ratio (gamma regime)
-- Gravity (price magnets)
-- Decision Tree (trading signals)
 """
 
 import asyncio
@@ -19,8 +13,6 @@ from typing import Optional, Callable, Dict, Any
 from collections import deque
 from ib_insync import IB, Contract, Ticker, TickByTickAllLast
 import pytz
-
-from .analysis import IntegratedAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +39,7 @@ class LiveCandlestickBuilder:
             ib: Connected IB instance
             contract: Futures contract to stream
             bar_size_minutes: Candlestick duration in minutes (default: 1)
-            on_bar_callback: Async callback(bar_data: dict, is_new_bar: bool, analysis: dict)
+            on_bar_callback: Async callback(bar_data: dict, is_new_bar: bool)
         """
         self.ib = ib
         self.contract = contract
@@ -58,10 +50,6 @@ class LiveCandlestickBuilder:
         self.ticker: Optional[Ticker] = None
         self.current_bar: Optional[Dict[str, Any]] = None
         self.current_bar_start_time: Optional[datetime] = None
-
-        # Initialize integrated analyzer
-        self.analyzer = IntegratedAnalyzer()
-        logger.info(f"[{self.contract.symbol}] Integrated analyzer initialized")
 
         self.stats = {
             'ticks_processed': 0,
@@ -173,9 +161,6 @@ class LiveCandlestickBuilder:
         """Process a single tick and update current bar"""
         self.stats['ticks_processed'] += 1
 
-        # Feed tick to delta analyzer
-        self.analyzer.process_tick(tick_time, price, size)
-
         # Log tick processing stats every 100 ticks
         if self.stats['ticks_processed'] % 100 == 0:
             logger.debug(
@@ -191,7 +176,7 @@ class LiveCandlestickBuilder:
 
         # Check if we need to finalize previous bar and start new one
         if self.current_bar_start_time and bar_start > self.current_bar_start_time:
-            # Finalize current bar with analysis
+            # Finalize current bar
             self._finalize_bar(is_new_bar=True)
 
             # Start new bar
@@ -208,30 +193,18 @@ class LiveCandlestickBuilder:
             self._update_bar(price, size)
             is_new_bar = False
 
-        # Generate comprehensive analysis
-        if self.current_bar:
-            analysis = self.analyzer.process_bar(
-                timestamp=tick_time,
-                open_price=self.current_bar['open'],
-                high=self.current_bar['high'],
-                low=self.current_bar['low'],
-                close=self.current_bar['close'],
-                volume=self.current_bar['volume'],
-                is_new_bar=is_new_bar
+        # Send update to callback (schedule async callback on event loop)
+        if self.on_bar and self.current_bar and self.loop:
+            bar_data = self.current_bar.copy()
+
+            # Schedule the async callback on the event loop
+            # This avoids "event loop already running" errors on Windows
+            asyncio.run_coroutine_threadsafe(
+                self.on_bar(bar_data, is_new_bar),
+                self.loop
             )
 
-            # Send update to callback (schedule async callback on event loop)
-            if self.on_bar and self.loop:
-                bar_data = self.current_bar.copy()
-
-                # Schedule the async callback on the event loop
-                # This avoids "event loop already running" errors on Windows
-                asyncio.run_coroutine_threadsafe(
-                    self.on_bar(bar_data, is_new_bar, analysis),
-                    self.loop
-                )
-
-                self.stats['bars_updated'] += 1
+            self.stats['bars_updated'] += 1
 
     def _get_bar_start_time(self, tick_time: datetime) -> datetime:
         """
