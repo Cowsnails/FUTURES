@@ -153,9 +153,9 @@ class HistoricalDataFetcher:
                     logger.warning(f"[{symbol}] No new data fetched - using existing cache")
                     return existing_data
         else:
-            # No cache - fetch full year
+            # No cache - fetch full duration (chunked)
             self.stats['cache_misses'] += 1
-            logger.info(f"[{symbol}] No cache found - fetching full year...")
+            logger.info(f"[{symbol}] No cache found - fetching historical data (chunked)...")
 
             data = await self._fetch_year_chunked(contract, end_date)
 
@@ -209,9 +209,10 @@ class HistoricalDataFetcher:
         errors_count = 0
         max_consecutive_errors = 3
 
+        days_to_fetch = (end - start).days
         logger.info(
-            f"Fetching data from {start.strftime('%Y-%m-%d')} "
-            f"to {end.strftime('%Y-%m-%d')}"
+            f"[{contract.symbol}] Fetching {days_to_fetch} days of data "
+            f"({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')})"
         )
 
         while current_end > start and errors_count < max_consecutive_errors:
@@ -455,6 +456,21 @@ class HistoricalDataFetcher:
 
         return df
 
+    def _parse_duration_days(self, duration: str) -> int:
+        """Parse duration string to number of days."""
+        duration = duration.strip().upper()
+        if duration.endswith('D'):
+            return int(duration[:-1].strip())
+        elif duration.endswith('W'):
+            return int(duration[:-1].strip()) * 7
+        elif duration.endswith('M'):
+            return int(duration[:-1].strip()) * 30
+        elif duration.endswith('Y'):
+            return int(duration[:-1].strip()) * 365
+        else:
+            # Assume days if no suffix
+            return int(duration.split()[0])
+
     async def fetch_recent(
         self,
         contract: Contract,
@@ -465,15 +481,14 @@ class HistoricalDataFetcher:
         """
         Fetch recent data with INCREMENTAL updates - only fetches missing data.
 
-        This method is smart about caching:
-        1. Checks if cached data exists for this symbol
-        2. If exists, only fetches data from last cached timestamp to now
-        3. Merges new data with existing cached data
-        4. Saves the combined result
+        Smart behavior:
+        1. If cache exists: only fetches gap between last bar and now
+        2. If no cache and duration > 5 days: uses chunked fetching
+        3. If no cache and duration <= 5 days: single request
 
         Args:
             contract: Futures contract
-            duration: Duration string (e.g., '1 D', '5 D') - used if NO cache exists
+            duration: Duration string (e.g., '1 D', '60 D') - used if NO cache exists
             bar_size: Bar size (e.g., '1 min', '5 mins')
             cache_all_timeframes: If True, aggregate and cache all timeframes
 
@@ -502,25 +517,55 @@ class HistoricalDataFetcher:
                     logger.info(f"[{symbol}] Cache is fresh (last update: {gap.total_seconds():.0f}s ago) - skipping fetch")
                     return existing_data
 
-                # Determine fetch duration based on gap
-                if gap_days <= 1:
-                    fetch_duration = '1 D'
-                elif gap_days <= 5:
+                # Determine fetch approach based on gap
+                if gap_days <= 5:
                     fetch_duration = f'{gap_days} D'
+                    use_chunked = False
                 else:
-                    # Gap is too large, might need multiple requests
-                    fetch_duration = '5 D'
+                    # Large gap - use chunked fetching
+                    use_chunked = True
+                    start_date = last_datetime
 
                 logger.info(
                     f"[{symbol}] Incremental update: cache has {len(existing_data)} bars "
                     f"(last: {last_datetime.strftime('%Y-%m-%d %H:%M')}), "
-                    f"fetching {fetch_duration} to fill {gap_days} day gap"
+                    f"gap is {gap_days} days"
                 )
+
+                if use_chunked:
+                    # Use chunked fetch for large gaps
+                    new_data = await self._fetch_year_chunked(contract, start_date=start_date)
+                    if new_data is not None and len(new_data) > 0:
+                        combined = pd.concat([existing_data, new_data], ignore_index=True)
+                        combined = combined.drop_duplicates(subset=['time'], keep='last')
+                        combined = combined.sort_values('time').reset_index(drop=True)
+
+                        # Save and aggregate
+                        self.cache.save(symbol, combined, bar_size='1min')
+                        if cache_all_timeframes:
+                            self._cache_all_timeframes(symbol, combined)
+                        return combined
+                    return existing_data
             else:
-                # No existing data - fetch full duration
+                # No existing data - determine if we need chunked fetch
                 existing_data = None
-                fetch_duration = duration
-                logger.info(f"[{symbol}] No cache found - fetching full {duration}")
+                duration_days = self._parse_duration_days(duration)
+
+                if duration_days > 5:
+                    # Large duration - use chunked fetching
+                    logger.info(f"[{symbol}] No cache found - fetching {duration_days} days (chunked)...")
+                    start_date = datetime.now(pytz.UTC) - timedelta(days=duration_days)
+                    data = await self._fetch_year_chunked(contract, start_date=start_date)
+
+                    if data is not None and len(data) > 0:
+                        self.cache.save(symbol, data, bar_size='1min')
+                        logger.info(f"[{symbol}] Saved {len(data)} bars to cache")
+                        if cache_all_timeframes:
+                            self._cache_all_timeframes(symbol, data)
+                    return data
+                else:
+                    fetch_duration = duration
+                    logger.info(f"[{symbol}] No cache found - fetching {duration}")
 
             # Create pacing request
             pacing_request = HistoricalRequest(
