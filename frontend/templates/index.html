@@ -312,6 +312,7 @@
         let latestBarTime = null;
         let countdownInterval = null;
         let intentionalDisconnect = false;  // Track if user is closing page
+        let isManualReconnect = false;  // Track if user is switching timeframe/symbol
         let futureMarkersSeries = null;  // Series for future time vertical lines
 
         // Timeframe to seconds mapping
@@ -495,8 +496,9 @@
             updateStatus('connecting', `Connecting to ${symbol} (${currentTimeframe})...`);
             showLoading(`Loading ${symbol} data (${currentTimeframe})...`);
 
-            // Close existing connection
+            // Close existing connection (mark as manual reconnect to prevent auto-reconnect)
             if (ws) {
+                isManualReconnect = true;
                 ws.close();
             }
 
@@ -532,7 +534,14 @@
                     return;
                 }
 
-                // Attempt reconnection
+                // Don't auto-reconnect if this was a manual reconnect (timeframe/symbol change)
+                if (isManualReconnect) {
+                    console.log('Manual reconnect in progress - skipping auto-reconnect');
+                    isManualReconnect = false;  // Reset flag
+                    return;
+                }
+
+                // Attempt reconnection (only for unexpected disconnects)
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
                 reconnectAttempts++;
 
