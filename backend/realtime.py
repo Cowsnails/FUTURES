@@ -130,7 +130,10 @@ class LiveCandlestickBuilder:
         """Stop streaming"""
         if self.ticker:
             logger.info(f"Stopping tick-by-tick stream for {self.contract.symbol}")
-            self.ib.cancelTickByTickData(self.contract)
+            try:
+                self.ib.cancelTickByTickData(self.contract, 'AllLast')
+            except Exception as e:
+                logger.warning(f"Error canceling tick data: {e}")
             self.ticker = None
 
     def _on_tick(self, ticker: Ticker):
