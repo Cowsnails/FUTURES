@@ -397,6 +397,24 @@
             }
 
             /**
+             * Initialize the aggregator with a bar from historical data
+             * This ensures real-time bars connect properly without visual gaps
+             * @param {Object} bar - The last bar from historical data
+             */
+            initializeWithBar(bar) {
+                const barStartTime = this.getBarStartTime(bar.time);
+                this.currentBar = {
+                    time: barStartTime,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume
+                };
+                console.log(`BarAggregator initialized with bar at ${new Date(barStartTime * 1000).toLocaleString()}`);
+            }
+
+            /**
              * Set the timeframe
              * @param {number} timeframeSeconds - New timeframe in seconds
              */
@@ -625,7 +643,7 @@
         function handleHistoricalData(msg) {
             console.log(`Received ${msg.data.length} historical bars`);
 
-            // Reset the bar aggregator for fresh start
+            // Reset the bar aggregator
             barAggregator.reset();
 
             // Debug: Check first and last bar timestamps
@@ -637,6 +655,10 @@
                 console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()}`);
                 console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()}`);
                 console.log('=======================');
+
+                // Initialize bar aggregator with the last historical bar
+                // This ensures real-time bars connect properly without gaps
+                barAggregator.initializeWithBar(lastBar);
             }
 
             // Set candlestick data
