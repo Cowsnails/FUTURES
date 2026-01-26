@@ -296,28 +296,35 @@ connection_manager = ConnectionManager()
 
 
 async def prefetch_all_tickers():
-    """Pre-fetch historical data for all tickers at startup"""
+    """
+    Pre-fetch historical data for all tickers at startup.
+
+    Uses incremental updates:
+    - If cache exists: only fetches missing data (gap from last bar to now)
+    - If no cache: fetches full year of data
+    """
     symbols = ['MNQ', 'MES', 'MGC']
-    duration = config['data']['default_duration']
 
     for symbol in symbols:
         try:
-            logger.info(f"Pre-fetching {symbol} historical data...")
+            logger.info(f"Pre-fetching {symbol} historical data (1 year with incremental update)...")
             contract = get_current_contract(symbol)
 
-            # Fetch and cache data
-            data = await historical_fetcher.fetch_recent(
+            # Qualify the contract first
+            await ib_manager.ib.qualifyContractsAsync(contract)
+
+            # Fetch with incremental updates - only gets missing data
+            data = await historical_fetcher.fetch_year(
                 contract,
-                duration=duration,
-                bar_size='1 min'
+                cache_all_timeframes=True
             )
 
             if data is not None and len(data) > 0:
-                logger.info(f"✓ Pre-fetched {len(data)} bars for {symbol}")
+                logger.info(f"✓ {symbol}: {len(data)} total bars in cache")
             else:
                 logger.warning(f"⚠ No data fetched for {symbol}")
 
-            # Small delay between requests to avoid pacing violations
+            # Small delay between tickers
             await asyncio.sleep(2)
 
         except Exception as e:
