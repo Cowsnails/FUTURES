@@ -880,10 +880,10 @@
             connect(newSymbol);
         });
 
-        // Timeframe selector
+        // Timeframe selector - NO RECONNECTION, just send message!
         document.getElementById('timeframe-select').addEventListener('change', (e) => {
             const newTimeframe = e.target.value;
-            console.log(`Switching to ${newTimeframe} timeframe`);
+            console.log(`Switching to ${newTimeframe} timeframe (no reconnect)`);
 
             // Update current timeframe
             currentTimeframe = newTimeframe;
@@ -905,8 +905,21 @@
                 indicatorRenderer.removeAllIndicators();
             }
 
-            // Reconnect with new timeframe
-            connect(currentSymbol);
+            // Show loading while switching
+            showLoading(`Switching to ${newTimeframe}...`);
+
+            // Send message to switch timeframe - NO RECONNECTION!
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'switch_timeframe',
+                    timeframe: newTimeframe
+                }));
+                console.log(`Sent switch_timeframe message for ${newTimeframe}`);
+            } else {
+                // WebSocket not connected, need to reconnect
+                console.warn('WebSocket not connected, reconnecting...');
+                connect(currentSymbol);
+            }
         });
 
         // ═══════════════════════════════════════════════════════════
