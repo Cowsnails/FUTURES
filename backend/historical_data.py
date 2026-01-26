@@ -497,6 +497,10 @@ class HistoricalDataFetcher:
         """
         symbol = contract.symbol
 
+        # Parse duration upfront for logging
+        duration_days = self._parse_duration_days(duration)
+        logger.info(f"[{symbol}] fetch_recent called: duration='{duration}' ({duration_days} days)")
+
         try:
             # Check for existing cached data
             existing_data = self.cache.load(symbol, bar_size='1min', max_age_hours=None)
@@ -553,8 +557,8 @@ class HistoricalDataFetcher:
 
                 if duration_days > 5:
                     # Large duration - use chunked fetching
-                    logger.info(f"[{symbol}] No cache found - fetching {duration_days} days (chunked)...")
                     start_date = datetime.now(pytz.UTC) - timedelta(days=duration_days)
+                    logger.info(f"[{symbol}] No cache - using CHUNKED fetch for {duration_days} days (start: {start_date.strftime('%Y-%m-%d')})")
                     data = await self._fetch_year_chunked(contract, start_date=start_date)
 
                     if data is not None and len(data) > 0:
