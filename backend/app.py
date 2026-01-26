@@ -306,24 +306,26 @@ async def prefetch_all_tickers():
 
     Uses incremental updates:
     - If cache exists: only fetches missing data (gap from last bar to now)
-    - If no cache: fetches full year of data
+    - If no cache: fetches configured duration (default_duration from config)
 
     After fetching, ALL timeframes are loaded into memory for instant switching.
     """
     global preloaded_data
     symbols = ['MNQ', 'MES', 'MGC']
+    duration = config['data']['default_duration']  # e.g., "60 D"
 
     for symbol in symbols:
         try:
-            logger.info(f"Pre-fetching {symbol} historical data (1 year with incremental update)...")
+            logger.info(f"Pre-fetching {symbol} historical data ({duration} with incremental update)...")
             contract = get_current_contract(symbol)
 
             # Qualify the contract first
             await ib_manager.ib.qualifyContractsAsync(contract)
 
             # Fetch with incremental updates - only gets missing data
-            data = await historical_fetcher.fetch_year(
+            data = await historical_fetcher.fetch_recent(
                 contract,
+                duration=duration,
                 cache_all_timeframes=True
             )
 
