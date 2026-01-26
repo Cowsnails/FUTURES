@@ -427,7 +427,7 @@
                     horzLines: { color: COLORS.GRID },
                 },
                 crosshair: {
-                    mode: LightweightCharts.CrosshairMode.Normal,  // Follow mouse exactly, don't snap to data
+                    mode: 0,  // 0 = Normal (follows mouse), 1 = Magnet (snaps to data)
                     vertLine: {
                         color: COLORS.CROSSHAIR,
                         labelBackgroundColor: '#2a2e39'
