@@ -383,23 +383,70 @@ class HistoricalDataFetcher:
         cache_all_timeframes: bool = True
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch recent data (useful for incremental cache updates).
+        Fetch recent data with INCREMENTAL updates - only fetches missing data.
+
+        This method is smart about caching:
+        1. Checks if cached data exists for this symbol
+        2. If exists, only fetches data from last cached timestamp to now
+        3. Merges new data with existing cached data
+        4. Saves the combined result
 
         Args:
             contract: Futures contract
-            duration: Duration string (e.g., '1 D', '1 W')
+            duration: Duration string (e.g., '1 D', '5 D') - used if NO cache exists
             bar_size: Bar size (e.g., '1 min', '5 mins')
             cache_all_timeframes: If True, aggregate and cache all timeframes
 
         Returns:
-            DataFrame with recent data
+            DataFrame with all data (existing + new)
         """
+        symbol = contract.symbol
+
         try:
+            # Check for existing cached data
+            existing_data = self.cache.load(symbol, bar_size='1min', max_age_hours=None)
+            metadata = self.cache.get_metadata(symbol, bar_size='1min')
+
+            if existing_data is not None and len(existing_data) > 0 and metadata:
+                # We have existing data - do incremental update
+                last_timestamp = existing_data['time'].max()
+                last_datetime = datetime.fromtimestamp(last_timestamp, tz=pytz.UTC)
+                now = datetime.now(pytz.UTC)
+
+                # Calculate gap in days
+                gap = now - last_datetime
+                gap_days = gap.days + 1  # Add 1 to ensure overlap
+
+                if gap_days <= 0 or gap.total_seconds() < 120:
+                    # Data is very fresh (less than 2 minutes old), no need to fetch
+                    logger.info(f"[{symbol}] Cache is fresh (last update: {gap.total_seconds():.0f}s ago) - skipping fetch")
+                    return existing_data
+
+                # Determine fetch duration based on gap
+                if gap_days <= 1:
+                    fetch_duration = '1 D'
+                elif gap_days <= 5:
+                    fetch_duration = f'{gap_days} D'
+                else:
+                    # Gap is too large, might need multiple requests
+                    fetch_duration = '5 D'
+
+                logger.info(
+                    f"[{symbol}] Incremental update: cache has {len(existing_data)} bars "
+                    f"(last: {last_datetime.strftime('%Y-%m-%d %H:%M')}), "
+                    f"fetching {fetch_duration} to fill {gap_days} day gap"
+                )
+            else:
+                # No existing data - fetch full duration
+                existing_data = None
+                fetch_duration = duration
+                logger.info(f"[{symbol}] No cache found - fetching full {duration}")
+
             # Create pacing request
             pacing_request = HistoricalRequest(
                 contract_id=contract.conId or 0,
                 end_datetime='',
-                duration=duration,
+                duration=fetch_duration,
                 bar_size=bar_size,
                 what_to_show='TRADES',
                 timestamp=datetime.now().timestamp()
@@ -408,12 +455,12 @@ class HistoricalDataFetcher:
             # Wait for pacing
             await self.pacing_manager.wait_if_needed(pacing_request)
 
-            # Request data using async method (Windows patches handle event loop)
+            # Request data using async method
             bars = await ib_request_with_retry(
                 self.ib.reqHistoricalDataAsync,
                 contract,
                 endDateTime='',
-                durationStr=duration,
+                durationStr=fetch_duration,
                 barSizeSetting=bar_size,
                 whatToShow='TRADES',
                 useRTH=False,
@@ -422,32 +469,59 @@ class HistoricalDataFetcher:
             )
 
             if bars:
-                df = self._bars_to_dataframe(bars)
-                logger.info(f"Fetched {len(df)} recent bars for {contract.symbol}")
+                new_df = self._bars_to_dataframe(bars)
+                logger.info(f"[{symbol}] Fetched {len(new_df)} new bars from IB")
 
-                # Save 1-minute data to cache
-                self.cache.save(contract.symbol, df, bar_size='1min')
-                logger.info(f"Saved {len(df)} 1min bars to cache for {contract.symbol}")
+                # Merge with existing data if we have it
+                if existing_data is not None:
+                    # Combine old and new data
+                    combined = pd.concat([existing_data, new_df], ignore_index=True)
+
+                    # Remove duplicates (keep newer data if timestamps overlap)
+                    combined = combined.drop_duplicates(subset=['time'], keep='last')
+
+                    # Sort by time
+                    combined = combined.sort_values('time').reset_index(drop=True)
+
+                    new_bars_added = len(combined) - len(existing_data)
+                    logger.info(
+                        f"[{symbol}] Merged: {len(existing_data)} existing + {len(new_df)} fetched "
+                        f"= {len(combined)} total ({new_bars_added} new bars added)"
+                    )
+
+                    final_df = combined
+                else:
+                    final_df = new_df
+
+                # Save combined data to cache
+                self.cache.save(symbol, final_df, bar_size='1min')
+                logger.info(f"[{symbol}] Saved {len(final_df)} bars to cache")
 
                 # Aggregate and cache all timeframes
                 if cache_all_timeframes and bar_size == '1 min':
                     for tf in ['5min', '15min', '30min', '1H', '2H', '4H']:
                         try:
-                            aggregated = self.aggregate_bars(df, tf)
-                            self.cache.save(contract.symbol, aggregated, bar_size=tf)
-                            logger.info(
-                                f"Cached {len(aggregated)} {tf} bars for {contract.symbol}"
-                            )
+                            aggregated = self.aggregate_bars(final_df, tf)
+                            self.cache.save(symbol, aggregated, bar_size=tf)
+                            logger.debug(f"[{symbol}] Cached {len(aggregated)} {tf} bars")
                         except Exception as e:
                             logger.error(f"Error aggregating {tf} bars: {e}")
 
-                return df
+                return final_df
             else:
-                logger.warning(f"No recent data for {contract.symbol}")
+                # No new data from IB, return existing if available
+                if existing_data is not None:
+                    logger.warning(f"[{symbol}] No new data from IB - using existing cache")
+                    return existing_data
+                logger.warning(f"[{symbol}] No data available")
                 return None
 
         except Exception as e:
-            logger.error(f"Error fetching recent data: {e}")
+            logger.error(f"Error fetching recent data for {symbol}: {e}")
+            # Return existing cache on error
+            if existing_data is not None:
+                logger.info(f"[{symbol}] Returning existing cache due to fetch error")
+                return existing_data
             return None
 
     def aggregate_bars(
