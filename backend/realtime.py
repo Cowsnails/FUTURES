@@ -57,6 +57,99 @@ class LiveCandlestickBuilder:
             'bars_updated': 0,
         }
 
+    async def _fetch_current_bar(self):
+        """
+        Fetch the current incomplete bar from IB.
+
+        This is called BEFORE starting tick-by-tick streaming to ensure
+        we have the complete bar data from the beginning of the current minute,
+        not just from when we started streaming.
+        """
+        try:
+            logger.info(f"[{self.contract.symbol}] Fetching current incomplete bar...")
+
+            # Request just 1 bar (the current incomplete one)
+            # Using 60 seconds duration to get the current minute bar
+            bar_size_str = f"{int(self.bar_size.total_seconds() // 60)} min" if self.bar_size.total_seconds() >= 60 else "1 min"
+
+            bars = await self.ib.reqHistoricalDataAsync(
+                self.contract,
+                endDateTime='',  # Empty = now
+                durationStr='60 S',  # Just 60 seconds to get current bar
+                barSizeSetting=bar_size_str,
+                whatToShow='TRADES',
+                useRTH=False,  # Include extended hours
+                formatDate=2,  # UTC timestamps
+                keepUpToDate=False
+            )
+
+            if bars and len(bars) > 0:
+                # Get the most recent bar (should be the current incomplete one)
+                current_ib_bar = bars[-1]
+
+                # Parse bar time
+                if isinstance(current_ib_bar.date, datetime):
+                    bar_time = current_ib_bar.date
+                    if bar_time.tzinfo is None:
+                        bar_time = pytz.UTC.localize(bar_time)
+                else:
+                    # String format
+                    naive_dt = datetime.strptime(str(current_ib_bar.date), '%Y%m%d  %H:%M:%S')
+                    bar_time = pytz.UTC.localize(naive_dt)
+
+                # Calculate bar start time (align to bar size)
+                bar_start = self._get_bar_start_time(bar_time)
+                self.current_bar_start_time = bar_start
+
+                # Convert to Eastern time for display
+                eastern = pytz.timezone('US/Eastern')
+                bar_eastern = bar_start.astimezone(eastern)
+
+                # Create "display timestamp" - treat Eastern time as if it were UTC
+                display_time = datetime(
+                    bar_eastern.year,
+                    bar_eastern.month,
+                    bar_eastern.day,
+                    bar_eastern.hour,
+                    bar_eastern.minute,
+                    bar_eastern.second,
+                    tzinfo=pytz.UTC
+                )
+
+                # Initialize current bar with IB's data
+                self.current_bar = {
+                    'time': int(display_time.timestamp()),
+                    'open': float(current_ib_bar.open),
+                    'high': float(current_ib_bar.high),
+                    'low': float(current_ib_bar.low),
+                    'close': float(current_ib_bar.close),
+                    'volume': int(current_ib_bar.volume)
+                }
+
+                logger.info(
+                    f"[{self.contract.symbol}] ✓ Current bar initialized from IB: "
+                    f"{bar_eastern.strftime('%H:%M:%S %Z')} | "
+                    f"O: {self.current_bar['open']:.2f} "
+                    f"H: {self.current_bar['high']:.2f} "
+                    f"L: {self.current_bar['low']:.2f} "
+                    f"C: {self.current_bar['close']:.2f} "
+                    f"V: {self.current_bar['volume']}"
+                )
+
+                # Send initial bar update to frontend so chart shows the current bar immediately
+                if self.on_bar and self.loop:
+                    bar_data = self.current_bar.copy()
+                    asyncio.run_coroutine_threadsafe(
+                        self.on_bar(bar_data, True),  # is_new_bar=True to create the bar on chart
+                        self.loop
+                    )
+            else:
+                logger.warning(f"[{self.contract.symbol}] No current bar data returned from IB")
+
+        except Exception as e:
+            logger.warning(f"[{self.contract.symbol}] Could not fetch current bar: {e}")
+            # Continue anyway - tick streaming will create the bar
+
     async def start(self):
         """Start streaming tick-by-tick data"""
         logger.info(f"[{self.contract.symbol}] Starting tick-by-tick stream...")
@@ -73,6 +166,10 @@ class LiveCandlestickBuilder:
                     f"localSymbol={self.contract.localSymbol}. "
                     f"Call qualifyContractsAsync() first."
                 )
+
+            # CRITICAL: Fetch the current incomplete bar BEFORE starting tick stream
+            # This ensures we have the full bar data from the beginning of the minute
+            await self._fetch_current_bar()
 
             # Request tick-by-tick data
             # 'AllLast' captures all trade types (more comprehensive than 'Last')
