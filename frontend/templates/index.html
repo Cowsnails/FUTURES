@@ -788,11 +788,15 @@
 
             const now = Math.floor(Date.now() / 1000);
             const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
-            const nextBarTime = latestBarTime + barSizeSeconds;
+
+            // Calculate next bar time based on current time alignment
+            // This ensures countdown works even if last bar is old
+            const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
+            const nextBarTime = currentBarStart + barSizeSeconds;
             const remaining = nextBarTime - now;
 
-            if (remaining <= 0) {
-                // Bar should have completed, wait for update
+            if (remaining <= 0 || remaining > barSizeSeconds) {
+                // Something's wrong, recalculate
                 document.getElementById('timer-value').textContent = '0:00';
                 return;
             }
