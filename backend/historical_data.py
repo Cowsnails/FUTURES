@@ -201,7 +201,8 @@ class HistoricalDataFetcher:
         if start_date:
             start = start_date
         else:
-            start = end - timedelta(days=365)
+            # Default to 60 days, not 365
+            start = end - timedelta(days=60)
 
         all_bars = []
         current_end = end
