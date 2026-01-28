@@ -2,6 +2,7 @@
  * Indicator Rendering System
  *
  * Handles rendering of technical indicators on TradingView Lightweight Charts
+ * Updated: Force cache refresh
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
