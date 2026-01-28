@@ -712,6 +712,9 @@
             if (msg.data.length > 0) {
                 const latestBar = msg.data[msg.data.length - 1];
                 startCountdown(latestBar.time);
+
+                // Initialize price line with latest bar's close price
+                updatePriceLine(latestBar.close, getCountdownText());
             }
 
             console.log('Historical data loaded successfully');
@@ -987,6 +990,13 @@
             volumeSeries.setData([]);
             barCount = 0;
             updateBarCount(0);
+
+            // Reset price line - it will be recreated with new data
+            if (currentPriceLine) {
+                candleSeries.removePriceLine(currentPriceLine);
+                currentPriceLine = null;
+                currentPrice = null;
+            }
 
             // Stop countdown
             stopCountdown();
