@@ -111,6 +111,11 @@ historical_fetcher: Optional[HistoricalDataFetcher] = None
 cache: Optional[DataCache] = None
 indicator_manager: Optional[IndicatorManager] = None
 
+# In-memory preloaded data for instant timeframe switching
+# Structure: { 'MNQ': { '1min': [...], '5min': [...], ... }, ... }
+preloaded_data: Dict[str, Dict[str, list]] = {}
+TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
+
 
 class ConnectionManager:
     """Manages WebSocket connections to clients with message batching"""
@@ -296,33 +301,70 @@ connection_manager = ConnectionManager()
 
 
 async def prefetch_all_tickers():
-    """Pre-fetch historical data for all tickers at startup"""
+    """
+    Pre-fetch historical data for all tickers at startup and load into memory.
+
+    Uses incremental updates:
+    - If cache exists: only fetches missing data (gap from last bar to now)
+    - If no cache: fetches configured duration (default_duration from config)
+
+    After fetching, ALL timeframes are loaded into memory for instant switching.
+    """
+    global preloaded_data
     symbols = ['MNQ', 'MES', 'MGC']
-    duration = config['data']['default_duration']
+    duration = config['data']['default_duration']  # e.g., "60 D"
 
     for symbol in symbols:
         try:
-            logger.info(f"Pre-fetching {symbol} historical data...")
+            logger.info(f"Pre-fetching {symbol} historical data ({duration} with incremental update)...")
             contract = get_current_contract(symbol)
 
-            # Fetch and cache data
+            # Qualify the contract first
+            await ib_manager.ib.qualifyContractsAsync(contract)
+
+            # Fetch with incremental updates - only gets missing data
             data = await historical_fetcher.fetch_recent(
                 contract,
                 duration=duration,
-                bar_size='1 min'
+                cache_all_timeframes=True
             )
 
             if data is not None and len(data) > 0:
-                logger.info(f"✓ Pre-fetched {len(data)} bars for {symbol}")
+                logger.info(f"✓ {symbol}: {len(data)} total bars in cache")
             else:
                 logger.warning(f"⚠ No data fetched for {symbol}")
 
-            # Small delay between requests to avoid pacing violations
+            # Small delay between tickers
             await asyncio.sleep(2)
 
         except Exception as e:
             logger.error(f"Error pre-fetching {symbol}: {e}")
             continue
+
+    # Load ALL timeframes into memory for instant switching
+    logger.info("Loading all timeframes into memory for instant switching...")
+    for symbol in symbols:
+        preloaded_data[symbol] = {}
+        for tf in TIMEFRAMES:
+            try:
+                tf_data = cache.load(symbol, bar_size=tf, max_age_hours=None)
+                if tf_data is not None and len(tf_data) > 0:
+                    # Convert to list of dicts for fast JSON serialization
+                    preloaded_data[symbol][tf] = tf_data.to_dict('records')
+                    logger.info(f"  ✓ {symbol}/{tf}: {len(preloaded_data[symbol][tf])} bars in memory")
+                else:
+                    preloaded_data[symbol][tf] = []
+                    logger.warning(f"  ⚠ {symbol}/{tf}: no data")
+            except Exception as e:
+                logger.error(f"  ✗ {symbol}/{tf}: error loading - {e}")
+                preloaded_data[symbol][tf] = []
+
+    total_bars = sum(
+        len(preloaded_data[s][tf])
+        for s in preloaded_data
+        for tf in preloaded_data[s]
+    )
+    logger.info(f"✓ Preloaded {total_bars:,} total bars into memory for instant switching")
 
 
 @asynccontextmanager
@@ -563,49 +605,39 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
 
         logger.info(f"Starting data stream for {symbol} (contract: {contract.localSymbol})")
 
-        # Step 1: Load ONLY from cache (pre-fetched at startup)
-        if cache:
-            try:
-                logger.info(f"Loading cached historical data for {symbol} ({timeframe})...")
-                # ONLY load from cache, NEVER fetch from IB Gateway
-                historical_data = cache.load(
-                    symbol,
-                    bar_size=timeframe,
-                    max_age_hours=config['data']['cache_max_age_hours']
-                )
+        # Track current timeframe for this connection
+        current_timeframe = timeframe
 
-                if historical_data is not None and len(historical_data) > 0:
-                    # Convert DataFrame to list of dicts
-                    data_list = historical_data.to_dict('records')
-
-                    # Calculate indicators if any are active
-                    indicators_data = {}
-                    if indicator_manager and len(indicator_manager.active_indicators) > 0:
-                        try:
-                            indicators_data = indicator_manager.calculate_all(historical_data)
-                            logger.info(f"Calculated {len(indicators_data)} indicators for {symbol}")
-                        except Exception as e:
-                            logger.error(f"Error calculating indicators: {e}")
-
-                    # Send historical data with indicators
+        # Helper function to send timeframe data from memory
+        async def send_timeframe_data(tf: str):
+            """Send preloaded data for a timeframe - instant from memory"""
+            if symbol in preloaded_data and tf in preloaded_data[symbol]:
+                data_list = preloaded_data[symbol][tf]
+                if data_list:
                     await connection_manager.send_to_client(websocket, {
                         'type': 'historical',
                         'data': data_list,
                         'symbol': symbol,
+                        'timeframe': tf,
                         'bar_count': len(data_list),
-                        'indicators': indicators_data
+                        'indicators': {}  # TODO: calculate indicators if needed
                     })
-
-                    logger.info(f"Sent {len(data_list)} cached historical bars to client")
+                    logger.info(f"[{symbol}] Sent {len(data_list)} bars for {tf} (from memory)")
                 else:
-                    logger.warning(f"No cached data available for {symbol} - was it pre-fetched at startup?")
+                    logger.warning(f"[{symbol}] No preloaded data for {tf}")
+            else:
+                logger.warning(f"[{symbol}] Timeframe {tf} not in preloaded_data")
 
-            except Exception as e:
-                logger.error(f"Error loading cached data: {e}")
-                await connection_manager.send_to_client(websocket, {
-                    'type': 'error',
-                    'message': f"Failed to fetch historical data: {str(e)}"
-                })
+        # Step 1: Send initial data from memory (instant!)
+        try:
+            logger.info(f"Sending preloaded data for {symbol} ({timeframe})...")
+            await send_timeframe_data(timeframe)
+        except Exception as e:
+            logger.error(f"Error sending preloaded data: {e}")
+            await connection_manager.send_to_client(websocket, {
+                'type': 'error',
+                'message': f"Failed to load historical data: {str(e)}"
+            })
 
         # Step 2: Start real-time streaming
         if realtime_manager:
@@ -648,9 +680,31 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                 # Receive messages from client (for keepalive or commands)
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
 
-                # Handle client commands here if needed
-                # For now, just log
-                logger.debug(f"Received from client: {data}")
+                # Parse and handle client commands
+                try:
+                    import json
+                    msg = json.loads(data)
+                    msg_type = msg.get('type')
+
+                    if msg_type == 'switch_timeframe':
+                        # Handle timeframe switch - NO RECONNECTION NEEDED!
+                        new_tf = msg.get('timeframe')
+                        if new_tf in TIMEFRAMES:
+                            logger.info(f"[{symbol}] Switching timeframe: {current_timeframe} -> {new_tf}")
+                            current_timeframe = new_tf
+                            await send_timeframe_data(new_tf)
+                        else:
+                            logger.warning(f"[{symbol}] Invalid timeframe requested: {new_tf}")
+
+                    elif msg_type == 'ping':
+                        # Client ping - respond with pong
+                        await websocket.send_json({'type': 'pong'})
+
+                    else:
+                        logger.debug(f"[{symbol}] Received message: {msg_type}")
+
+                except json.JSONDecodeError:
+                    logger.debug(f"[{symbol}] Received non-JSON: {data}")
 
             except asyncio.TimeoutError:
                 # Send ping to keep connection alive

@@ -14,8 +14,8 @@ server:
 data:
   cache_dir: C:\Users\jacem\Downloads\futures_data
   max_bars_in_memory: 10000
-  cache_max_age_hours: 168  # 7 days - keep data for a week
-  default_duration: "5 D"  # Fetch 5 days at startup
+  cache_max_age_hours: 8760  # 365 days - keep data for a year
+  default_duration: "60 D"  # Fetch 60 days at startup - good for intraday
   bar_size: "1 min"
 
 contracts:

@@ -280,7 +280,7 @@
 
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
-        import { IndicatorRenderer, IndicatorManager } from '/static/js/indicators.js';
+        import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=4';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -312,7 +312,13 @@
         let latestBarTime = null;
         let countdownInterval = null;
         let intentionalDisconnect = false;  // Track if user is closing page
+        let isManualReconnect = false;  // Track if user is switching timeframe/symbol
         let futureMarkersSeries = null;  // Series for future time vertical lines
+        let currentPriceLine = null;  // Price line showing current price + countdown on axis
+        let currentPrice = null;  // Current close price for price line
+        let currentOpenPrice = null;  // Current open price for candle coloring
+        let supertrendIndicator = null;  // Supertrend Multi-Timeframe indicator
+        let historicalBars = [];  // Store bars for indicator calculations
 
         // Timeframe to seconds mapping
         const TIMEFRAME_SECONDS = {
@@ -396,6 +402,24 @@
             }
 
             /**
+             * Initialize the aggregator with a bar from historical data
+             * This ensures real-time bars connect properly without visual gaps
+             * @param {Object} bar - The last bar from historical data
+             */
+            initializeWithBar(bar) {
+                const barStartTime = this.getBarStartTime(bar.time);
+                this.currentBar = {
+                    time: barStartTime,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume
+                };
+                console.log(`BarAggregator initialized with bar at ${new Date(barStartTime * 1000).toLocaleString()}`);
+            }
+
+            /**
              * Set the timeframe
              * @param {number} timeframeSeconds - New timeframe in seconds
              */
@@ -426,6 +450,7 @@
                     horzLines: { color: COLORS.GRID },
                 },
                 crosshair: {
+                    mode: 0,  // 0 = Normal (follows mouse), 1 = Magnet (snaps to data)
                     vertLine: {
                         color: COLORS.CROSSHAIR,
                         labelBackgroundColor: '#2a2e39'
@@ -453,6 +478,7 @@
                 borderVisible: false,
                 wickUpColor: COLORS.UP,
                 wickDownColor: COLORS.DOWN,
+                lastValueVisible: false,  // Hide default price label - we use custom price line
             });
 
             // Volume series (overlay at bottom)
@@ -484,7 +510,42 @@
             indicatorRenderer = new IndicatorRenderer(chart);
             indicatorManager = new IndicatorManager();
 
+            // Initialize Supertrend Multi-Timeframe indicator
+            try {
+                supertrendIndicator = new SupertrendIndicator(chart, candleSeries);
+                // Adjust settings based on timeframe
+                updateSupertrendSettings();
+            } catch (e) {
+                console.error('Error initializing Supertrend indicator:', e);
+                supertrendIndicator = null;
+            }
+
             console.log('Chart initialized');
+        }
+
+        /**
+         * Update Supertrend settings based on current timeframe
+         */
+        function updateSupertrendSettings() {
+            if (!supertrendIndicator) return;
+
+            // Larger timeframe multiplier varies by current timeframe
+            // For 1min -> larger is 4min (multiplier 4)
+            // For 5min -> larger is 60min/1H (multiplier 12)
+            // For 15min -> larger is 4H (multiplier 16)
+            const multipliers = {
+                '1min': 4,    // 1min -> 4min
+                '5min': 12,   // 5min -> 1H
+                '15min': 16,  // 15min -> 4H
+                '30min': 8,   // 30min -> 4H
+                '1H': 4,      // 1H -> 4H
+                '2H': 2,      // 2H -> 4H
+                '4H': 4,      // 4H -> 16H (daily-ish)
+            };
+
+            supertrendIndicator.updateSettings({
+                largerTimeframeMultiplier: multipliers[currentTimeframe] || 4
+            });
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -495,8 +556,9 @@
             updateStatus('connecting', `Connecting to ${symbol} (${currentTimeframe})...`);
             showLoading(`Loading ${symbol} data (${currentTimeframe})...`);
 
-            // Close existing connection
+            // Close existing connection (mark as manual reconnect to prevent auto-reconnect)
             if (ws) {
+                isManualReconnect = true;
                 ws.close();
             }
 
@@ -532,7 +594,14 @@
                     return;
                 }
 
-                // Attempt reconnection
+                // Don't auto-reconnect if this was a manual reconnect (timeframe/symbol change)
+                if (isManualReconnect) {
+                    console.log('Manual reconnect in progress - skipping auto-reconnect');
+                    isManualReconnect = false;  // Reset flag
+                    return;
+                }
+
+                // Attempt reconnection (only for unexpected disconnects)
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
                 reconnectAttempts++;
 
@@ -613,32 +682,67 @@
         }
 
         function handleHistoricalData(msg) {
-            console.log(`Received ${msg.data.length} historical bars`);
+            console.log(`Received ${msg.data.length} historical bars for timeframe ${currentTimeframe}`);
 
-            // Reset the bar aggregator for fresh start
+            // Reset the bar aggregator
             barAggregator.reset();
 
-            // Debug: Check first and last bar timestamps
-            if (msg.data.length > 0) {
-                const firstBar = msg.data[0];
-                const lastBar = msg.data[msg.data.length - 1];
+            // Sort data by time to ensure proper ordering (safety check)
+            const sortedData = [...msg.data].sort((a, b) => a.time - b.time);
+
+            // Debug: Check first and last bar timestamps and verify spacing
+            if (sortedData.length > 0) {
+                const firstBar = sortedData[0];
+                const lastBar = sortedData[sortedData.length - 1];
+                const expectedInterval = TIMEFRAME_SECONDS[currentTimeframe];
 
                 console.log('=== HISTORICAL DATA ===');
-                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()}`);
-                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()}`);
+                console.log(`Timeframe: ${currentTimeframe} (${expectedInterval}s intervals)`);
+                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()} (ts: ${firstBar.time})`);
+                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()} (ts: ${lastBar.time})`);
+
+                // Check for gaps in last 5 bars
+                if (sortedData.length >= 2) {
+                    console.log('Last 5 bar intervals:');
+                    const start = Math.max(0, sortedData.length - 5);
+                    for (let i = start + 1; i < sortedData.length; i++) {
+                        const gap = sortedData[i].time - sortedData[i-1].time;
+                        const gapBars = gap / expectedInterval;
+                        if (gapBars !== 1) {
+                            console.log(`  Bar ${i}: ${new Date(sortedData[i].time * 1000).toLocaleTimeString()} - gap: ${gap}s (${gapBars.toFixed(1)} bars)`);
+                        }
+                    }
+                }
                 console.log('=======================');
+
+                // Initialize bar aggregator with the last historical bar
+                // This ensures real-time bars connect properly without gaps
+                barAggregator.initializeWithBar(lastBar);
             }
 
-            // Set candlestick data
-            candleSeries.setData(msg.data);
+            // Set candlestick data (use sorted data)
+            candleSeries.setData(sortedData);
 
-            // Set volume data with colors
-            const volumeData = msg.data.map(bar => ({
+            // Store bars for indicator calculations
+            historicalBars = sortedData;
+
+            // Set volume data with colors (use sorted data)
+            const volumeData = sortedData.map(bar => ({
                 time: bar.time,
                 value: bar.volume,
                 color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
             }));
             volumeSeries.setData(volumeData);
+
+            // Initialize Supertrend indicator with historical data
+            if (supertrendIndicator && sortedData.length >= 20) {
+                try {
+                    updateSupertrendSettings();  // Update settings for current timeframe
+                    supertrendIndicator.initialize(sortedData);
+                } catch (e) {
+                    console.error('Error initializing Supertrend with data:', e);
+                }
+            }
 
             // Render indicators if present
             if (msg.indicators && Object.keys(msg.indicators).length > 0) {
@@ -660,8 +764,8 @@
             chart.timeScale().fitContent();
 
             // Generate future time markers (extend chart to end of day)
-            if (msg.data.length > 0) {
-                const latestBar = msg.data[msg.data.length - 1];
+            if (sortedData.length > 0) {
+                const latestBar = sortedData[sortedData.length - 1];
                 console.log(`Latest bar time from backend: ${latestBar.time}, which is ${new Date(latestBar.time * 1000).toLocaleString()}`);
                 // Use closing price of last bar for invisible markers
                 const avgPrice = latestBar.close;
@@ -671,13 +775,16 @@
             hideLoading();
 
             // Update bar count
-            barCount = msg.data.length;
+            barCount = sortedData.length;
             updateBarCount(barCount);
 
             // Start countdown timer with latest bar
-            if (msg.data.length > 0) {
-                const latestBar = msg.data[msg.data.length - 1];
+            if (sortedData.length > 0) {
+                const latestBar = sortedData[sortedData.length - 1];
                 startCountdown(latestBar.time);
+
+                // Initialize price line with latest bar's prices
+                updatePriceLine(latestBar.close, latestBar.open, getCountdownText());
             }
 
             console.log('Historical data loaded successfully');
@@ -700,6 +807,9 @@
                     color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                 });
 
+                // Update price line with current bar prices
+                updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
+
                 // Update bar count if new bar
                 if (isNewBar) {
                     barCount++;
@@ -714,6 +824,15 @@
                     // Just update the latest bar time for countdown calculation
                     latestBarTime = incomingBar.time;
                 }
+
+                // Update Supertrend indicator with new/updated bar
+                if (supertrendIndicator) {
+                    try {
+                        supertrendIndicator.addBar(incomingBar, isNewBar);
+                    } catch (e) {
+                        console.warn('Error updating Supertrend:', e);
+                    }
+                }
             } else {
                 // For higher timeframes, aggregate 1-minute bars
                 const result = barAggregator.processBar(incomingBar);
@@ -727,6 +846,9 @@
                         value: result.partialBar.volume,
                         color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                     });
+
+                    // Update price line with current bar prices
+                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
 
                     // Update latest bar time for countdown
                     latestBarTime = result.partialBar.time;
@@ -747,6 +869,15 @@
                     // Update future markers with latest aggregated bar
                     if (result.isNewBar) {
                         generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
+                    }
+
+                    // Update Supertrend indicator with aggregated bar
+                    if (supertrendIndicator) {
+                        try {
+                            supertrendIndicator.addBar(result.partialBar, result.isNewBar);
+                        } catch (e) {
+                            console.warn('Error updating Supertrend:', e);
+                        }
                     }
                 }
             }
@@ -774,17 +905,82 @@
             barCountEl.style.display = 'flex';
         }
 
+        function updatePriceLine(closePrice, openPrice, countdownText) {
+            if (!candleSeries || closePrice === null || closePrice === undefined) return;
+
+            // Determine color based on candle color (close vs open)
+            // Green if close > open, Red if close < open, Grey if close == open
+            let lineColor;
+            if (openPrice === null || openPrice === undefined) {
+                lineColor = '#758696';  // Grey if no open price
+            } else if (closePrice > openPrice) {
+                lineColor = COLORS.UP;  // Green - bullish candle
+            } else if (closePrice < openPrice) {
+                lineColor = COLORS.DOWN;  // Red - bearish candle
+            } else {
+                lineColor = '#758696';  // Grey - neutral/doji
+            }
+
+            if (!currentPriceLine) {
+                // Create the price line for the first time
+                currentPriceLine = candleSeries.createPriceLine({
+                    price: closePrice,
+                    color: lineColor,
+                    lineWidth: 1,
+                    lineStyle: 2,  // Dashed line
+                    axisLabelVisible: true,
+                    title: countdownText || '',
+                });
+            } else {
+                // Update existing price line
+                currentPriceLine.applyOptions({
+                    price: closePrice,
+                    color: lineColor,
+                    title: countdownText || '',
+                });
+            }
+
+            currentPrice = closePrice;
+            currentOpenPrice = openPrice;
+        }
+
+        function getCountdownText() {
+            if (!latestBarTime) return '';
+
+            const now = Math.floor(Date.now() / 1000);
+            const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
+            const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
+            const nextBarTime = currentBarStart + barSizeSeconds;
+            const remaining = nextBarTime - now;
+
+            if (remaining <= 0 || remaining > barSizeSeconds) {
+                return '0:00';
+            }
+
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        }
+
         function updateCountdown() {
             if (!latestBarTime) return;
 
             const now = Math.floor(Date.now() / 1000);
             const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
-            const nextBarTime = latestBarTime + barSizeSeconds;
+
+            // Calculate next bar time based on current time alignment
+            // This ensures countdown works even if last bar is old
+            const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
+            const nextBarTime = currentBarStart + barSizeSeconds;
             const remaining = nextBarTime - now;
 
-            if (remaining <= 0) {
-                // Bar should have completed, wait for update
+            if (remaining <= 0 || remaining > barSizeSeconds) {
+                // Something's wrong, recalculate
                 document.getElementById('timer-value').textContent = '0:00';
+                // Also update price line with 0:00
+                if (currentPrice !== null) {
+                    updatePriceLine(currentPrice, currentOpenPrice, '0:00');
+                }
                 return;
             }
 
@@ -793,6 +989,11 @@
             const display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
 
             document.getElementById('timer-value').textContent = display;
+
+            // Update price line with new countdown
+            if (currentPrice !== null) {
+                updatePriceLine(currentPrice, currentOpenPrice, display);
+            }
         }
 
         function startCountdown(barTime) {
@@ -867,14 +1068,20 @@
                 indicatorRenderer.removeAllIndicators();
             }
 
+            // Clear Supertrend indicator
+            if (supertrendIndicator) {
+                supertrendIndicator.remove();
+            }
+            historicalBars = [];
+
             // Reconnect with new symbol
             connect(newSymbol);
         });
 
-        // Timeframe selector
+        // Timeframe selector - NO RECONNECTION, just send message!
         document.getElementById('timeframe-select').addEventListener('change', (e) => {
             const newTimeframe = e.target.value;
-            console.log(`Switching to ${newTimeframe} timeframe`);
+            console.log(`Switching to ${newTimeframe} timeframe (no reconnect)`);
 
             // Update current timeframe
             currentTimeframe = newTimeframe;
@@ -888,6 +1095,14 @@
             barCount = 0;
             updateBarCount(0);
 
+            // Reset price line - it will be recreated with new data
+            if (currentPriceLine) {
+                candleSeries.removePriceLine(currentPriceLine);
+                currentPriceLine = null;
+                currentPrice = null;
+                currentOpenPrice = null;
+            }
+
             // Stop countdown
             stopCountdown();
 
@@ -896,8 +1111,27 @@
                 indicatorRenderer.removeAllIndicators();
             }
 
-            // Reconnect with new timeframe
-            connect(currentSymbol);
+            // Clear Supertrend indicator
+            if (supertrendIndicator) {
+                supertrendIndicator.remove();
+            }
+            historicalBars = [];
+
+            // Show loading while switching
+            showLoading(`Switching to ${newTimeframe}...`);
+
+            // Send message to switch timeframe - NO RECONNECTION!
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'switch_timeframe',
+                    timeframe: newTimeframe
+                }));
+                console.log(`Sent switch_timeframe message for ${newTimeframe}`);
+            } else {
+                // WebSocket not connected, need to reconnect
+                console.warn('WebSocket not connected, reconnecting...');
+                connect(currentSymbol);
+            }
         });
 
         // ═══════════════════════════════════════════════════════════
