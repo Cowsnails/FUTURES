@@ -643,19 +643,37 @@
         }
 
         function handleHistoricalData(msg) {
-            console.log(`Received ${msg.data.length} historical bars`);
+            console.log(`Received ${msg.data.length} historical bars for timeframe ${currentTimeframe}`);
 
             // Reset the bar aggregator
             barAggregator.reset();
 
-            // Debug: Check first and last bar timestamps
-            if (msg.data.length > 0) {
-                const firstBar = msg.data[0];
-                const lastBar = msg.data[msg.data.length - 1];
+            // Sort data by time to ensure proper ordering (safety check)
+            const sortedData = [...msg.data].sort((a, b) => a.time - b.time);
+
+            // Debug: Check first and last bar timestamps and verify spacing
+            if (sortedData.length > 0) {
+                const firstBar = sortedData[0];
+                const lastBar = sortedData[sortedData.length - 1];
+                const expectedInterval = TIMEFRAME_SECONDS[currentTimeframe];
 
                 console.log('=== HISTORICAL DATA ===');
-                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()}`);
-                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()}`);
+                console.log(`Timeframe: ${currentTimeframe} (${expectedInterval}s intervals)`);
+                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()} (ts: ${firstBar.time})`);
+                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()} (ts: ${lastBar.time})`);
+
+                // Check for gaps in last 5 bars
+                if (sortedData.length >= 2) {
+                    console.log('Last 5 bar intervals:');
+                    const start = Math.max(0, sortedData.length - 5);
+                    for (let i = start + 1; i < sortedData.length; i++) {
+                        const gap = sortedData[i].time - sortedData[i-1].time;
+                        const gapBars = gap / expectedInterval;
+                        if (gapBars !== 1) {
+                            console.log(`  Bar ${i}: ${new Date(sortedData[i].time * 1000).toLocaleTimeString()} - gap: ${gap}s (${gapBars.toFixed(1)} bars)`);
+                        }
+                    }
+                }
                 console.log('=======================');
 
                 // Initialize bar aggregator with the last historical bar
@@ -663,11 +681,11 @@
                 barAggregator.initializeWithBar(lastBar);
             }
 
-            // Set candlestick data
-            candleSeries.setData(msg.data);
+            // Set candlestick data (use sorted data)
+            candleSeries.setData(sortedData);
 
-            // Set volume data with colors
-            const volumeData = msg.data.map(bar => ({
+            // Set volume data with colors (use sorted data)
+            const volumeData = sortedData.map(bar => ({
                 time: bar.time,
                 value: bar.volume,
                 color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
@@ -694,8 +712,8 @@
             chart.timeScale().fitContent();
 
             // Generate future time markers (extend chart to end of day)
-            if (msg.data.length > 0) {
-                const latestBar = msg.data[msg.data.length - 1];
+            if (sortedData.length > 0) {
+                const latestBar = sortedData[sortedData.length - 1];
                 console.log(`Latest bar time from backend: ${latestBar.time}, which is ${new Date(latestBar.time * 1000).toLocaleString()}`);
                 // Use closing price of last bar for invisible markers
                 const avgPrice = latestBar.close;
@@ -705,12 +723,12 @@
             hideLoading();
 
             // Update bar count
-            barCount = msg.data.length;
+            barCount = sortedData.length;
             updateBarCount(barCount);
 
             // Start countdown timer with latest bar
-            if (msg.data.length > 0) {
-                const latestBar = msg.data[msg.data.length - 1];
+            if (sortedData.length > 0) {
+                const latestBar = sortedData[sortedData.length - 1];
                 startCountdown(latestBar.time);
 
                 // Initialize price line with latest bar's close price
