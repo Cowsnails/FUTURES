@@ -315,7 +315,8 @@
         let isManualReconnect = false;  // Track if user is switching timeframe/symbol
         let futureMarkersSeries = null;  // Series for future time vertical lines
         let currentPriceLine = null;  // Price line showing current price + countdown on axis
-        let currentPrice = null;  // Current price for price line
+        let currentPrice = null;  // Current close price for price line
+        let currentOpenPrice = null;  // Current open price for candle coloring
 
         // Timeframe to seconds mapping
         const TIMEFRAME_SECONDS = {
@@ -475,6 +476,7 @@
                 borderVisible: false,
                 wickUpColor: COLORS.UP,
                 wickDownColor: COLORS.DOWN,
+                lastValueVisible: false,  // Hide default price label - we use custom price line
             });
 
             // Volume series (overlay at bottom)
@@ -731,8 +733,8 @@
                 const latestBar = sortedData[sortedData.length - 1];
                 startCountdown(latestBar.time);
 
-                // Initialize price line with latest bar's close price
-                updatePriceLine(latestBar.close, getCountdownText());
+                // Initialize price line with latest bar's prices
+                updatePriceLine(latestBar.close, latestBar.open, getCountdownText());
             }
 
             console.log('Historical data loaded successfully');
@@ -755,8 +757,8 @@
                     color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                 });
 
-                // Update price line with current close price
-                updatePriceLine(incomingBar.close, getCountdownText());
+                // Update price line with current bar prices
+                updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
 
                 // Update bar count if new bar
                 if (isNewBar) {
@@ -786,8 +788,8 @@
                         color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                     });
 
-                    // Update price line with current close price
-                    updatePriceLine(result.partialBar.close, getCountdownText());
+                    // Update price line with current bar prices
+                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
 
                     // Update latest bar time for countdown
                     latestBarTime = result.partialBar.time;
@@ -835,17 +837,26 @@
             barCountEl.style.display = 'flex';
         }
 
-        function updatePriceLine(price, countdownText) {
-            if (!candleSeries || price === null || price === undefined) return;
+        function updatePriceLine(closePrice, openPrice, countdownText) {
+            if (!candleSeries || closePrice === null || closePrice === undefined) return;
 
-            // Determine color based on price direction (green if up, red if down)
-            const isUp = currentPrice === null || price >= currentPrice;
-            const lineColor = isUp ? COLORS.UP : COLORS.DOWN;
+            // Determine color based on candle color (close vs open)
+            // Green if close > open, Red if close < open, Grey if close == open
+            let lineColor;
+            if (openPrice === null || openPrice === undefined) {
+                lineColor = '#758696';  // Grey if no open price
+            } else if (closePrice > openPrice) {
+                lineColor = COLORS.UP;  // Green - bullish candle
+            } else if (closePrice < openPrice) {
+                lineColor = COLORS.DOWN;  // Red - bearish candle
+            } else {
+                lineColor = '#758696';  // Grey - neutral/doji
+            }
 
             if (!currentPriceLine) {
                 // Create the price line for the first time
                 currentPriceLine = candleSeries.createPriceLine({
-                    price: price,
+                    price: closePrice,
                     color: lineColor,
                     lineWidth: 1,
                     lineStyle: 2,  // Dashed line
@@ -855,13 +866,14 @@
             } else {
                 // Update existing price line
                 currentPriceLine.applyOptions({
-                    price: price,
+                    price: closePrice,
                     color: lineColor,
                     title: countdownText || '',
                 });
             }
 
-            currentPrice = price;
+            currentPrice = closePrice;
+            currentOpenPrice = openPrice;
         }
 
         function getCountdownText() {
@@ -899,7 +911,7 @@
                 document.getElementById('timer-value').textContent = '0:00';
                 // Also update price line with 0:00
                 if (currentPrice !== null) {
-                    updatePriceLine(currentPrice, '0:00');
+                    updatePriceLine(currentPrice, currentOpenPrice, '0:00');
                 }
                 return;
             }
@@ -912,7 +924,7 @@
 
             // Update price line with new countdown
             if (currentPrice !== null) {
-                updatePriceLine(currentPrice, display);
+                updatePriceLine(currentPrice, currentOpenPrice, display);
             }
         }
 
@@ -1014,6 +1026,7 @@
                 candleSeries.removePriceLine(currentPriceLine);
                 currentPriceLine = null;
                 currentPrice = null;
+                currentOpenPrice = null;
             }
 
             // Stop countdown
