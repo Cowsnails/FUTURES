@@ -511,9 +511,14 @@
             indicatorManager = new IndicatorManager();
 
             // Initialize Supertrend Multi-Timeframe indicator
-            supertrendIndicator = new SupertrendIndicator(chart, candleSeries);
-            // Adjust settings based on timeframe
-            updateSupertrendSettings();
+            try {
+                supertrendIndicator = new SupertrendIndicator(chart, candleSeries);
+                // Adjust settings based on timeframe
+                updateSupertrendSettings();
+            } catch (e) {
+                console.error('Error initializing Supertrend indicator:', e);
+                supertrendIndicator = null;
+            }
 
             console.log('Chart initialized');
         }
@@ -731,8 +736,12 @@
 
             // Initialize Supertrend indicator with historical data
             if (supertrendIndicator && sortedData.length >= 20) {
-                updateSupertrendSettings();  // Update settings for current timeframe
-                supertrendIndicator.initialize(sortedData);
+                try {
+                    updateSupertrendSettings();  // Update settings for current timeframe
+                    supertrendIndicator.initialize(sortedData);
+                } catch (e) {
+                    console.error('Error initializing Supertrend with data:', e);
+                }
             }
 
             // Render indicators if present

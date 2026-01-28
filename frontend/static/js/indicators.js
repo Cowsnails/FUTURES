@@ -327,9 +327,15 @@ export class SupertrendIndicator {
             }
         }
 
-        // Apply markers to candle series
+        // Apply markers to candle series (must be sorted by time)
         if (this.markers.length > 0 && this.candleSeries) {
-            this.candleSeries.setMarkers(this.markers);
+            try {
+                // Sort markers by time (required by LightweightCharts)
+                this.markers.sort((a, b) => a.time - b.time);
+                this.candleSeries.setMarkers(this.markers);
+            } catch (e) {
+                console.warn('Error setting markers:', e);
+            }
         }
 
         // Store state for updates
