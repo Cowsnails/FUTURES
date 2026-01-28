@@ -25,8 +25,8 @@ export class SupertrendIndicator {
             atrRegimeLength: 14,
         };
 
-        // Series for rendering - single line with per-point color
-        this.supertrendSeries = null;
+        // Series for rendering - array of line segment series
+        this.segmentSeries = [];
 
         // Marker arrays
         this.markers = [];
@@ -161,20 +161,12 @@ export class SupertrendIndicator {
         this.remove();
         this.bars = [...bars];
 
-        const { lineData, markers } = this._computeAllData(bars);
+        const { segments, markers } = this._computeAllData(bars);
 
-        // Single line series with per-point color
-        // At direction changes, the transition point has transparent color
-        // so no visible line cuts through the candles
-        this.supertrendSeries = this.chart.addLineSeries({
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            lineWidth: 2,
-            color: this.colors.bullish,
-        });
-
-        this.supertrendSeries.setData(lineData);
+        // Create one line series per continuous direction segment.
+        // This is the ONLY way to truly break the line in lightweight-charts
+        // so there's no connecting line snapping between upper/lower bands.
+        this._createSegmentSeries(segments);
 
         // Apply markers
         this.markers = markers;
@@ -200,28 +192,29 @@ export class SupertrendIndicator {
         const st2 = this.calculateSupertrend(aggregatedBars, this.settings.largerFactor, this.settings.largerAtrLength);
         const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
-        // Single line series with per-point color.
-        // The color property on a data point controls the segment drawn FROM
-        // the previous point TO this point. At direction changes, the first
-        // point of the new direction gets transparent color so the connecting
-        // segment (which would snap vertically through candles) is invisible.
-        const lineData = [];
-        let prevDir = 0;
+        // Build segments: each segment is a continuous run of the same direction.
+        // Each becomes its own line series so there's zero connecting line at transitions.
+        const segments = [];
+        let currentSegment = null;
 
         for (let i = 0; i < bars.length; i++) {
             if (st1.supertrend[i] === null) continue;
-            const time = bars[i].time;
             const dir = st1.direction[i];
-            const dirColor = dir === 1 ? this.colors.bullish : this.colors.bearish;
 
-            if (prevDir !== 0 && dir !== prevDir) {
-                // Direction just changed - make this segment transparent
-                lineData.push({ time, value: st1.supertrend[i], color: 'rgba(0,0,0,0)' });
-            } else {
-                lineData.push({ time, value: st1.supertrend[i], color: dirColor });
+            if (!currentSegment || currentSegment.dir !== dir) {
+                // Start new segment
+                currentSegment = {
+                    dir,
+                    color: dir === 1 ? this.colors.bullish : this.colors.bearish,
+                    data: [],
+                };
+                segments.push(currentSegment);
             }
 
-            prevDir = dir;
+            currentSegment.data.push({
+                time: bars[i].time,
+                value: st1.supertrend[i],
+            });
         }
 
         // Detect signals (uses larger TF internally for signal logic)
@@ -255,7 +248,7 @@ export class SupertrendIndicator {
         this.lastDirection = st1.direction[st1.direction.length - 1];
         this.lastLargerDirection = expandedSt2.direction[expandedSt2.direction.length - 1];
 
-        return { lineData, markers };
+        return { segments, markers };
     }
 
     /**
@@ -280,15 +273,39 @@ export class SupertrendIndicator {
         }
     }
 
+    _createSegmentSeries(segments) {
+        for (const seg of segments) {
+            if (seg.data.length < 2) continue; // need at least 2 points to draw a line
+            const series = this.chart.addLineSeries({
+                lastValueVisible: false,
+                priceLineVisible: false,
+                crosshairMarkerVisible: false,
+                lineWidth: 2,
+                color: seg.color,
+            });
+            series.setData(seg.data);
+            this.segmentSeries.push(series);
+        }
+    }
+
+    _removeSegmentSeries() {
+        for (const s of this.segmentSeries) {
+            try { this.chart.removeSeries(s); } catch (e) {}
+        }
+        this.segmentSeries = [];
+    }
+
     _recalcAndUpdate() {
-        if (!this.supertrendSeries || !this.bars || this.bars.length < 20) return;
+        if (this.segmentSeries.length === 0 || !this.bars || this.bars.length < 20) return;
         this._lastFullRecalcTime = Date.now();
 
-        const { lineData, markers } = this._computeAllData(this.bars);
+        const { segments, markers } = this._computeAllData(this.bars);
+
+        // Rebuild all segment series
+        this._removeSegmentSeries();
+        this._createSegmentSeries(segments);
 
         try {
-            this.supertrendSeries.setData(lineData);
-
             this.markers = markers;
             if (this.markers.length > 0 && this.candleSeries) {
                 this.markers.sort((a, b) => a.time - b.time);
@@ -348,10 +365,7 @@ export class SupertrendIndicator {
 
     remove() {
         try {
-            if (this.supertrendSeries) {
-                this.chart.removeSeries(this.supertrendSeries);
-                this.supertrendSeries = null;
-            }
+            this._removeSegmentSeries();
             if (this.candleSeries) {
                 this.candleSeries.setMarkers([]);
             }
