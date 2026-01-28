@@ -314,6 +314,8 @@
         let intentionalDisconnect = false;  // Track if user is closing page
         let isManualReconnect = false;  // Track if user is switching timeframe/symbol
         let futureMarkersSeries = null;  // Series for future time vertical lines
+        let currentPriceLine = null;  // Price line showing current price + countdown on axis
+        let currentPrice = null;  // Current price for price line
 
         // Timeframe to seconds mapping
         const TIMEFRAME_SECONDS = {
@@ -732,6 +734,9 @@
                     color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                 });
 
+                // Update price line with current close price
+                updatePriceLine(incomingBar.close, getCountdownText());
+
                 // Update bar count if new bar
                 if (isNewBar) {
                     barCount++;
@@ -759,6 +764,9 @@
                         value: result.partialBar.volume,
                         color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                     });
+
+                    // Update price line with current close price
+                    updatePriceLine(result.partialBar.close, getCountdownText());
 
                     // Update latest bar time for countdown
                     latestBarTime = result.partialBar.time;
@@ -806,6 +814,53 @@
             barCountEl.style.display = 'flex';
         }
 
+        function updatePriceLine(price, countdownText) {
+            if (!candleSeries || price === null || price === undefined) return;
+
+            // Determine color based on price direction (green if up, red if down)
+            const isUp = currentPrice === null || price >= currentPrice;
+            const lineColor = isUp ? COLORS.UP : COLORS.DOWN;
+
+            if (!currentPriceLine) {
+                // Create the price line for the first time
+                currentPriceLine = candleSeries.createPriceLine({
+                    price: price,
+                    color: lineColor,
+                    lineWidth: 1,
+                    lineStyle: 2,  // Dashed line
+                    axisLabelVisible: true,
+                    title: countdownText || '',
+                });
+            } else {
+                // Update existing price line
+                currentPriceLine.applyOptions({
+                    price: price,
+                    color: lineColor,
+                    title: countdownText || '',
+                });
+            }
+
+            currentPrice = price;
+        }
+
+        function getCountdownText() {
+            if (!latestBarTime) return '';
+
+            const now = Math.floor(Date.now() / 1000);
+            const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
+            const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
+            const nextBarTime = currentBarStart + barSizeSeconds;
+            const remaining = nextBarTime - now;
+
+            if (remaining <= 0 || remaining > barSizeSeconds) {
+                return '0:00';
+            }
+
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        }
+
         function updateCountdown() {
             if (!latestBarTime) return;
 
@@ -821,6 +876,10 @@
             if (remaining <= 0 || remaining > barSizeSeconds) {
                 // Something's wrong, recalculate
                 document.getElementById('timer-value').textContent = '0:00';
+                // Also update price line with 0:00
+                if (currentPrice !== null) {
+                    updatePriceLine(currentPrice, '0:00');
+                }
                 return;
             }
 
@@ -829,6 +888,11 @@
             const display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
 
             document.getElementById('timer-value').textContent = display;
+
+            // Update price line with new countdown
+            if (currentPrice !== null) {
+                updatePriceLine(currentPrice, display);
+            }
         }
 
         function startCountdown(barTime) {
