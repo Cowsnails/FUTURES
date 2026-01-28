@@ -280,7 +280,7 @@
 
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
-        import { IndicatorRenderer, IndicatorManager } from '/static/js/indicators.js';
+        import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -317,6 +317,8 @@
         let currentPriceLine = null;  // Price line showing current price + countdown on axis
         let currentPrice = null;  // Current close price for price line
         let currentOpenPrice = null;  // Current open price for candle coloring
+        let supertrendIndicator = null;  // Supertrend Multi-Timeframe indicator
+        let historicalBars = [];  // Store bars for indicator calculations
 
         // Timeframe to seconds mapping
         const TIMEFRAME_SECONDS = {
@@ -508,7 +510,37 @@
             indicatorRenderer = new IndicatorRenderer(chart);
             indicatorManager = new IndicatorManager();
 
+            // Initialize Supertrend Multi-Timeframe indicator
+            supertrendIndicator = new SupertrendIndicator(chart, candleSeries);
+            // Adjust settings based on timeframe
+            updateSupertrendSettings();
+
             console.log('Chart initialized');
+        }
+
+        /**
+         * Update Supertrend settings based on current timeframe
+         */
+        function updateSupertrendSettings() {
+            if (!supertrendIndicator) return;
+
+            // Larger timeframe multiplier varies by current timeframe
+            // For 1min -> larger is 4min (multiplier 4)
+            // For 5min -> larger is 60min/1H (multiplier 12)
+            // For 15min -> larger is 4H (multiplier 16)
+            const multipliers = {
+                '1min': 4,    // 1min -> 4min
+                '5min': 12,   // 5min -> 1H
+                '15min': 16,  // 15min -> 4H
+                '30min': 8,   // 30min -> 4H
+                '1H': 4,      // 1H -> 4H
+                '2H': 2,      // 2H -> 4H
+                '4H': 4,      // 4H -> 16H (daily-ish)
+            };
+
+            supertrendIndicator.updateSettings({
+                largerTimeframeMultiplier: multipliers[currentTimeframe] || 4
+            });
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -686,6 +718,9 @@
             // Set candlestick data (use sorted data)
             candleSeries.setData(sortedData);
 
+            // Store bars for indicator calculations
+            historicalBars = sortedData;
+
             // Set volume data with colors (use sorted data)
             const volumeData = sortedData.map(bar => ({
                 time: bar.time,
@@ -693,6 +728,12 @@
                 color: bar.close >= bar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
             }));
             volumeSeries.setData(volumeData);
+
+            // Initialize Supertrend indicator with historical data
+            if (supertrendIndicator && sortedData.length >= 20) {
+                updateSupertrendSettings();  // Update settings for current timeframe
+                supertrendIndicator.initialize(sortedData);
+            }
 
             // Render indicators if present
             if (msg.indicators && Object.keys(msg.indicators).length > 0) {
@@ -1000,6 +1041,12 @@
                 indicatorRenderer.removeAllIndicators();
             }
 
+            // Clear Supertrend indicator
+            if (supertrendIndicator) {
+                supertrendIndicator.remove();
+            }
+            historicalBars = [];
+
             // Reconnect with new symbol
             connect(newSymbol);
         });
@@ -1036,6 +1083,12 @@
             if (indicatorRenderer) {
                 indicatorRenderer.removeAllIndicators();
             }
+
+            // Clear Supertrend indicator
+            if (supertrendIndicator) {
+                supertrendIndicator.remove();
+            }
+            historicalBars = [];
 
             // Show loading while switching
             showLoading(`Switching to ${newTimeframe}...`);
