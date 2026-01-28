@@ -210,9 +210,8 @@ export class SupertrendIndicator {
         const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
         // Two series: up (bullish/green) and down (bearish/red)
-        // When direction is bullish, upData gets the value, downData gets whitespace
-        // When direction is bearish, downData gets the value, upData gets whitespace
-        // This prevents the vertical snap-through on direction change
+        // Both series have an entry at every timestamp.
+        // Active direction gets the value; inactive gets whitespace { time } to break the line.
         const upData = [];
         const downData = [];
 
@@ -222,10 +221,10 @@ export class SupertrendIndicator {
 
             if (st1.direction[i] === 1) {
                 upData.push({ time, value: st1.supertrend[i] });
-                downData.push({ time });  // whitespace
+                downData.push({ time });
             } else {
                 downData.push({ time, value: st1.supertrend[i] });
-                upData.push({ time });  // whitespace
+                upData.push({ time });
             }
         }
 
