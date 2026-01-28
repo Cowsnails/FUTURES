@@ -26,9 +26,8 @@ export class SupertrendIndicator {
         };
 
         // Series for rendering - single colored line per timeframe
-        this.supertrendSeries = null;       // Current TF - colored line
-        this.largerSupertrendSeries = null;  // Larger TF - colored line
-        this.bgSeries = null;               // Background shading
+        this.supertrendSeries = null;
+        this.largerSupertrendSeries = null;
 
         // Marker arrays
         this.markers = [];
@@ -36,7 +35,12 @@ export class SupertrendIndicator {
         // State tracking
         this.lastDirection = 0;
         this.lastLargerDirection = 0;
-        this.bars = [];  // Store all bars for recalculation
+        this.bars = [];
+
+        // Throttle: only full recalc on new bars, not every tick
+        this._pendingUpdate = false;
+        this._updateThrottleMs = 500;
+        this._lastFullRecalcTime = 0;
 
         // Colors
         this.colors = {
@@ -46,8 +50,6 @@ export class SupertrendIndicator {
             bearishLarger: 'rgba(255, 82, 82, 0.5)',
             buySignal: 'rgba(0, 230, 118, 1)',
             sellSignal: 'rgba(255, 82, 82, 1)',
-            bgBullish: 'rgba(76, 175, 80, 0.08)',
-            bgBearish: 'rgba(255, 82, 82, 0.08)',
         };
     }
 
@@ -162,7 +164,7 @@ export class SupertrendIndicator {
         this.remove();
         this.bars = [...bars];
 
-        const { st1Data, largerStData, bgData, markers } = this._computeAllData(bars);
+        const { st1Data, largerStData, markers } = this._computeAllData(bars);
 
         // Create current TF supertrend as a single line series with per-point color
         this.supertrendSeries = this.chart.addLineSeries({
@@ -170,7 +172,7 @@ export class SupertrendIndicator {
             priceLineVisible: false,
             crosshairMarkerVisible: false,
             lineWidth: 2,
-            color: this.colors.bullish, // default, overridden per-point
+            color: this.colors.bullish,
         });
 
         // Create larger TF supertrend line
@@ -182,34 +184,8 @@ export class SupertrendIndicator {
             color: this.colors.bullishLarger,
         });
 
-        // Background shading using area series between price extremes
-        // We'll use two area series for bullish/bearish shading
-        this.bgBullishSeries = this.chart.addAreaSeries({
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            topColor: 'rgba(76, 175, 80, 0.12)',
-            bottomColor: 'rgba(76, 175, 80, 0.02)',
-            lineColor: 'rgba(0,0,0,0)',
-            lineWidth: 0,
-        });
-
-        this.bgBearishSeries = this.chart.addAreaSeries({
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            topColor: 'rgba(255, 82, 82, 0.12)',
-            bottomColor: 'rgba(255, 82, 82, 0.02)',
-            lineColor: 'rgba(0,0,0,0)',
-            lineWidth: 0,
-        });
-
         this.supertrendSeries.setData(st1Data);
         this.largerSupertrendSeries.setData(largerStData);
-
-        // Set background shading data
-        this.bgBullishSeries.setData(bgData.bullish);
-        this.bgBearishSeries.setData(bgData.bearish);
 
         // Apply markers
         this.markers = markers;
@@ -235,27 +211,12 @@ export class SupertrendIndicator {
         const st2 = this.calculateSupertrend(aggregatedBars, this.settings.largerFactor, this.settings.largerAtrLength);
         const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
-        // Build current TF line data - color matches direction, only show the active side
         const st1Data = [];
         const largerStData = [];
-        const bgBullishData = [];
-        const bgBearishData = [];
-
-        // Track price range for background shading
-        let priceMax = -Infinity;
-        let priceMin = Infinity;
-        for (let i = 0; i < bars.length; i++) {
-            if (bars[i].high > priceMax) priceMax = bars[i].high;
-            if (bars[i].low < priceMin) priceMin = bars[i].low;
-        }
-        const priceRange = priceMax - priceMin;
-        const bgTop = priceMax + priceRange * 0.1;
-        const bgBottom = priceMin - priceRange * 0.1;
 
         for (let i = 0; i < bars.length; i++) {
             const time = bars[i].time;
 
-            // Current TF: only show line with color matching direction
             if (st1.supertrend[i] !== null) {
                 st1Data.push({
                     time,
@@ -264,30 +225,12 @@ export class SupertrendIndicator {
                 });
             }
 
-            // Larger TF: only show line with color matching direction
             if (expandedSt2.supertrend[i] !== null) {
                 largerStData.push({
                     time,
                     value: expandedSt2.supertrend[i],
                     color: expandedSt2.direction[i] === 1 ? this.colors.bullishLarger : this.colors.bearishLarger,
                 });
-            }
-
-            // Background shading based on combined regime
-            // Both bullish = green bg, both bearish = red bg, mixed = no bg
-            const currDir = st1.direction[i];
-            const largerDir = expandedSt2.direction[i];
-
-            if (currDir === 1 && largerDir === 1) {
-                bgBullishData.push({ time, value: bgTop });
-                bgBearishData.push({ time, value: bgBottom }); // push bottom to keep series aligned but invisible
-            } else if (currDir === -1 && largerDir === -1) {
-                bgBearishData.push({ time, value: bgTop });
-                bgBullishData.push({ time, value: bgBottom });
-            } else {
-                // No shading - push bottom values so series stays continuous
-                bgBullishData.push({ time, value: bgBottom });
-                bgBearishData.push({ time, value: bgBottom });
             }
         }
 
@@ -319,11 +262,10 @@ export class SupertrendIndicator {
             }
         }
 
-        // Store last state
         this.lastDirection = st1.direction[st1.direction.length - 1];
         this.lastLargerDirection = expandedSt2.direction[expandedSt2.direction.length - 1];
 
-        return { st1Data, largerStData, bgData: { bullish: bgBullishData, bearish: bgBearishData }, markers };
+        return { st1Data, largerStData, markers };
     }
 
     /**
@@ -334,31 +276,29 @@ export class SupertrendIndicator {
 
         if (isNewBar) {
             this.bars.push(bar);
+            // Full recalc on new bar - direction may have changed
+            this._recalcAndUpdate();
         } else {
-            // Update the last bar
-            if (this.bars.length > 0) {
-                this.bars[this.bars.length - 1] = bar;
+            // Update last bar in memory but DON'T recalc every tick
+            this.bars[this.bars.length - 1] = bar;
+
+            // Throttled update: max once per 500ms for tick updates
+            const now = Date.now();
+            if (now - this._lastFullRecalcTime > this._updateThrottleMs) {
+                this._recalcAndUpdate();
             }
         }
-
-        // Recalculate with all bars (efficient enough for typical bar counts)
-        // For very large datasets we could optimize, but this ensures accuracy
-        this._recalcAndUpdate();
     }
 
-    /**
-     * Recalculate and update all series in-place
-     */
     _recalcAndUpdate() {
         if (!this.supertrendSeries || !this.bars || this.bars.length < 20) return;
+        this._lastFullRecalcTime = Date.now();
 
-        const { st1Data, largerStData, bgData, markers } = this._computeAllData(this.bars);
+        const { st1Data, largerStData, markers } = this._computeAllData(this.bars);
 
         try {
             this.supertrendSeries.setData(st1Data);
             this.largerSupertrendSeries.setData(largerStData);
-            this.bgBullishSeries.setData(bgData.bullish);
-            this.bgBearishSeries.setData(bgData.bearish);
 
             this.markers = markers;
             if (this.markers.length > 0 && this.candleSeries) {
@@ -413,7 +353,7 @@ export class SupertrendIndicator {
      * Update with new bar data (full recalc)
      */
     update(bars) {
-        this.bars = [...bars];
+        this.bars = bars.slice();
         this._recalcAndUpdate();
     }
 
@@ -426,14 +366,6 @@ export class SupertrendIndicator {
             if (this.largerSupertrendSeries) {
                 this.chart.removeSeries(this.largerSupertrendSeries);
                 this.largerSupertrendSeries = null;
-            }
-            if (this.bgBullishSeries) {
-                this.chart.removeSeries(this.bgBullishSeries);
-                this.bgBullishSeries = null;
-            }
-            if (this.bgBearishSeries) {
-                this.chart.removeSeries(this.bgBearishSeries);
-                this.bgBearishSeries = null;
             }
             if (this.candleSeries) {
                 this.candleSeries.setMarkers([]);
