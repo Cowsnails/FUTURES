@@ -824,6 +824,15 @@
                     // Just update the latest bar time for countdown calculation
                     latestBarTime = incomingBar.time;
                 }
+
+                // Update Supertrend indicator with new/updated bar
+                if (supertrendIndicator) {
+                    try {
+                        supertrendIndicator.addBar(incomingBar, isNewBar);
+                    } catch (e) {
+                        console.warn('Error updating Supertrend:', e);
+                    }
+                }
             } else {
                 // For higher timeframes, aggregate 1-minute bars
                 const result = barAggregator.processBar(incomingBar);
@@ -860,6 +869,15 @@
                     // Update future markers with latest aggregated bar
                     if (result.isNewBar) {
                         generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
+                    }
+
+                    // Update Supertrend indicator with aggregated bar
+                    if (supertrendIndicator) {
+                        try {
+                            supertrendIndicator.addBar(result.partialBar, result.isNewBar);
+                        } catch (e) {
+                            console.warn('Error updating Supertrend:', e);
+                        }
                     }
                 }
             }

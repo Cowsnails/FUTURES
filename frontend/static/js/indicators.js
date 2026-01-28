@@ -2,7 +2,7 @@
  * Indicator Rendering System
  *
  * Handles rendering of technical indicators on TradingView Lightweight Charts
- * Updated: Force cache refresh
+ * Updated: Major Supertrend fix - regime-colored lines, background shading, live updates
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -20,17 +20,15 @@ export class SupertrendIndicator {
             atrLength: 10,
             largerFactor: 3,
             largerAtrLength: 10,
-            largerTimeframeMultiplier: 4,  // e.g., if on 1min, larger = 4min
+            largerTimeframeMultiplier: 4,
             showAtrRegime: true,
             atrRegimeLength: 14,
         };
 
-        // Series for rendering
-        this.supertrendUpSeries = null;
-        this.supertrendDownSeries = null;
-        this.largerSupertrendUpSeries = null;
-        this.largerSupertrendDownSeries = null;
-        this.atrRegimeSeries = null;
+        // Series for rendering - single colored line per timeframe
+        this.supertrendSeries = null;       // Current TF - colored line
+        this.largerSupertrendSeries = null;  // Larger TF - colored line
+        this.bgSeries = null;               // Background shading
 
         // Marker arrays
         this.markers = [];
@@ -38,25 +36,21 @@ export class SupertrendIndicator {
         // State tracking
         this.lastDirection = 0;
         this.lastLargerDirection = 0;
+        this.bars = [];  // Store all bars for recalculation
 
         // Colors
         this.colors = {
-            bullish: 'rgba(76, 175, 80, 1)',        // Green
-            bullishFill: 'rgba(76, 175, 80, 0.15)', // Light green fill
-            bearish: 'rgba(255, 82, 82, 1)',        // Red
-            bearishFill: 'rgba(255, 82, 82, 0.15)', // Light red fill
-            bullishLarger: 'rgba(76, 175, 80, 0.6)',
-            bearishLarger: 'rgba(255, 82, 82, 0.6)',
-            buySignal: 'rgba(0, 230, 118, 1)',      // Bright green
-            sellSignal: 'rgba(255, 82, 82, 1)',     // Red
-            hotRegime: 'rgba(76, 175, 80, 0.07)',   // Green tint
-            coldRegime: 'rgba(255, 82, 82, 0.07)', // Red tint
+            bullish: '#4CAF50',
+            bearish: '#FF5252',
+            bullishLarger: 'rgba(76, 175, 80, 0.5)',
+            bearishLarger: 'rgba(255, 82, 82, 0.5)',
+            buySignal: 'rgba(0, 230, 118, 1)',
+            sellSignal: 'rgba(255, 82, 82, 1)',
+            bgBullish: 'rgba(76, 175, 80, 0.08)',
+            bgBearish: 'rgba(255, 82, 82, 0.08)',
         };
     }
 
-    /**
-     * Calculate True Range for a single bar
-     */
     calculateTR(high, low, prevClose) {
         if (prevClose === null) return high - low;
         return Math.max(
@@ -66,9 +60,6 @@ export class SupertrendIndicator {
         );
     }
 
-    /**
-     * Calculate ATR (Average True Range)
-     */
     calculateATR(bars, period) {
         const atr = new Array(bars.length).fill(null);
         let sum = 0;
@@ -83,7 +74,6 @@ export class SupertrendIndicator {
                     atr[i] = sum / period;
                 }
             } else {
-                // Wilder's smoothing
                 atr[i] = (atr[i - 1] * (period - 1) + tr) / period;
             }
         }
@@ -91,14 +81,10 @@ export class SupertrendIndicator {
         return atr;
     }
 
-    /**
-     * Calculate Supertrend
-     */
     calculateSupertrend(bars, factor, atrPeriod) {
         const atr = this.calculateATR(bars, atrPeriod);
         const supertrend = new Array(bars.length).fill(null);
-        const direction = new Array(bars.length).fill(0);  // 1 = up, -1 = down
-
+        const direction = new Array(bars.length).fill(0);
         let upperBand = new Array(bars.length).fill(null);
         let lowerBand = new Array(bars.length).fill(null);
 
@@ -109,23 +95,19 @@ export class SupertrendIndicator {
             const basicUpperBand = hl2 + factor * atr[i];
             const basicLowerBand = hl2 - factor * atr[i];
 
-            // Calculate final bands
             if (i === 0 || upperBand[i - 1] === null) {
                 upperBand[i] = basicUpperBand;
                 lowerBand[i] = basicLowerBand;
             } else {
-                // Upper band
                 upperBand[i] = basicUpperBand < upperBand[i - 1] || bars[i - 1].close > upperBand[i - 1]
                     ? basicUpperBand
                     : upperBand[i - 1];
 
-                // Lower band
                 lowerBand[i] = basicLowerBand > lowerBand[i - 1] || bars[i - 1].close < lowerBand[i - 1]
                     ? basicLowerBand
                     : lowerBand[i - 1];
             }
 
-            // Determine direction
             if (i === 0) {
                 direction[i] = bars[i].close > upperBand[i] ? 1 : -1;
             } else if (direction[i - 1] === 1) {
@@ -134,46 +116,12 @@ export class SupertrendIndicator {
                 direction[i] = bars[i].close > upperBand[i] ? 1 : -1;
             }
 
-            // Set supertrend value based on direction
             supertrend[i] = direction[i] === 1 ? lowerBand[i] : upperBand[i];
         }
 
         return { supertrend, direction, upperBand, lowerBand };
     }
 
-    /**
-     * Calculate ATR Regime (above/below median)
-     */
-    calculateAtrRegime(bars, period, lookback = 100) {
-        const atr = this.calculateATR(bars, period);
-        const regime = new Array(bars.length).fill(null);
-
-        for (let i = lookback - 1; i < bars.length; i++) {
-            // Get last 'lookback' ATR values
-            const atrValues = [];
-            for (let j = i - lookback + 1; j <= i; j++) {
-                if (atr[j] !== null) atrValues.push(atr[j]);
-            }
-
-            if (atrValues.length >= 20) {
-                // Calculate median
-                const sorted = [...atrValues].sort((a, b) => a - b);
-                const mid = Math.floor(sorted.length / 2);
-                const median = sorted.length % 2 === 0
-                    ? (sorted[mid - 1] + sorted[mid]) / 2
-                    : sorted[mid];
-
-                // Check if current ATR is above median
-                regime[i] = atr[i] > median;
-            }
-        }
-
-        return regime;
-    }
-
-    /**
-     * Detect buy/sell signals
-     */
     detectSignals(direction, largerDirection) {
         const buySignals = [];
         const sellSignals = [];
@@ -184,8 +132,6 @@ export class SupertrendIndicator {
             const prevBullish = direction[i - 1] === 1;
             const largerPrevBullish = largerDirection[i - 1] === 1;
 
-            // Buy signal: larger TF is bullish AND current TF crosses to bullish
-            // OR current TF is bullish AND larger TF crosses to bullish
             const crossToBullish = !prevBullish && currentBullish;
             const largerCrossToBullish = !largerPrevBullish && largerBullish;
 
@@ -193,7 +139,6 @@ export class SupertrendIndicator {
                 buySignals.push(i);
             }
 
-            // Sell signal: was both bullish, now one is bearish
             const wasBothBullish = prevBullish && largerPrevBullish;
             const nowOneBearish = !currentBullish || !largerBullish;
 
@@ -214,99 +159,145 @@ export class SupertrendIndicator {
             return;
         }
 
-        // Remove existing series if any
         this.remove();
+        this.bars = [...bars];
 
-        // Calculate current timeframe supertrend
+        const { st1Data, largerStData, bgData, markers } = this._computeAllData(bars);
+
+        // Create current TF supertrend as a single line series with per-point color
+        this.supertrendSeries = this.chart.addLineSeries({
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            lineWidth: 2,
+            color: this.colors.bullish, // default, overridden per-point
+        });
+
+        // Create larger TF supertrend line
+        this.largerSupertrendSeries = this.chart.addLineSeries({
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            lineWidth: 1,
+            color: this.colors.bullishLarger,
+        });
+
+        // Background shading using area series between price extremes
+        // We'll use two area series for bullish/bearish shading
+        this.bgBullishSeries = this.chart.addAreaSeries({
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            topColor: 'rgba(76, 175, 80, 0.12)',
+            bottomColor: 'rgba(76, 175, 80, 0.02)',
+            lineColor: 'rgba(0,0,0,0)',
+            lineWidth: 0,
+        });
+
+        this.bgBearishSeries = this.chart.addAreaSeries({
+            lastValueVisible: false,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+            topColor: 'rgba(255, 82, 82, 0.12)',
+            bottomColor: 'rgba(255, 82, 82, 0.02)',
+            lineColor: 'rgba(0,0,0,0)',
+            lineWidth: 0,
+        });
+
+        this.supertrendSeries.setData(st1Data);
+        this.largerSupertrendSeries.setData(largerStData);
+
+        // Set background shading data
+        this.bgBullishSeries.setData(bgData.bullish);
+        this.bgBearishSeries.setData(bgData.bearish);
+
+        // Apply markers
+        this.markers = markers;
+        if (this.markers.length > 0 && this.candleSeries) {
+            try {
+                this.markers.sort((a, b) => a.time - b.time);
+                this.candleSeries.setMarkers(this.markers);
+            } catch (e) {
+                console.warn('Error setting markers:', e);
+            }
+        }
+
+        console.log(`Supertrend initialized: ${bars.length} bars, ${markers.length} signals`);
+    }
+
+    /**
+     * Compute all rendering data from bars
+     */
+    _computeAllData(bars) {
         const st1 = this.calculateSupertrend(bars, this.settings.factor, this.settings.atrLength);
 
-        // For larger timeframe, we aggregate bars and calculate
         const aggregatedBars = this.aggregateBars(bars, this.settings.largerTimeframeMultiplier);
         const st2 = this.calculateSupertrend(aggregatedBars, this.settings.largerFactor, this.settings.largerAtrLength);
-
-        // Expand larger timeframe data back to original timeframe
         const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
-        // Calculate ATR regime
-        const atrRegime = this.calculateAtrRegime(bars, this.settings.atrRegimeLength);
+        // Build current TF line data - color matches direction, only show the active side
+        const st1Data = [];
+        const largerStData = [];
+        const bgBullishData = [];
+        const bgBearishData = [];
 
-        // Create supertrend line series (current timeframe)
-        this.supertrendUpSeries = this.chart.addLineSeries({
-            color: this.colors.bullish,
-            lineWidth: 2,
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-        });
-
-        this.supertrendDownSeries = this.chart.addLineSeries({
-            color: this.colors.bearish,
-            lineWidth: 2,
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-        });
-
-        // Create larger timeframe supertrend series
-        this.largerSupertrendUpSeries = this.chart.addLineSeries({
-            color: this.colors.bullishLarger,
-            lineWidth: 1,
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            lineStyle: 0,
-        });
-
-        this.largerSupertrendDownSeries = this.chart.addLineSeries({
-            color: this.colors.bearishLarger,
-            lineWidth: 1,
-            lastValueVisible: false,
-            priceLineVisible: false,
-            crosshairMarkerVisible: false,
-            lineStyle: 0,
-        });
-
-        // Prepare data for series
-        const upData = [];
-        const downData = [];
-        const largerUpData = [];
-        const largerDownData = [];
+        // Track price range for background shading
+        let priceMax = -Infinity;
+        let priceMin = Infinity;
+        for (let i = 0; i < bars.length; i++) {
+            if (bars[i].high > priceMax) priceMax = bars[i].high;
+            if (bars[i].low < priceMin) priceMin = bars[i].low;
+        }
+        const priceRange = priceMax - priceMin;
+        const bgTop = priceMax + priceRange * 0.1;
+        const bgBottom = priceMin - priceRange * 0.1;
 
         for (let i = 0; i < bars.length; i++) {
             const time = bars[i].time;
 
-            // Current timeframe supertrend
+            // Current TF: only show line with color matching direction
             if (st1.supertrend[i] !== null) {
-                if (st1.direction[i] === 1) {
-                    upData.push({ time, value: st1.supertrend[i] });
-                } else {
-                    downData.push({ time, value: st1.supertrend[i] });
-                }
+                st1Data.push({
+                    time,
+                    value: st1.supertrend[i],
+                    color: st1.direction[i] === 1 ? this.colors.bullish : this.colors.bearish,
+                });
             }
 
-            // Larger timeframe supertrend
+            // Larger TF: only show line with color matching direction
             if (expandedSt2.supertrend[i] !== null) {
-                if (expandedSt2.direction[i] === 1) {
-                    largerUpData.push({ time, value: expandedSt2.supertrend[i] });
-                } else {
-                    largerDownData.push({ time, value: expandedSt2.supertrend[i] });
-                }
+                largerStData.push({
+                    time,
+                    value: expandedSt2.supertrend[i],
+                    color: expandedSt2.direction[i] === 1 ? this.colors.bullishLarger : this.colors.bearishLarger,
+                });
+            }
+
+            // Background shading based on combined regime
+            // Both bullish = green bg, both bearish = red bg, mixed = no bg
+            const currDir = st1.direction[i];
+            const largerDir = expandedSt2.direction[i];
+
+            if (currDir === 1 && largerDir === 1) {
+                bgBullishData.push({ time, value: bgTop });
+                bgBearishData.push({ time, value: bgBottom }); // push bottom to keep series aligned but invisible
+            } else if (currDir === -1 && largerDir === -1) {
+                bgBearishData.push({ time, value: bgTop });
+                bgBullishData.push({ time, value: bgBottom });
+            } else {
+                // No shading - push bottom values so series stays continuous
+                bgBullishData.push({ time, value: bgBottom });
+                bgBearishData.push({ time, value: bgBottom });
             }
         }
 
-        // Set data
-        this.supertrendUpSeries.setData(upData);
-        this.supertrendDownSeries.setData(downData);
-        this.largerSupertrendUpSeries.setData(largerUpData);
-        this.largerSupertrendDownSeries.setData(largerDownData);
-
-        // Detect and render signals
+        // Detect signals
         const signals = this.detectSignals(st1.direction, expandedSt2.direction);
-        this.markers = [];
+        const markers = [];
 
         for (const idx of signals.buySignals) {
             if (idx < bars.length) {
-                this.markers.push({
+                markers.push({
                     time: bars[idx].time,
                     position: 'belowBar',
                     color: this.colors.buySignal,
@@ -318,7 +309,7 @@ export class SupertrendIndicator {
 
         for (const idx of signals.sellSignals) {
             if (idx < bars.length) {
-                this.markers.push({
+                markers.push({
                     time: bars[idx].time,
                     position: 'aboveBar',
                     color: this.colors.sellSignal,
@@ -328,27 +319,57 @@ export class SupertrendIndicator {
             }
         }
 
-        // Apply markers to candle series (must be sorted by time)
-        if (this.markers.length > 0 && this.candleSeries) {
-            try {
-                // Sort markers by time (required by LightweightCharts)
-                this.markers.sort((a, b) => a.time - b.time);
-                this.candleSeries.setMarkers(this.markers);
-            } catch (e) {
-                console.warn('Error setting markers:', e);
-            }
-        }
-
-        // Store state for updates
+        // Store last state
         this.lastDirection = st1.direction[st1.direction.length - 1];
         this.lastLargerDirection = expandedSt2.direction[expandedSt2.direction.length - 1];
 
-        console.log(`Supertrend initialized: ${bars.length} bars, ${signals.buySignals.length} buy signals, ${signals.sellSignals.length} sell signals`);
+        return { st1Data, largerStData, bgData: { bullish: bgBullishData, bearish: bgBearishData }, markers };
     }
 
     /**
-     * Aggregate bars to larger timeframe
+     * Add a new bar and update the indicator incrementally
      */
+    addBar(bar, isNewBar) {
+        if (!this.bars || this.bars.length === 0) return;
+
+        if (isNewBar) {
+            this.bars.push(bar);
+        } else {
+            // Update the last bar
+            if (this.bars.length > 0) {
+                this.bars[this.bars.length - 1] = bar;
+            }
+        }
+
+        // Recalculate with all bars (efficient enough for typical bar counts)
+        // For very large datasets we could optimize, but this ensures accuracy
+        this._recalcAndUpdate();
+    }
+
+    /**
+     * Recalculate and update all series in-place
+     */
+    _recalcAndUpdate() {
+        if (!this.supertrendSeries || !this.bars || this.bars.length < 20) return;
+
+        const { st1Data, largerStData, bgData, markers } = this._computeAllData(this.bars);
+
+        try {
+            this.supertrendSeries.setData(st1Data);
+            this.largerSupertrendSeries.setData(largerStData);
+            this.bgBullishSeries.setData(bgData.bullish);
+            this.bgBearishSeries.setData(bgData.bearish);
+
+            this.markers = markers;
+            if (this.markers.length > 0 && this.candleSeries) {
+                this.markers.sort((a, b) => a.time - b.time);
+                this.candleSeries.setMarkers(this.markers);
+            }
+        } catch (e) {
+            console.warn('Error updating supertrend:', e);
+        }
+    }
+
     aggregateBars(bars, multiplier) {
         const aggregated = [];
 
@@ -369,9 +390,6 @@ export class SupertrendIndicator {
         return aggregated;
     }
 
-    /**
-     * Expand aggregated data back to original timeframe
-     */
     expandToOriginalTimeframe(data, originalLength, multiplier) {
         const expanded = {
             supertrend: new Array(originalLength).fill(null),
@@ -392,47 +410,41 @@ export class SupertrendIndicator {
     }
 
     /**
-     * Update with new bar data
+     * Update with new bar data (full recalc)
      */
     update(bars) {
-        // For simplicity, just reinitialize when data updates
-        // A more efficient implementation would update incrementally
-        this.initialize(bars);
+        this.bars = [...bars];
+        this._recalcAndUpdate();
     }
 
-    /**
-     * Remove all indicator series from chart
-     */
     remove() {
         try {
-            if (this.supertrendUpSeries) {
-                this.chart.removeSeries(this.supertrendUpSeries);
-                this.supertrendUpSeries = null;
+            if (this.supertrendSeries) {
+                this.chart.removeSeries(this.supertrendSeries);
+                this.supertrendSeries = null;
             }
-            if (this.supertrendDownSeries) {
-                this.chart.removeSeries(this.supertrendDownSeries);
-                this.supertrendDownSeries = null;
+            if (this.largerSupertrendSeries) {
+                this.chart.removeSeries(this.largerSupertrendSeries);
+                this.largerSupertrendSeries = null;
             }
-            if (this.largerSupertrendUpSeries) {
-                this.chart.removeSeries(this.largerSupertrendUpSeries);
-                this.largerSupertrendUpSeries = null;
+            if (this.bgBullishSeries) {
+                this.chart.removeSeries(this.bgBullishSeries);
+                this.bgBullishSeries = null;
             }
-            if (this.largerSupertrendDownSeries) {
-                this.chart.removeSeries(this.largerSupertrendDownSeries);
-                this.largerSupertrendDownSeries = null;
+            if (this.bgBearishSeries) {
+                this.chart.removeSeries(this.bgBearishSeries);
+                this.bgBearishSeries = null;
             }
             if (this.candleSeries) {
                 this.candleSeries.setMarkers([]);
             }
             this.markers = [];
+            this.bars = [];
         } catch (e) {
             console.warn('Error removing supertrend series:', e);
         }
     }
 
-    /**
-     * Update settings
-     */
     updateSettings(newSettings) {
         this.settings = { ...this.settings, ...newSettings };
     }
@@ -444,17 +456,10 @@ export class SupertrendIndicator {
 export class IndicatorRenderer {
     constructor(chart) {
         this.chart = chart;
-        this.series = {};  // indicator_id -> series object
-        this.separatePanes = {};  // pane_id -> pane info
+        this.series = {};
+        this.separatePanes = {};
     }
 
-    /**
-     * Add an indicator to the chart
-     *
-     * @param {string} indicatorId - Unique indicator ID
-     * @param {object} config - Plot configuration from backend
-     * @param {array} data - Indicator data points
-     */
     addIndicator(indicatorId, config, data) {
         console.log(`Adding indicator: ${indicatorId}`, config);
 
@@ -469,12 +474,8 @@ export class IndicatorRenderer {
         }
     }
 
-    /**
-     * Add indicator that overlays on main price chart
-     */
     _addMainPaneIndicator(indicatorId, config, data) {
         if (config.type === 'line') {
-            // Standard line overlay (SMA, EMA, etc.)
             const series = this.chart.addLineSeries({
                 color: config.color || '#2962FF',
                 lineWidth: config.lineWidth || 2,
@@ -491,19 +492,14 @@ export class IndicatorRenderer {
             this.series[indicatorId] = series;
 
         } else if (config.type === 'bands') {
-            // Bollinger Bands (3 lines)
             this._addBollingerBands(indicatorId, config, data);
         }
     }
 
-    /**
-     * Add Bollinger Bands (special case with 3 lines)
-     */
     _addBollingerBands(indicatorId, config, data) {
         const color = config.color || '#2962FF';
         const lineWidth = config.lineWidth || 1;
 
-        // Middle line
         const middleSeries = this.chart.addLineSeries({
             color: color,
             lineWidth: lineWidth,
@@ -514,29 +510,26 @@ export class IndicatorRenderer {
             value: d.middle
         })));
 
-        // Upper line
         const upperSeries = this.chart.addLineSeries({
             color: color,
             lineWidth: lineWidth,
-            lineStyle: 2,  // Dashed
+            lineStyle: 2,
         });
         upperSeries.setData(data.map(d => ({
             time: d.time,
             value: d.upper
         })));
 
-        // Lower line
         const lowerSeries = this.chart.addLineSeries({
             color: color,
             lineWidth: lineWidth,
-            lineStyle: 2,  // Dashed
+            lineStyle: 2,
         });
         lowerSeries.setData(data.map(d => ({
             time: d.time,
             value: d.lower
         })));
 
-        // Store all three series
         this.series[indicatorId] = {
             middle: middleSeries,
             upper: upperSeries,
@@ -545,12 +538,8 @@ export class IndicatorRenderer {
         };
     }
 
-    /**
-     * Add indicator in separate pane below main chart
-     */
     _addSeparatePaneIndicator(indicatorId, config, data) {
         if (config.type === 'line') {
-            // Standard oscillator (RSI, CCI, ROC)
             const series = this.chart.addLineSeries({
                 color: config.color || '#7B1FA2',
                 lineWidth: config.lineWidth || 2,
@@ -574,11 +563,7 @@ export class IndicatorRenderer {
         }
     }
 
-    /**
-     * Add MACD indicator (2 lines + histogram)
-     */
     _addMACD(indicatorId, config, data) {
-        // MACD line
         const macdSeries = this.chart.addLineSeries({
             color: config.macdColor || '#2962FF',
             lineWidth: 2,
@@ -589,7 +574,6 @@ export class IndicatorRenderer {
             value: d.macd
         })));
 
-        // Signal line
         const signalSeries = this.chart.addLineSeries({
             color: config.signalColor || '#FF6D00',
             lineWidth: 2,
@@ -599,7 +583,6 @@ export class IndicatorRenderer {
             value: d.signal
         })));
 
-        // Histogram
         const histogramSeries = this.chart.addHistogramSeries({
             priceScaleId: '',
         });
@@ -619,11 +602,7 @@ export class IndicatorRenderer {
         };
     }
 
-    /**
-     * Add Stochastic indicator (%K and %D lines)
-     */
     _addStochastic(indicatorId, config, data) {
-        // %K line
         const kSeries = this.chart.addLineSeries({
             color: config.kColor || '#2962FF',
             lineWidth: 2,
@@ -634,7 +613,6 @@ export class IndicatorRenderer {
             value: d.k
         })));
 
-        // %D line
         const dSeries = this.chart.addLineSeries({
             color: config.dColor || '#FF6D00',
             lineWidth: 2,
@@ -651,12 +629,6 @@ export class IndicatorRenderer {
         };
     }
 
-    /**
-     * Update indicator with new data point
-     *
-     * @param {string} indicatorId - Indicator ID
-     * @param {object} newPoint - New data point
-     */
     updateIndicator(indicatorId, newPoint) {
         if (!this.series[indicatorId]) {
             console.warn(`Indicator ${indicatorId} not found`);
@@ -667,13 +639,11 @@ export class IndicatorRenderer {
 
         try {
             if (series.type === 'bands') {
-                // Update Bollinger Bands
                 series.middle.update({ time: newPoint.time, value: newPoint.middle });
                 series.upper.update({ time: newPoint.time, value: newPoint.upper });
                 series.lower.update({ time: newPoint.time, value: newPoint.lower });
 
             } else if (series.type === 'macd') {
-                // Update MACD
                 series.macd.update({ time: newPoint.time, value: newPoint.macd });
                 series.signal.update({ time: newPoint.time, value: newPoint.signal });
                 series.histogram.update({
@@ -685,12 +655,10 @@ export class IndicatorRenderer {
                 });
 
             } else if (series.type === 'stochastic') {
-                // Update Stochastic
                 series.k.update({ time: newPoint.time, value: newPoint.k });
                 series.d.update({ time: newPoint.time, value: newPoint.d });
 
             } else {
-                // Standard line series
                 series.update({ time: newPoint.time, value: newPoint.value });
             }
 
@@ -699,11 +667,6 @@ export class IndicatorRenderer {
         }
     }
 
-    /**
-     * Remove an indicator from the chart
-     *
-     * @param {string} indicatorId - Indicator ID
-     */
     removeIndicator(indicatorId) {
         if (!this.series[indicatorId]) {
             return;
@@ -738,17 +701,11 @@ export class IndicatorRenderer {
         }
     }
 
-    /**
-     * Remove all indicators
-     */
     removeAllIndicators() {
         const indicators = Object.keys(this.series);
         indicators.forEach(id => this.removeIndicator(id));
     }
 
-    /**
-     * Get list of active indicator IDs
-     */
     getActiveIndicators() {
         return Object.keys(this.series);
     }
@@ -757,8 +714,6 @@ export class IndicatorRenderer {
 
 /**
  * Indicator Manager
- *
- * Manages indicator state and API communication
  */
 export class IndicatorManager {
     constructor(apiBaseUrl = '') {
@@ -766,9 +721,6 @@ export class IndicatorManager {
         this.activeIndicators = [];
     }
 
-    /**
-     * Get list of available indicators from backend
-     */
     async getAvailableIndicators() {
         try {
             const response = await fetch(`${this.apiBaseUrl}/api/indicators`);
@@ -780,9 +732,6 @@ export class IndicatorManager {
         }
     }
 
-    /**
-     * Get list of active indicators
-     */
     async getActiveIndicators() {
         try {
             const response = await fetch(`${this.apiBaseUrl}/api/indicators/active`);
@@ -795,9 +744,6 @@ export class IndicatorManager {
         }
     }
 
-    /**
-     * Add an indicator
-     */
     async addIndicator(type, params = {}) {
         try {
             const response = await fetch(`${this.apiBaseUrl}/api/indicators/${type}`, {
@@ -819,9 +765,6 @@ export class IndicatorManager {
         }
     }
 
-    /**
-     * Remove an indicator
-     */
     async removeIndicator(indicatorId) {
         try {
             const response = await fetch(`${this.apiBaseUrl}/api/indicators/${indicatorId}`, {
@@ -840,9 +783,6 @@ export class IndicatorManager {
         }
     }
 
-    /**
-     * Calculate indicators for a symbol
-     */
     async calculateIndicators(symbol) {
         try {
             const response = await fetch(`${this.apiBaseUrl}/api/indicators/calculate/${symbol}`);
