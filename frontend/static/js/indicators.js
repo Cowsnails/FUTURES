@@ -25,9 +25,9 @@ export class SupertrendIndicator {
             atrRegimeLength: 14,
         };
 
-        // Series for rendering - single colored line per timeframe
-        this.supertrendSeries = null;
-        this.largerSupertrendSeries = null;
+        // Series for rendering - separate up/down to avoid vertical snap on direction change
+        this.supertrendUpSeries = null;
+        this.supertrendDownSeries = null;
 
         // Marker arrays
         this.markers = [];
@@ -46,8 +46,6 @@ export class SupertrendIndicator {
         this.colors = {
             bullish: '#4CAF50',
             bearish: '#FF5252',
-            bullishLarger: 'rgba(76, 175, 80, 0.5)',
-            bearishLarger: 'rgba(255, 82, 82, 0.5)',
             buySignal: 'rgba(0, 230, 118, 1)',
             sellSignal: 'rgba(255, 82, 82, 1)',
         };
@@ -164,10 +162,11 @@ export class SupertrendIndicator {
         this.remove();
         this.bars = [...bars];
 
-        const { st1Data, largerStData, markers } = this._computeAllData(bars);
+        const { upData, downData, markers } = this._computeAllData(bars);
 
-        // Create current TF supertrend as a single line series with per-point color
-        this.supertrendSeries = this.chart.addLineSeries({
+        // Two separate series: bullish (green) and bearish (red)
+        // Each has whitespace entries where the other is active, creating gaps
+        this.supertrendUpSeries = this.chart.addLineSeries({
             lastValueVisible: false,
             priceLineVisible: false,
             crosshairMarkerVisible: false,
@@ -175,17 +174,16 @@ export class SupertrendIndicator {
             color: this.colors.bullish,
         });
 
-        // Create larger TF supertrend line
-        this.largerSupertrendSeries = this.chart.addLineSeries({
+        this.supertrendDownSeries = this.chart.addLineSeries({
             lastValueVisible: false,
             priceLineVisible: false,
             crosshairMarkerVisible: false,
-            lineWidth: 1,
-            color: this.colors.bullishLarger,
+            lineWidth: 2,
+            color: this.colors.bearish,
         });
 
-        this.supertrendSeries.setData(st1Data);
-        this.largerSupertrendSeries.setData(largerStData);
+        this.supertrendUpSeries.setData(upData);
+        this.supertrendDownSeries.setData(downData);
 
         // Apply markers
         this.markers = markers;
@@ -211,30 +209,27 @@ export class SupertrendIndicator {
         const st2 = this.calculateSupertrend(aggregatedBars, this.settings.largerFactor, this.settings.largerAtrLength);
         const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
-        const st1Data = [];
-        const largerStData = [];
+        // Two series: up (bullish/green) and down (bearish/red)
+        // When direction is bullish, upData gets the value, downData gets whitespace
+        // When direction is bearish, downData gets the value, upData gets whitespace
+        // This prevents the vertical snap-through on direction change
+        const upData = [];
+        const downData = [];
 
         for (let i = 0; i < bars.length; i++) {
+            if (st1.supertrend[i] === null) continue;
             const time = bars[i].time;
 
-            if (st1.supertrend[i] !== null) {
-                st1Data.push({
-                    time,
-                    value: st1.supertrend[i],
-                    color: st1.direction[i] === 1 ? this.colors.bullish : this.colors.bearish,
-                });
-            }
-
-            if (expandedSt2.supertrend[i] !== null) {
-                largerStData.push({
-                    time,
-                    value: expandedSt2.supertrend[i],
-                    color: expandedSt2.direction[i] === 1 ? this.colors.bullishLarger : this.colors.bearishLarger,
-                });
+            if (st1.direction[i] === 1) {
+                upData.push({ time, value: st1.supertrend[i] });
+                downData.push({ time });  // whitespace
+            } else {
+                downData.push({ time, value: st1.supertrend[i] });
+                upData.push({ time });  // whitespace
             }
         }
 
-        // Detect signals
+        // Detect signals (uses larger TF internally for signal logic)
         const signals = this.detectSignals(st1.direction, expandedSt2.direction);
         const markers = [];
 
@@ -265,7 +260,7 @@ export class SupertrendIndicator {
         this.lastDirection = st1.direction[st1.direction.length - 1];
         this.lastLargerDirection = expandedSt2.direction[expandedSt2.direction.length - 1];
 
-        return { st1Data, largerStData, markers };
+        return { upData, downData, markers };
     }
 
     /**
@@ -291,14 +286,14 @@ export class SupertrendIndicator {
     }
 
     _recalcAndUpdate() {
-        if (!this.supertrendSeries || !this.bars || this.bars.length < 20) return;
+        if (!this.supertrendUpSeries || !this.bars || this.bars.length < 20) return;
         this._lastFullRecalcTime = Date.now();
 
-        const { st1Data, largerStData, markers } = this._computeAllData(this.bars);
+        const { upData, downData, markers } = this._computeAllData(this.bars);
 
         try {
-            this.supertrendSeries.setData(st1Data);
-            this.largerSupertrendSeries.setData(largerStData);
+            this.supertrendUpSeries.setData(upData);
+            this.supertrendDownSeries.setData(downData);
 
             this.markers = markers;
             if (this.markers.length > 0 && this.candleSeries) {
@@ -359,13 +354,13 @@ export class SupertrendIndicator {
 
     remove() {
         try {
-            if (this.supertrendSeries) {
-                this.chart.removeSeries(this.supertrendSeries);
-                this.supertrendSeries = null;
+            if (this.supertrendUpSeries) {
+                this.chart.removeSeries(this.supertrendUpSeries);
+                this.supertrendUpSeries = null;
             }
-            if (this.largerSupertrendSeries) {
-                this.chart.removeSeries(this.largerSupertrendSeries);
-                this.largerSupertrendSeries = null;
+            if (this.supertrendDownSeries) {
+                this.chart.removeSeries(this.supertrendDownSeries);
+                this.supertrendDownSeries = null;
             }
             if (this.candleSeries) {
                 this.candleSeries.setMarkers([]);
