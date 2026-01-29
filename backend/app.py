@@ -91,7 +91,7 @@ from .security import (
     validate_bar_size,
     validate_indicator_params
 )
-from .pattern_matcher import PatternMatchEngine
+from .pattern_matcher import DailyPatternEngine
 
 # Configure logging
 logging.basicConfig(
@@ -117,8 +117,8 @@ indicator_manager: Optional[IndicatorManager] = None
 preloaded_data: Dict[str, Dict[str, list]] = {}
 TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
 
-# Pattern matching engines per symbol
-pattern_engines: Dict[str, PatternMatchEngine] = {}
+# Daily pattern matching engines per symbol
+pattern_engines: Dict[str, DailyPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
 
 
@@ -374,10 +374,9 @@ async def prefetch_all_tickers():
 
 def initialize_pattern_engines():
     """
-    Build PatternMatchEngine for each symbol from preloaded 1-min data.
-    Splits the 1-min bars into per-day arrays (RTH: 9:30-16:00 ET).
+    Build DailyPatternEngine for each symbol from preloaded 1-min data.
+    Groups 1-min bars into daily OHLCV + hourly bars for 750-day matching.
     """
-    import pytz
     from datetime import datetime as dt
 
     for symbol in ['MNQ', 'MES', 'MGC']:
@@ -386,87 +385,44 @@ def initialize_pattern_engines():
             logger.warning(f"Pattern matcher: no 1-min data for {symbol}")
             continue
 
-        # Group bars by trading day (bar.time is ET-as-UTC unix seconds)
-        days_map = {}  # date_str -> list of bars
-        for b in bars:
-            # bar.time is Eastern time encoded as UTC timestamp
-            d = dt.utcfromtimestamp(b['time'])
-            h, m = d.hour, d.minute
-            # RTH filter: 9:30 - 16:00 ET
-            minutes = h * 60 + m
-            if minutes < 570 or minutes >= 960:  # 9:30=570, 16:00=960
-                continue
-            date_key = d.strftime('%Y-%m-%d')
-            if date_key not in days_map:
-                days_map[date_key] = []
-            days_map[date_key].append(b)
-
-        # Sort dates, take last 60 trading days
-        sorted_dates = sorted(days_map.keys())
-        if len(sorted_dates) > 61:
-            # Keep 61 so we have prior_close for the first day
-            sorted_dates = sorted_dates[-61:]
-
-        daily_bars_list = []
-        for i, date_key in enumerate(sorted_dates):
-            day_bars = sorted(days_map[date_key], key=lambda x: x['time'])
-            prior_close = 0.0
-            if i > 0:
-                prev_date = sorted_dates[i - 1]
-                prev_bars = days_map[prev_date]
-                if prev_bars:
-                    prior_close = sorted(prev_bars, key=lambda x: x['time'])[-1]['close']
-
-            daily_bars_list.append({
-                'date': date_key,
-                'bars': day_bars,
-                'prior_close': prior_close,
-            })
-
-        # Skip the first day if we used it just for prior_close
-        if len(daily_bars_list) > 60:
-            daily_bars_list = daily_bars_list[1:]
-
-        engine = PatternMatchEngine()
-        engine.load_historical_data(daily_bars_list)
+        engine = DailyPatternEngine()
+        engine.load_from_1min_bars(bars)
         pattern_engines[symbol] = engine
-        logger.info(f"✓ Pattern matcher for {symbol}: {engine.num_days} days loaded")
+        logger.info(f"✓ Daily pattern matcher for {symbol}: {engine.num_days} days loaded")
 
 
 async def pattern_match_loop():
     """
-    Background task: run pattern matching every 5 minutes during RTH.
-    Broadcasts results to all connected WebSocket clients.
+    Background task: run daily pattern matching every 30 minutes during RTH.
+    Schedule: 9:30 AM initial, then every 30 min until 2:00 PM ET.
     """
     import pytz
-    from datetime import datetime as dt, time as dtime
+    from datetime import datetime as dt
 
     eastern = pytz.timezone('US/Eastern')
 
     while True:
         try:
             now_et = dt.now(eastern)
-            # Only run 10:00 AM - 2:00 PM ET on weekdays
             if now_et.weekday() < 5:
                 current_minutes = now_et.hour * 60 + now_et.minute
-                if 600 <= current_minutes < 840:  # 10:00 - 14:00
+                # 9:30 AM (570) to 2:00 PM (840)
+                if 570 <= current_minutes < 840:
                     await run_all_pattern_matches()
 
-            # Sleep 5 minutes
-            await asyncio.sleep(300)
+            # Sleep 30 minutes (1800 seconds)
+            await asyncio.sleep(1800)
         except asyncio.CancelledError:
             logger.info("Pattern match loop cancelled")
             break
         except Exception as e:
             logger.error(f"Pattern match loop error: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(120)
 
 
 async def run_all_pattern_matches():
-    """Run pattern matching for all symbols and broadcast results."""
+    """Run daily pattern matching for all symbols and broadcast results."""
     from datetime import datetime as dt
-    import pytz
-    eastern = pytz.timezone('US/Eastern')
 
     for symbol, engine in pattern_engines.items():
         try:
@@ -474,40 +430,20 @@ async def run_all_pattern_matches():
             if not bars_1min:
                 continue
 
-            # Get today's RTH bars
-            now_et = dt.now(eastern)
-            today_str = now_et.strftime('%Y-%m-%d')
-
-            today_bars = []
-            prior_close = 0.0
-            for b in bars_1min:
-                d = dt.utcfromtimestamp(b['time'])
-                date_key = d.strftime('%Y-%m-%d')
-                minutes = d.hour * 60 + d.minute
-                if date_key == today_str and 570 <= minutes < 960:
-                    today_bars.append(b)
-                elif date_key < today_str:
-                    prior_close = b['close']
-
-            today_bars.sort(key=lambda x: x['time'])
-
-            if len(today_bars) < 30:
-                continue
-
-            result = engine.run_match(today_bars, prior_close)
+            result = engine.run_match_from_1min(bars_1min)
             if result:
                 result['symbol'] = symbol
                 result['type'] = 'pattern_update'
-                # Broadcast to all connected clients
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
                 logger.info(
-                    f"Pattern match {symbol}: {result['match_count']} matches, "
+                    f"Daily pattern {symbol}: {result['match_count']} matches, "
+                    f"phase={result.get('projection', {}).get('current_phase', 'n/a')}, "
                     f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
                 )
         except Exception as e:
-            logger.error(f"Pattern match error for {symbol}: {e}")
+            logger.error(f"Daily pattern match error for {symbol}: {e}")
 
 
 @asynccontextmanager

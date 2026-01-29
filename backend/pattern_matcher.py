@@ -1,559 +1,715 @@
 """
-Historical Intraday Pattern Matching System
+Daily Pattern Matching System with Intraday Refinement
 
-Compares today's unfolding price action against 60 days of historical intraday
-templates to find similar days and forecast probable outcomes.
+Matches today's setup against 750 days of historical data using daily OHLCV
+context + hourly intraday shape. Projects the typical rest-of-day path and
+refines predictions every 30 minutes as the day unfolds.
 
 Architecture:
-  - Precomputes normalized templates at startup
-  - Regime-filters historical pool (ATR, gap type, trend context)
-  - Vectorized Pearson correlation for fast matching
-  - Runs every 5 minutes from 10:00 AM to 2:00 PM ET
-  - Broadcasts results via WebSocket to frontend
+  - Layer 1: Daily regime filter (ATR, gap, trend) narrows 750 → ~100-200 days
+  - Layer 2: Hourly shape correlation ranks candidates by similarity
+  - Forecast: Rest-of-day projection with inflection points and day phase
+  - Updates every 30 min from 9:30 AM to 2:00 PM ET
 """
 
 import numpy as np
 import logging
-from dataclasses import dataclass, asdict
-from enum import Enum
+from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime, time as dtime
-
-import pytz
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-EASTERN = pytz.timezone("US/Eastern")
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
 
-# RTH: 9:30 AM - 4:00 PM ET = 390 one-minute bars
-RTH_START = dtime(9, 30)
-RTH_END = dtime(16, 0)
-RTH_BARS = 390
+# RTH hourly slots: 9:30, 10:30, 11:30, 12:30, 13:30, 14:30, 15:30 = 7 bars
+RTH_HOURLY_SLOTS = 7
+RTH_START_HOUR = 9   # 9:30
+RTH_END_HOUR = 16    # 16:00
 
-# Matching parameters
-MIN_BARS_FOR_MATCH = 30       # Need at least 30 bars (30 min) of today's data
-MIN_CORRELATION = 0.80        # Below this = weak match, exclude
-MIN_MATCHES_REQUIRED = 3      # Need at least 3 valid matches for a forecast
-TOP_N_MATCHES = 5             # Return top 5 most similar days
-RECENCY_DECAY = 0.97          # Exponential decay for recency weighting (~23-day half-life)
-ATR_TOLERANCE = 0.20          # ±20% ATR for regime filter
-GAP_THRESHOLD = 0.003         # 0.3% gap classification threshold
+MIN_CORRELATION = 0.75       # Minimum for a valid match
+MIN_STRONG_CORRELATION = 0.80
+MIN_MATCHES_REQUIRED = 3
+TOP_N_MATCHES = 8            # Return top 8 matches
+RECENCY_DECAY = 0.97         # ~23-day half-life
+ATR_TOLERANCE = 0.20         # ±20% ATR for regime filter
+GAP_THRESHOLD = 0.003        # 0.3% for gap classification
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA MODELS
 # ═══════════════════════════════════════════════════════════════════════════
 
-class GapType(Enum):
-    GAP_UP = "gap_up"
-    GAP_DOWN = "gap_down"
-    FLAT = "flat"
-
-
-class TrendContext(Enum):
-    UP = "up"
-    DOWN = "down"
-    SIDEWAYS = "sideways"
-
-
 @dataclass
-class DayMetadata:
-    date: str                       # YYYY-MM-DD
-    day_index: int                  # 0-59 (0 = most recent)
-    opening_atr: float              # ATR at market open
-    gap_percent: float              # Gap from prior close
-    gap_type: GapType
-    trend_context: TrendContext     # Prior day trend
-    daily_return: float             # Full-day return (close vs open) in %
-    high_of_day_bar: int            # Bar index of HOD
-    low_of_day_bar: int             # Bar index of LOD
-    is_half_day: bool               # Early close day
-    is_extreme: bool                # |daily_return| > 3%
-
-
-@dataclass
-class PatternMatch:
-    date: str
-    correlation: float
-    weighted_correlation: float     # After recency weighting
-    daily_return: float
-    projection_prices: list         # Remaining bars after match window (raw prices)
-    projection_returns: list        # Remaining bars as % returns from match end
-    metadata: dict
-
-
-@dataclass
-class PatternForecast:
-    direction_probability: float    # 0-1, >0.5 = bullish
-    direction_signal: float         # -1 to +1
-    mean_move: float                # Average remaining-day return
-    median_move: float
-    std_dev: float
-    confidence_interval_68: tuple   # (lower, upper) 1-sigma
-    sample_size: int
-    consensus: str                  # e.g. "4/5 bullish"
-    avg_correlation: float
-    confluence_score: float         # -1 to +1 for decision engine
+class DayRecord:
+    """One historical trading day with daily stats + hourly bars."""
+    date_str: str
+    day_index: int                    # 0 = oldest loaded
+    # Daily OHLCV
+    day_open: float
+    day_high: float
+    day_low: float
+    day_close: float
+    day_volume: int
+    # Derived daily
+    daily_range: float                # high - low
+    daily_return_pct: float           # (close - open) / open * 100
+    gap_pct: float                    # (open - prior_close) / prior_close
+    gap_type: str                     # 'gap_up', 'gap_down', 'flat'
+    atr_10: float                     # 10-period ATR at this day
+    trend_context: str                # 'up', 'down', 'sideways'
+    day_type: str                     # 'trend', 'reversal', 'range', 'breakout'
+    is_extreme: bool                  # |daily_return| > 3%
+    is_half_day: bool
+    # Hourly bars (up to 7 slots for RTH)
+    hourly_closes: np.ndarray         # shape (N,) where N <= 7
+    hourly_opens: np.ndarray
+    hourly_highs: np.ndarray
+    hourly_lows: np.ndarray
+    hourly_volumes: np.ndarray
+    hourly_returns: np.ndarray        # % returns from day open
+    # Key levels
+    morning_high: float               # High of first 2 hours
+    morning_low: float
+    hod_bar: int                      # Bar index of high of day
+    lod_bar: int                      # Bar index of low of day
+    # Rest-of-day outcome (from hour 2 onward)
+    rest_of_day_return: float         # % return from ~10:30 to close
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # NORMALIZATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def normalize_intraday_prices(prices: np.ndarray) -> np.ndarray:
-    """
-    Two-stage normalization:
-    1. Returns from open (scale-invariant across different price levels)
-    2. Z-score (shape comparison)
-    """
-    if len(prices) == 0:
-        return prices
-    open_price = prices[0]
-    if open_price == 0:
+def normalize_returns(prices: np.ndarray) -> np.ndarray:
+    """Returns from open, then z-score normalize for shape comparison."""
+    if len(prices) < 2:
         return np.zeros_like(prices)
-    returns_from_open = (prices / open_price - 1.0) * 100.0
-    mean = np.mean(returns_from_open)
-    std = np.std(returns_from_open)
+    returns = (prices / prices[0] - 1.0) * 100.0
+    std = np.std(returns)
     if std < 1e-8:
         return np.zeros_like(prices)
-    return (returns_from_open - mean) / std
-
-
-def normalize_volume(volumes: np.ndarray, avg_by_minute: np.ndarray) -> np.ndarray:
-    """Time-of-day adjusted volume normalization."""
-    relative = volumes / (avg_by_minute + 1e-8)
-    mean = np.mean(relative)
-    std = np.std(relative)
-    if std < 1e-8:
-        return np.zeros_like(volumes)
-    return (relative - mean) / std
+    return (returns - np.mean(returns)) / std
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SIMILARITY
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fast_correlation_batch(today_series: np.ndarray,
-                           historical_matrix: np.ndarray) -> np.ndarray:
-    """
-    Vectorized Pearson correlation: today vs all historical days at once.
-    today_series: (N,)
-    historical_matrix: (D, N) where D = number of historical days
-    Returns: (D,) correlation values
-    """
-    if len(today_series) == 0 or historical_matrix.shape[0] == 0:
+def pearson_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson correlation between two arrays. Returns 0 on error."""
+    if len(a) < 2 or len(a) != len(b):
+        return 0.0
+    a_c = a - np.mean(a)
+    b_c = b - np.mean(b)
+    num = np.dot(a_c, b_c)
+    den = np.sqrt(np.sum(a_c ** 2) * np.sum(b_c ** 2))
+    if den < 1e-10:
+        return 0.0
+    r = num / den
+    return float(np.clip(r, -1.0, 1.0))
+
+
+def batch_pearson(today: np.ndarray, hist_matrix: np.ndarray) -> np.ndarray:
+    """Vectorized Pearson: today (N,) vs hist_matrix (D, N) → (D,)."""
+    if len(today) == 0 or hist_matrix.shape[0] == 0:
         return np.array([])
-
-    today_centered = today_series - np.mean(today_series)
-    hist_centered = historical_matrix - np.mean(historical_matrix, axis=1, keepdims=True)
-
-    today_norm = np.sqrt(np.sum(today_centered ** 2))
-    hist_norms = np.sqrt(np.sum(hist_centered ** 2, axis=1))
-
-    if today_norm < 1e-10:
-        return np.zeros(historical_matrix.shape[0])
-
-    numerator = np.dot(hist_centered, today_centered)
-    denominator = hist_norms * today_norm + 1e-10
-
-    result = numerator / denominator
-    # Clamp to valid range
-    return np.clip(result, -1.0, 1.0)
-
-
-def apply_recency_weight(correlations: np.ndarray,
-                          days_ago: np.ndarray,
-                          decay: float = RECENCY_DECAY) -> np.ndarray:
-    """Weight recent matches more heavily."""
-    weights = decay ** days_ago
-    return correlations * weights
+    t_c = today - np.mean(today)
+    h_c = hist_matrix - np.mean(hist_matrix, axis=1, keepdims=True)
+    t_norm = np.sqrt(np.sum(t_c ** 2))
+    h_norms = np.sqrt(np.sum(h_c ** 2, axis=1))
+    if t_norm < 1e-10:
+        return np.zeros(hist_matrix.shape[0])
+    return np.clip(np.dot(h_c, t_c) / (h_norms * t_norm + 1e-10), -1.0, 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REGIME CLASSIFICATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def classify_gap(gap_percent: float) -> GapType:
-    if gap_percent > GAP_THRESHOLD:
-        return GapType.GAP_UP
-    elif gap_percent < -GAP_THRESHOLD:
-        return GapType.GAP_DOWN
-    return GapType.FLAT
+def classify_gap(gap_pct: float) -> str:
+    if gap_pct > GAP_THRESHOLD:
+        return 'gap_up'
+    elif gap_pct < -GAP_THRESHOLD:
+        return 'gap_down'
+    return 'flat'
 
 
-def classify_trend(closes: np.ndarray, period: int = 9) -> TrendContext:
-    """EMA-based trend context from prior day's closes."""
+def classify_trend(closes: list, period: int = 9) -> str:
+    """Trend context from an array of recent daily closes."""
     if len(closes) < period:
-        return TrendContext.SIDEWAYS
-    # Simple EMA approximation
-    ema = np.mean(closes[-period:])
-    last_close = closes[-1]
-    pct = (last_close - ema) / ema * 100
+        return 'sideways'
+    ema = float(np.mean(closes[-period:]))
+    last = closes[-1]
+    pct = (last - ema) / ema * 100.0
     if pct > 0.15:
-        return TrendContext.UP
+        return 'up'
     elif pct < -0.15:
-        return TrendContext.DOWN
-    return TrendContext.SIDEWAYS
+        return 'down'
+    return 'sideways'
 
 
-def compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-                period: int = 10) -> float:
-    """Compute ATR from OHLC arrays."""
-    if len(highs) < period + 1:
-        return 0.0
-    tr = np.maximum(
-        highs[1:] - lows[1:],
-        np.maximum(
-            np.abs(highs[1:] - closes[:-1]),
-            np.abs(lows[1:] - closes[:-1])
+def classify_day_type(day_open, day_close, day_high, day_low, first_hour_close) -> str:
+    """Classify day as trend/reversal/range/breakout."""
+    daily_ret = abs(day_close - day_open) / day_open * 100 if day_open else 0
+    intraday_range = (day_high - day_low) / day_open * 100 if day_open else 0
+    first_hour_ret = (first_hour_close - day_open) / day_open * 100 if day_open and first_hour_close else 0
+    daily_dir = day_close - day_open
+
+    if daily_ret > 1.5 and intraday_range > 2.0:
+        return 'trend'
+    elif first_hour_ret != 0 and (daily_dir * first_hour_ret < 0):
+        return 'reversal'
+    elif intraday_range < 1.0:
+        return 'range'
+    return 'breakout'
+
+
+def compute_atr_series(highs: list, lows: list, closes: list, period: int = 10) -> list:
+    """Compute ATR for each bar given daily H/L/C lists."""
+    n = len(highs)
+    if n < 2:
+        return [0.0] * n
+    trs = [highs[0] - lows[0]]
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
         )
-    )
-    return float(np.mean(tr[-period:]))
-
-
-def filter_by_regime(today_atr: float, today_gap: float,
-                     today_trend: TrendContext,
-                     metadata: dict[int, DayMetadata]) -> list[int]:
-    """
-    Filter historical days by similar market context.
-    Returns list of day indices that pass the filter.
-    Progressive relaxation if too few matches.
-    """
-    today_gap_type = classify_gap(today_gap)
-
-    # Strict filter: ATR + gap + trend
-    strict = []
-    for idx, meta in metadata.items():
-        if meta.is_half_day or meta.is_extreme:
-            continue
-        atr_match = (abs(meta.opening_atr - today_atr) /
-                     (today_atr + 1e-8)) <= ATR_TOLERANCE
-        gap_match = meta.gap_type == today_gap_type
-        trend_match = meta.trend_context == today_trend
-        if atr_match and gap_match and trend_match:
-            strict.append(idx)
-
-    if len(strict) >= 10:
-        return strict
-
-    # Relaxed: ATR + gap only
-    relaxed = []
-    for idx, meta in metadata.items():
-        if meta.is_half_day or meta.is_extreme:
-            continue
-        atr_match = (abs(meta.opening_atr - today_atr) /
-                     (today_atr + 1e-8)) <= ATR_TOLERANCE
-        gap_match = meta.gap_type == today_gap_type
-        if atr_match and gap_match:
-            relaxed.append(idx)
-
-    if len(relaxed) >= 5:
-        return relaxed
-
-    # Fallback: ATR only
-    atr_only = []
-    for idx, meta in metadata.items():
-        if meta.is_half_day or meta.is_extreme:
-            continue
-        atr_match = (abs(meta.opening_atr - today_atr) /
-                     (today_atr + 1e-8)) <= ATR_TOLERANCE
-        if atr_match:
-            atr_only.append(idx)
-
-    if len(atr_only) >= 5:
-        return atr_only
-
-    # Final fallback: all valid days
-    return [idx for idx, meta in metadata.items()
-            if not meta.is_half_day and not meta.is_extreme]
+        trs.append(tr)
+    # Simple moving average of TR
+    atrs = []
+    for i in range(n):
+        start = max(0, i - period + 1)
+        atrs.append(float(np.mean(trs[start:i + 1])))
+    return atrs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FORECAST GENERATION
+# FORECAST & PROJECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_forecast(matches: list[PatternMatch]) -> Optional[PatternForecast]:
+def generate_projection(matches: list, n_hours_so_far: int,
+                        current_price: float) -> dict:
     """
-    Build probabilistic forecast from top matched historical days.
+    Build rest-of-day projection from matched historical days.
+    matches: list of (DayRecord, correlation)
+    n_hours_so_far: how many hourly bars we have for today (1-7)
+    current_price: latest price
     """
+    if not matches:
+        return {}
+
+    future_paths = []   # list of { returns: [...], weight: corr }
+    for day, corr in matches:
+        if len(day.hourly_closes) <= n_hours_so_far:
+            continue
+        remaining = day.hourly_closes[n_hours_so_far:]
+        anchor = day.hourly_closes[n_hours_so_far - 1] if n_hours_so_far > 0 else day.day_open
+        if anchor <= 0:
+            continue
+        returns = ((remaining / anchor) - 1.0) * 100.0
+        future_paths.append({
+            'returns': returns.tolist(),
+            'weight': corr,
+            'date': day.date_str,
+            'day_type': day.day_type,
+            'daily_return': day.daily_return_pct,
+        })
+
+    if not future_paths:
+        return {}
+
+    # Weighted average path
+    max_len = max(len(p['returns']) for p in future_paths)
+    weighted_sum = np.zeros(max_len)
+    weight_sum = np.zeros(max_len)
+    all_returns_at_end = []
+
+    for p in future_paths:
+        r = np.array(p['returns'])
+        w = p['weight']
+        weighted_sum[:len(r)] += r * w
+        weight_sum[:len(r)] += w
+        if len(r) > 0:
+            all_returns_at_end.append(r[-1])
+
+    avg_path = np.where(weight_sum > 0, weighted_sum / weight_sum, 0).tolist()
+
+    # Projected prices
+    projected_prices = [current_price * (1 + r / 100.0) for r in avg_path]
+
+    # Inflection points (local max/min in avg path)
+    inflections = []
+    for i in range(1, len(avg_path) - 1):
+        if avg_path[i] > avg_path[i - 1] and avg_path[i] > avg_path[i + 1]:
+            inflections.append({
+                'bar_offset': i,
+                'type': 'typical_peak',
+                'projected_price': round(projected_prices[i], 2),
+            })
+        elif avg_path[i] < avg_path[i - 1] and avg_path[i] < avg_path[i + 1]:
+            inflections.append({
+                'bar_offset': i,
+                'type': 'typical_low',
+                'projected_price': round(projected_prices[i], 2),
+            })
+
+    # Day phase
+    hour_labels = ['9:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']
+    current_phase = _identify_phase(n_hours_so_far, avg_path, inflections)
+
+    # Confidence bands (16th and 84th percentile of all paths at each step)
+    upper = []
+    lower = []
+    for step in range(max_len):
+        vals = [p['returns'][step] for p in future_paths if len(p['returns']) > step]
+        if vals:
+            upper.append(current_price * (1 + float(np.percentile(vals, 84)) / 100))
+            lower.append(current_price * (1 + float(np.percentile(vals, 16)) / 100))
+
+    return {
+        'hourly_levels': [
+            {
+                'bar_offset': i,
+                'hour_label': hour_labels[n_hours_so_far + i] if (n_hours_so_far + i) < len(hour_labels) else f"+{i}h",
+                'projected_price': round(p, 2),
+                'avg_return_pct': round(avg_path[i], 3),
+            }
+            for i, p in enumerate(projected_prices)
+        ],
+        'inflection_points': inflections,
+        'current_phase': current_phase,
+        'end_of_day_price': round(projected_prices[-1], 2) if projected_prices else None,
+        'end_of_day_return': round(avg_path[-1], 3) if avg_path else None,
+        'confidence_upper': [round(v, 2) for v in upper],
+        'confidence_lower': [round(v, 2) for v in lower],
+        'individual_paths': [
+            {
+                'date': p['date'],
+                'day_type': p['day_type'],
+                'returns': [round(r, 4) for r in p['returns']],
+            }
+            for p in future_paths[:5]
+        ],
+    }
+
+
+def _identify_phase(n_hours: int, avg_path: list, inflections: list) -> str:
+    """Determine what phase of the day we're in."""
+    # Time-based defaults
+    if n_hours <= 1:
+        return 'morning_open'
+    elif n_hours <= 2:
+        return 'morning_development'
+    elif n_hours <= 4:
+        if any(inf['type'] == 'typical_peak' and inf['bar_offset'] <= 2 for inf in inflections):
+            return 'approaching_reversal_zone'
+        return 'midday_assessment'
+    elif n_hours <= 5:
+        return 'afternoon_positioning'
+    else:
+        return 'late_day'
+
+    # If there's a near inflection point, override
+    for inf in inflections:
+        if inf['bar_offset'] <= 1:
+            if inf['type'] == 'typical_peak':
+                return 'approaching_reversal_zone'
+            elif inf['type'] == 'typical_low':
+                return 'approaching_bounce_zone'
+
+    return 'undefined'
+
+
+def compute_confluence_score(matches: list) -> float:
+    """Convert daily pattern matches into -1 to +1 score."""
     if len(matches) < MIN_MATCHES_REQUIRED:
-        return None
-
-    returns = np.array([m.daily_return for m in matches])
-    correlations = np.array([m.correlation for m in matches])
-
-    up_count = int(np.sum(returns > 0))
-    total = len(returns)
-    direction_prob = up_count / total
-
-    return PatternForecast(
-        direction_probability=direction_prob,
-        direction_signal=(direction_prob - 0.5) * 2.0,  # -1 to +1
-        mean_move=float(np.mean(returns)),
-        median_move=float(np.median(returns)),
-        std_dev=float(np.std(returns)),
-        confidence_interval_68=(
-            float(np.percentile(returns, 16)),
-            float(np.percentile(returns, 84))
-        ),
-        sample_size=total,
-        consensus=f"{up_count}/{total} bullish",
-        avg_correlation=float(np.mean(correlations)),
-        confluence_score=_compute_confluence_score(direction_prob, total,
-                                                   float(np.mean(correlations)))
-    )
-
-
-def _compute_confluence_score(direction_prob: float, sample_size: int,
-                               avg_corr: float) -> float:
-    """
-    Convert pattern match results to -1 to +1 signal for the decision engine.
-    """
-    base = (direction_prob - 0.5) * 2.0  # -1 to +1
-    sample_confidence = min(1.0, np.sqrt(sample_size / 20.0))
-    quality_factor = max(0.0, (avg_corr - 0.8) / 0.2)  # 0 at 0.8, 1 at 1.0
-    return float(base * sample_confidence * quality_factor)
+        return 0.0
+    outcomes = [day.rest_of_day_return for day, _ in matches]
+    bullish = sum(1 for o in outcomes if o > 0)
+    total = len(outcomes)
+    dir_prob = bullish / total
+    base = (dir_prob - 0.5) * 2.0
+    avg_corr = float(np.mean([c for _, c in matches]))
+    quality = max(0.0, (avg_corr - 0.75) / 0.25)
+    consensus = abs(bullish - (total - bullish)) / total
+    return float(base * quality * (0.5 + 0.5 * consensus))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PATTERN MATCHING ENGINE
+# MAIN ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
-class PatternMatchEngine:
+class DailyPatternEngine:
     """
-    Main engine that holds precomputed templates and runs the matching pipeline.
+    Loads historical days, precomputes templates, runs the two-layer
+    matching pipeline, and generates rest-of-day forecasts.
     """
 
     def __init__(self):
-        # Raw OHLCV: (num_days, 390, 5) — [open, high, low, close, volume]
-        self.historical_ohlcv: Optional[np.ndarray] = None
-        # Normalized close templates: (num_days, 390)
-        self.normalized_templates: Optional[np.ndarray] = None
-        # Day metadata indexed by day number
-        self.day_metadata: dict[int, DayMetadata] = {}
-        # Average volume per minute across all days
-        self.volume_avg_by_minute: Optional[np.ndarray] = None
-        # Number of historical days loaded
+        self.days: list[DayRecord] = []
         self.num_days: int = 0
-        # Latest match result
+        # Precomputed normalized hourly matrices for batch correlation
+        self.norm_hourly: Optional[np.ndarray] = None   # (num_days, 7)
         self.latest_result: Optional[dict] = None
-        # Track today's bar count for change detection
-        self._last_bar_count: int = 0
 
-    def load_historical_data(self, daily_bars_list: list[dict]):
-        """
-        Load historical data from a list of daily OHLCV arrays.
+    # ── Loading ──────────────────────────────────────────────────────────
 
-        Args:
-            daily_bars_list: List of dicts, each with:
-                - 'date': str (YYYY-MM-DD)
-                - 'bars': list of dicts with time/open/high/low/close/volume
-                - 'prior_close': float (previous day's close for gap calc)
+    def load_from_1min_bars(self, bars_1min: list):
         """
-        valid_days = []
-        for day_data in daily_bars_list:
-            bars = day_data['bars']
-            if len(bars) < RTH_BARS * 0.8:  # Allow some missing bars
+        Build daily + hourly records from 1-minute bars.
+        bar.time is ET-as-UTC unix seconds.
+        Groups by date, aggregates into hourly slots, computes daily OHLCV.
+        """
+        from datetime import datetime as dt
+
+        # Group bars by date
+        days_map = {}  # date_str -> list of bars (sorted by time)
+        for b in bars_1min:
+            d = dt.utcfromtimestamp(b['time'])
+            minutes = d.hour * 60 + d.minute
+            # RTH filter: 9:30 (570) to 16:00 (960)
+            if minutes < 570 or minutes >= 960:
                 continue
-            # Pad to RTH_BARS if slightly short
-            ohlcv = np.zeros((RTH_BARS, 5), dtype=np.float64)
-            n = min(len(bars), RTH_BARS)
-            for i in range(n):
-                b = bars[i]
-                ohlcv[i] = [b['open'], b['high'], b['low'], b['close'], b['volume']]
-            # Forward-fill any remaining bars with last known values
-            if n < RTH_BARS:
-                ohlcv[n:] = ohlcv[n - 1]
-            valid_days.append({
-                'date': day_data['date'],
-                'ohlcv': ohlcv,
-                'prior_close': day_data.get('prior_close', ohlcv[0, 0])
-            })
+            date_key = d.strftime('%Y-%m-%d')
+            if date_key not in days_map:
+                days_map[date_key] = []
+            days_map[date_key].append(b)
 
-        self.num_days = len(valid_days)
-        if self.num_days == 0:
-            logger.warning("No valid historical days loaded for pattern matching")
+        sorted_dates = sorted(days_map.keys())
+        if not sorted_dates:
+            logger.warning("No RTH bars found for pattern matcher")
             return
 
-        # Build arrays
-        self.historical_ohlcv = np.zeros((self.num_days, RTH_BARS, 5), dtype=np.float64)
-        self.normalized_templates = np.zeros((self.num_days, RTH_BARS), dtype=np.float64)
+        # Build daily records
+        all_daily_closes = []
+        all_daily_highs = []
+        all_daily_lows = []
+        records = []
 
-        for i, day in enumerate(valid_days):
-            self.historical_ohlcv[i] = day['ohlcv']
-            closes = day['ohlcv'][:, 3]
-            self.normalized_templates[i] = normalize_intraday_prices(closes)
+        for di, date_key in enumerate(sorted_dates):
+            day_bars = sorted(days_map[date_key], key=lambda x: x['time'])
+            if len(day_bars) < 30:  # Need at least ~30 min of data
+                continue
 
-            # Compute metadata
-            opens = day['ohlcv'][:, 0]
-            highs = day['ohlcv'][:, 1]
-            lows = day['ohlcv'][:, 2]
-            volumes = day['ohlcv'][:, 4]
+            day_open = day_bars[0]['open']
+            day_close = day_bars[-1]['close']
+            day_high = max(b['high'] for b in day_bars)
+            day_low = min(b['low'] for b in day_bars)
+            day_vol = sum(b['volume'] for b in day_bars)
 
-            opening_atr = compute_atr(highs[:30], lows[:30], closes[:30], period=10)
-            prior_close = day['prior_close']
-            gap_pct = (opens[0] - prior_close) / prior_close if prior_close else 0.0
-            daily_ret = (closes[-1] / opens[0] - 1.0) * 100.0 if opens[0] else 0.0
+            # Aggregate to hourly slots (9:30-10:29, 10:30-11:29, etc.)
+            hourly_slots = {}  # hour_key -> list of bars
+            for b in day_bars:
+                d = dt.utcfromtimestamp(b['time'])
+                # Map to slot: 9:30-10:29 → 9, 10:30-11:29 → 10, ...
+                slot_hour = d.hour if d.minute >= 30 else d.hour - 1
+                if slot_hour < 9:
+                    slot_hour = 9
+                if slot_hour not in hourly_slots:
+                    hourly_slots[slot_hour] = []
+                hourly_slots[slot_hour].append(b)
 
-            self.day_metadata[i] = DayMetadata(
-                date=day['date'],
-                day_index=i,
-                opening_atr=opening_atr,
-                gap_percent=gap_pct,
-                gap_type=classify_gap(gap_pct),
-                trend_context=TrendContext.SIDEWAYS,  # Will be set from prior day
-                daily_return=daily_ret,
-                high_of_day_bar=int(np.argmax(highs)),
-                low_of_day_bar=int(np.argmin(lows)),
-                is_half_day=len([v for v in volumes if v > 0]) < RTH_BARS * 0.7,
-                is_extreme=abs(daily_ret) > 3.0
+            slot_keys = sorted(hourly_slots.keys())
+            h_opens, h_highs, h_lows, h_closes, h_vols = [], [], [], [], []
+            for sk in slot_keys:
+                slot_bars = hourly_slots[sk]
+                h_opens.append(slot_bars[0]['open'])
+                h_closes.append(slot_bars[-1]['close'])
+                h_highs.append(max(b['high'] for b in slot_bars))
+                h_lows.append(min(b['low'] for b in slot_bars))
+                h_vols.append(sum(b['volume'] for b in slot_bars))
+
+            if not h_closes:
+                continue
+
+            h_closes_arr = np.array(h_closes, dtype=np.float64)
+            h_returns = ((h_closes_arr / day_open) - 1.0) * 100.0 if day_open else np.zeros(len(h_closes))
+
+            # Prior close for gap calc
+            prior_close = all_daily_closes[-1] if all_daily_closes else day_open
+            gap_pct = (day_open - prior_close) / prior_close if prior_close else 0.0
+
+            # ATR
+            all_daily_highs.append(day_high)
+            all_daily_lows.append(day_low)
+            all_daily_closes.append(day_close)
+            if len(all_daily_closes) >= 2:
+                atrs = compute_atr_series(all_daily_highs, all_daily_lows, all_daily_closes, 10)
+                atr_val = atrs[-1]
+            else:
+                atr_val = day_high - day_low
+
+            # Trend context from last 9 daily closes
+            trend = classify_trend(all_daily_closes, 9)
+
+            # Day type
+            first_hour_close = h_closes[0] if h_closes else day_open
+            dtype = classify_day_type(day_open, day_close, day_high, day_low, first_hour_close)
+
+            # Morning levels
+            morning_bars = min(2, len(h_highs))
+            morn_high = max(h_highs[:morning_bars]) if morning_bars > 0 else day_high
+            morn_low = min(h_lows[:morning_bars]) if morning_bars > 0 else day_low
+
+            # HOD/LOD bar indices
+            hod_bar = int(np.argmax(h_highs))
+            lod_bar = int(np.argmin(h_lows))
+
+            # Rest-of-day return (from hour 2 close to day close)
+            rod = 0.0
+            if len(h_closes) >= 2:
+                rod = (day_close - h_closes[1]) / h_closes[1] * 100.0 if h_closes[1] else 0.0
+
+            daily_ret = (day_close - day_open) / day_open * 100.0 if day_open else 0.0
+
+            rec = DayRecord(
+                date_str=date_key,
+                day_index=di,
+                day_open=day_open, day_high=day_high, day_low=day_low,
+                day_close=day_close, day_volume=day_vol,
+                daily_range=day_high - day_low,
+                daily_return_pct=daily_ret,
+                gap_pct=gap_pct, gap_type=classify_gap(gap_pct),
+                atr_10=atr_val, trend_context=trend,
+                day_type=dtype,
+                is_extreme=abs(daily_ret) > 3.0,
+                is_half_day=len(day_bars) < 200,
+                hourly_closes=h_closes_arr,
+                hourly_opens=np.array(h_opens, dtype=np.float64),
+                hourly_highs=np.array(h_highs, dtype=np.float64),
+                hourly_lows=np.array(h_lows, dtype=np.float64),
+                hourly_volumes=np.array(h_vols, dtype=np.float64),
+                hourly_returns=h_returns,
+                morning_high=morn_high, morning_low=morn_low,
+                hod_bar=hod_bar, lod_bar=lod_bar,
+                rest_of_day_return=rod,
             )
+            records.append(rec)
 
-        # Set trend context from prior day
-        for i in range(1, self.num_days):
-            prior_closes = self.historical_ohlcv[i - 1, :, 3]
-            self.day_metadata[i].trend_context = classify_trend(prior_closes)
+        self.days = records
+        self.num_days = len(records)
 
-        # Volume average by minute
-        all_vols = self.historical_ohlcv[:, :, 4]
-        self.volume_avg_by_minute = np.mean(all_vols, axis=0)
+        # Precompute normalized hourly templates (pad to 7 slots)
+        if self.num_days > 0:
+            self.norm_hourly = np.zeros((self.num_days, RTH_HOURLY_SLOTS), dtype=np.float64)
+            for i, day in enumerate(self.days):
+                n = min(len(day.hourly_closes), RTH_HOURLY_SLOTS)
+                if n >= 2:
+                    normed = normalize_returns(day.hourly_closes[:n])
+                    self.norm_hourly[i, :n] = normed
 
-        logger.info(f"Pattern matcher loaded {self.num_days} historical days "
-                     f"({self.num_days * RTH_BARS} total bars)")
+        logger.info(f"Loaded {self.num_days} daily records for pattern matching")
 
-    def run_match(self, today_bars: list[dict],
-                  prior_close: float = 0.0) -> Optional[dict]:
+    # ── Matching Pipeline ────────────────────────────────────────────────
+
+    def run_match_from_1min(self, bars_1min: list) -> Optional[dict]:
         """
-        Run the full pattern matching pipeline on today's data so far.
-
-        Args:
-            today_bars: List of OHLCV dicts for today (from market open)
-            prior_close: Yesterday's close for gap calculation
-
-        Returns:
-            Dict with matches, forecast, and metadata, or None if insufficient data
+        Full pipeline: extract today's data from 1-min bars, run match.
+        Called by the background scheduler.
         """
-        if self.num_days == 0 or self.normalized_templates is None:
+        from datetime import datetime as dt
+
+        if self.num_days < 20:
             return None
 
-        n_bars = len(today_bars)
-        if n_bars < MIN_BARS_FOR_MATCH:
+        # Find today's date (from latest bar)
+        if not bars_1min:
+            return None
+        latest_time = max(b['time'] for b in bars_1min)
+        today_dt = dt.utcfromtimestamp(latest_time)
+        today_str = today_dt.strftime('%Y-%m-%d')
+
+        # Extract today's RTH bars
+        today_bars = []
+        for b in bars_1min:
+            d = dt.utcfromtimestamp(b['time'])
+            if d.strftime('%Y-%m-%d') != today_str:
+                continue
+            minutes = d.hour * 60 + d.minute
+            if 570 <= minutes < 960:
+                today_bars.append(b)
+        today_bars.sort(key=lambda x: x['time'])
+
+        if len(today_bars) < 15:  # Need at least ~15 min
             return None
 
-        # Cap at RTH bars
-        n_bars = min(n_bars, RTH_BARS)
+        # Aggregate today's bars into hourly slots
+        hourly_slots = {}
+        for b in today_bars:
+            d = dt.utcfromtimestamp(b['time'])
+            slot_hour = d.hour if d.minute >= 30 else d.hour - 1
+            if slot_hour < 9:
+                slot_hour = 9
+            if slot_hour not in hourly_slots:
+                hourly_slots[slot_hour] = []
+            hourly_slots[slot_hour].append(b)
 
-        # Extract today's OHLCV
-        today_closes = np.array([b['close'] for b in today_bars[:n_bars]], dtype=np.float64)
-        today_highs = np.array([b['high'] for b in today_bars[:n_bars]], dtype=np.float64)
-        today_lows = np.array([b['low'] for b in today_bars[:n_bars]], dtype=np.float64)
+        slot_keys = sorted(hourly_slots.keys())
+        today_hourly_closes = []
+        for sk in slot_keys:
+            sbs = hourly_slots[sk]
+            today_hourly_closes.append(sbs[-1]['close'])
 
-        # Today's regime
-        today_atr = compute_atr(today_highs[:min(30, n_bars)],
-                                today_lows[:min(30, n_bars)],
-                                today_closes[:min(30, n_bars)], period=10)
-        today_gap = ((today_closes[0] - prior_close) / prior_close
-                     if prior_close > 0 else 0.0)
-        today_trend = classify_trend(today_closes)
-
-        # Filter by regime
-        filtered_idx = filter_by_regime(today_atr, today_gap, today_trend,
-                                        self.day_metadata)
-        if len(filtered_idx) == 0:
+        if len(today_hourly_closes) < 1:
             return None
 
-        # Normalize today
-        today_normalized = normalize_intraday_prices(today_closes)
+        today_hourly = np.array(today_hourly_closes, dtype=np.float64)
+        n_hours = len(today_hourly)
+        current_price = today_hourly[-1]
 
-        # Extract same portion from historical templates
-        hist_portion = self.normalized_templates[filtered_idx, :n_bars]
+        # Yesterday's close for gap calc
+        yesterday = None
+        for day in reversed(self.days):
+            if day.date_str < today_str:
+                yesterday = day
+                break
+        if not yesterday:
+            return None
 
-        # Compute correlations
-        correlations = fast_correlation_batch(today_normalized, hist_portion)
+        today_open = today_bars[0]['open']
+        today_gap = (today_open - yesterday.day_close) / yesterday.day_close if yesterday.day_close else 0.0
+        today_atr = yesterday.atr_10  # Use yesterday's ATR as proxy
+        today_trend = yesterday.trend_context
 
-        # Apply recency weighting
-        days_ago = np.array([self.day_metadata[idx].day_index
-                             for idx in filtered_idx], dtype=np.float64)
-        weighted_corrs = apply_recency_weight(correlations, days_ago)
+        # ── Layer 1: Regime filter ──
+        filtered = self._filter_by_regime(today_gap, today_atr, today_trend)
+        if not filtered:
+            return None
+
+        # ── Layer 2: Hourly similarity ──
+        today_norm = normalize_returns(today_hourly)
+        # Build matrix of same-length portions from filtered days
+        filtered_indices = []
+        hist_portions = []
+        for idx in filtered:
+            day = self.days[idx]
+            if len(day.hourly_closes) >= n_hours:
+                portion = normalize_returns(day.hourly_closes[:n_hours])
+                hist_portions.append(portion)
+                filtered_indices.append(idx)
+
+        if len(hist_portions) < MIN_MATCHES_REQUIRED:
+            return None
+
+        hist_matrix = np.array(hist_portions, dtype=np.float64)
+        correlations = batch_pearson(today_norm, hist_matrix)
+
+        # Apply recency weighting (more recent days get higher weight)
+        days_ago = np.array([
+            self.num_days - self.days[idx].day_index
+            for idx in filtered_indices
+        ], dtype=np.float64)
+        weighted_corrs = correlations * (RECENCY_DECAY ** days_ago)
 
         # Rank by weighted correlation, take top N
         sorted_local = np.argsort(weighted_corrs)[::-1]
-        top_local = sorted_local[:TOP_N_MATCHES]
-
-        # Build match objects
-        matches = []
-        for local_idx in top_local:
-            global_idx = filtered_idx[local_idx]
-            corr = float(correlations[local_idx])
-            w_corr = float(weighted_corrs[local_idx])
-
+        top_matches = []
+        for li in sorted_local[:TOP_N_MATCHES]:
+            corr = float(correlations[li])
             if corr < MIN_CORRELATION:
                 continue
+            day = self.days[filtered_indices[li]]
+            if day.is_half_day or day.is_extreme:
+                continue
+            top_matches.append((day, corr))
 
-            meta = self.day_metadata[global_idx]
-            # Projection: remaining bars after the match window
-            remaining_prices = self.historical_ohlcv[global_idx, n_bars:, 3].tolist()
-            # Returns from the match-end price
-            match_end_price = self.historical_ohlcv[global_idx, n_bars - 1, 3]
-            if match_end_price > 0:
-                remaining_returns = [
-                    (p / match_end_price - 1.0) * 100.0 for p in remaining_prices
-                ]
-            else:
-                remaining_returns = [0.0] * len(remaining_prices)
+        if len(top_matches) < MIN_MATCHES_REQUIRED:
+            return None
 
-            matches.append(PatternMatch(
-                date=meta.date,
-                correlation=corr,
-                weighted_correlation=w_corr,
-                daily_return=meta.daily_return,
-                projection_prices=remaining_prices,
-                projection_returns=remaining_returns,
-                metadata=asdict(meta)
-            ))
+        # ── Forecast ──
+        projection = generate_projection(top_matches, n_hours, current_price)
+        conf_score = compute_confluence_score(top_matches)
 
-        # Generate forecast
-        forecast = generate_forecast(matches)
+        # Direction stats
+        outcomes = [d.rest_of_day_return for d, _ in top_matches]
+        bullish = sum(1 for o in outcomes if o > 0)
 
         result = {
-            'timestamp': datetime.now(EASTERN).isoformat(),
-            'bars_matched': n_bars,
-            'filtered_day_count': len(filtered_idx),
+            'timestamp': datetime.utcnow().isoformat(),
+            'bars_matched': n_hours,
+            'filtered_day_count': len(filtered),
             'total_days': self.num_days,
             'regime': {
-                'atr': float(today_atr),
-                'gap_pct': float(today_gap),
-                'gap_type': classify_gap(today_gap).value,
-                'trend': today_trend.value,
+                'gap_pct': round(today_gap * 100, 3),
+                'gap_type': classify_gap(today_gap),
+                'atr': round(today_atr, 2),
+                'trend': today_trend,
             },
             'matches': [
                 {
-                    'date': m.date,
-                    'correlation': round(m.correlation, 4),
-                    'weighted_correlation': round(m.weighted_correlation, 4),
-                    'daily_return': round(m.daily_return, 2),
-                    'projection_returns': [round(r, 4) for r in m.projection_returns],
+                    'date': d.date_str,
+                    'correlation': round(c, 4),
+                    'day_type': d.day_type,
+                    'daily_return': round(d.daily_return_pct, 2),
+                    'rest_of_day_return': round(d.rest_of_day_return, 3),
                 }
-                for m in matches
+                for d, c in top_matches
             ],
             'forecast': {
-                'direction_probability': round(forecast.direction_probability, 3),
-                'direction_signal': round(forecast.direction_signal, 3),
-                'mean_move': round(forecast.mean_move, 3),
-                'median_move': round(forecast.median_move, 3),
-                'std_dev': round(forecast.std_dev, 3),
-                'confidence_interval_68': (
-                    round(forecast.confidence_interval_68[0], 3),
-                    round(forecast.confidence_interval_68[1], 3),
-                ),
-                'sample_size': forecast.sample_size,
-                'consensus': forecast.consensus,
-                'avg_correlation': round(forecast.avg_correlation, 4),
-                'confluence_score': round(forecast.confluence_score, 4),
-            } if forecast else None,
-            'match_count': len(matches),
+                'direction_probability': round(bullish / len(top_matches), 3),
+                'direction_signal': round((bullish / len(top_matches) - 0.5) * 2.0, 3),
+                'mean_move': round(float(np.mean(outcomes)), 3),
+                'median_move': round(float(np.median(outcomes)), 3),
+                'std_dev': round(float(np.std(outcomes)), 3),
+                'sample_size': len(top_matches),
+                'consensus': f"{bullish}/{len(top_matches)} bullish",
+                'avg_correlation': round(float(np.mean([c for _, c in top_matches])), 4),
+                'confluence_score': round(conf_score, 4),
+            },
+            'projection': projection,
+            'match_count': len(top_matches),
         }
 
         self.latest_result = result
-        self._last_bar_count = n_bars
         return result
+
+    # ── Internal Helpers ─────────────────────────────────────────────────
+
+    def _filter_by_regime(self, today_gap: float, today_atr: float,
+                          today_trend: str) -> list[int]:
+        """Progressive regime filtering: strict → relaxed → fallback."""
+        today_gap_type = classify_gap(today_gap)
+
+        # Strict: ATR + gap + trend
+        strict = []
+        for i, day in enumerate(self.days):
+            if day.is_half_day or day.is_extreme:
+                continue
+            atr_ok = abs(day.atr_10 - today_atr) / (today_atr + 1e-8) <= ATR_TOLERANCE
+            gap_ok = day.gap_type == today_gap_type
+            trend_ok = day.trend_context == today_trend
+            if atr_ok and gap_ok and trend_ok:
+                strict.append(i)
+        if len(strict) >= 20:
+            return strict
+
+        # Relaxed: ATR + gap
+        relaxed = []
+        for i, day in enumerate(self.days):
+            if day.is_half_day or day.is_extreme:
+                continue
+            atr_ok = abs(day.atr_10 - today_atr) / (today_atr + 1e-8) <= ATR_TOLERANCE
+            gap_ok = day.gap_type == today_gap_type
+            if atr_ok and gap_ok:
+                relaxed.append(i)
+        if len(relaxed) >= 10:
+            return relaxed
+
+        # ATR only
+        atr_only = []
+        for i, day in enumerate(self.days):
+            if day.is_half_day or day.is_extreme:
+                continue
+            if abs(day.atr_10 - today_atr) / (today_atr + 1e-8) <= 0.30:
+                atr_only.append(i)
+        if len(atr_only) >= 10:
+            return atr_only
+
+        # All valid days
+        return [i for i, d in enumerate(self.days)
+                if not d.is_half_day and not d.is_extreme]
