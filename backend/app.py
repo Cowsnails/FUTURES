@@ -92,6 +92,9 @@ from .security import (
     validate_indicator_params
 )
 from .pattern_matcher import DailyPatternEngine
+from .data_grabber import (
+    get_grabber_status, start_grab, stop_grab, update_all_day_counts
+)
 
 # Configure logging
 logging.basicConfig(
@@ -1106,6 +1109,54 @@ async def rate_limit_info():
         },
         "note": "Rate limits are per IP address"
     }
+
+
+# --- Data Grabber Endpoints ---
+
+@app.get("/api/data-grab/status")
+async def data_grab_status():
+    """Get current data grabber status for frontend polling."""
+    return get_grabber_status()
+
+
+@app.post("/api/data-grab/{symbol}/start")
+async def data_grab_start(symbol: str):
+    """Start grabbing historical data for a symbol."""
+    if symbol not in ['MNQ', 'MES', 'MGC']:
+        raise HTTPException(status_code=400, detail=f"Invalid symbol: {symbol}")
+
+    if not ib_manager or not ib_manager.is_connected():
+        raise HTTPException(status_code=503, detail="IB Gateway not connected")
+
+    status = get_grabber_status()
+    if status['active']:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Already grabbing {status['symbol']}. One at a time."
+        )
+
+    # Update day counts before starting
+    update_all_day_counts(cache)
+
+    success = await start_grab(symbol, ib_manager.ib, cache)
+    if success:
+        return {"status": "started", "symbol": symbol}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to start grab")
+
+
+@app.post("/api/data-grab/stop")
+async def data_grab_stop():
+    """Stop the active data grab."""
+    await stop_grab()
+    return {"status": "stopped"}
+
+
+@app.get("/api/data-grab/day-counts")
+async def data_grab_day_counts():
+    """Get day counts for all symbols."""
+    update_all_day_counts(cache)
+    return get_grabber_status()['days_in_cache']
 
 
 if __name__ == '__main__':

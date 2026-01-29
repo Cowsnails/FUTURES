@@ -121,6 +121,61 @@
             color: #d1d4dc;
         }
 
+        /* Data Grabber dropdown */
+        .data-grabber {
+            position: relative;
+        }
+        .data-grabber-btn {
+            padding: 8px 12px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            color: #d1d4dc;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .data-grabber-btn:hover { border-color: #3a3e49; }
+        .dg-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            margin-top: 4px;
+            background: rgba(26, 29, 39, 0.97);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            padding: 6px 0;
+            min-width: 200px;
+            z-index: 200;
+        }
+        .dg-dropdown.open { display: block; }
+        .dg-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: opacity 0.2s;
+        }
+        .dg-item:hover { background: rgba(255,255,255,0.05); }
+        .dg-item.faded { opacity: 0.35; pointer-events: none; }
+        .dg-item .dg-left { display: flex; align-items: center; gap: 8px; }
+        .dg-light {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #ef5350;
+        }
+        .dg-light.green { background: #26a69a; }
+        .dg-days { color: #758696; font-size: 11px; }
+        .dg-status-bar {
+            padding: 6px 14px;
+            font-size: 11px;
+            color: #758696;
+            border-top: 1px solid #2a2e39;
+        }
+
         /* Loading overlay */
         .loading-overlay {
             position: absolute;
@@ -368,6 +423,25 @@
                     <option value="2H">2h</option>
                     <option value="4H">4h</option>
                 </select>
+            </div>
+            <!-- Data Grabber -->
+            <div class="data-grabber" id="data-grabber">
+                <button class="data-grabber-btn" id="dg-btn">Data Grabber</button>
+                <div class="dg-dropdown" id="dg-dropdown">
+                    <div class="dg-item" data-symbol="MNQ" id="dg-MNQ">
+                        <div class="dg-left"><div class="dg-light" id="dg-light-MNQ"></div><span>MNQ</span></div>
+                        <span class="dg-days" id="dg-days-MNQ">— days</span>
+                    </div>
+                    <div class="dg-item" data-symbol="MES" id="dg-MES">
+                        <div class="dg-left"><div class="dg-light" id="dg-light-MES"></div><span>MES</span></div>
+                        <span class="dg-days" id="dg-days-MES">— days</span>
+                    </div>
+                    <div class="dg-item" data-symbol="MGC" id="dg-MGC">
+                        <div class="dg-left"><div class="dg-light" id="dg-light-MGC"></div><span>MGC</span></div>
+                        <span class="dg-days" id="dg-days-MGC">— days</span>
+                    </div>
+                    <div class="dg-status-bar" id="dg-status">Idle</div>
+                </div>
             </div>
         </div>
 
@@ -1813,6 +1887,102 @@
 
         // ═══════════════════════════════════════════════════════════
         // CLEANUP
+        // ═══════════════════════════════════════════════════════════
+        // DATA GRABBER
+        // ═══════════════════════════════════════════════════════════
+        const dgBtn = document.getElementById('dg-btn');
+        const dgDropdown = document.getElementById('dg-dropdown');
+        const dgStatus = document.getElementById('dg-status');
+        let dgPolling = null;
+        let dgActiveSymbol = null;
+
+        dgBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            dgDropdown.classList.toggle('open');
+            if (dgDropdown.classList.contains('open')) {
+                fetchDayCounts();
+            }
+        });
+        document.addEventListener('click', () => dgDropdown.classList.remove('open'));
+        dgDropdown.addEventListener('click', (e) => e.stopPropagation());
+
+        ['MNQ', 'MES', 'MGC'].forEach(sym => {
+            document.getElementById('dg-' + sym).addEventListener('click', async () => {
+                if (dgActiveSymbol) return; // one at a time
+                try {
+                    const res = await fetch(`/api/data-grab/${sym}/start`, { method: 'POST' });
+                    if (res.ok) {
+                        dgActiveSymbol = sym;
+                        startDgPolling();
+                        updateDgFade();
+                    } else {
+                        const err = await res.json();
+                        alert(err.detail || 'Failed to start');
+                    }
+                } catch (e) {
+                    console.error('Data grab start error:', e);
+                }
+            });
+        });
+
+        function updateDgFade() {
+            ['MNQ', 'MES', 'MGC'].forEach(sym => {
+                const el = document.getElementById('dg-' + sym);
+                if (dgActiveSymbol && dgActiveSymbol !== sym) {
+                    el.classList.add('faded');
+                } else {
+                    el.classList.remove('faded');
+                }
+            });
+        }
+
+        function updateDgLights(dayCounts) {
+            ['MNQ', 'MES', 'MGC'].forEach(sym => {
+                const light = document.getElementById('dg-light-' + sym);
+                const days = document.getElementById('dg-days-' + sym);
+                const count = dayCounts[sym] || 0;
+                days.textContent = count + ' days';
+                if (count >= 200) {
+                    light.classList.add('green');
+                } else {
+                    light.classList.remove('green');
+                }
+            });
+        }
+
+        async function fetchDayCounts() {
+            try {
+                const res = await fetch('/api/data-grab/day-counts');
+                if (res.ok) {
+                    const counts = await res.json();
+                    updateDgLights(counts);
+                }
+            } catch (e) { /* ignore */ }
+        }
+
+        function startDgPolling() {
+            if (dgPolling) clearInterval(dgPolling);
+            dgPolling = setInterval(async () => {
+                try {
+                    const res = await fetch('/api/data-grab/status');
+                    if (!res.ok) return;
+                    const st = await res.json();
+                    dgStatus.textContent = st.message || st.status;
+                    updateDgLights(st.days_in_cache || {});
+                    if (!st.active && st.status !== 'idle') {
+                        // Grab finished
+                        dgActiveSymbol = null;
+                        updateDgFade();
+                        clearInterval(dgPolling);
+                        dgPolling = null;
+                    }
+                } catch (e) { /* ignore */ }
+            }, 3000);
+        }
+
+        // Initial day count fetch
+        fetchDayCounts();
+
         // ═══════════════════════════════════════════════════════════
         window.addEventListener('beforeunload', () => {
             console.log('Page is closing - cleaning up WebSocket...');
