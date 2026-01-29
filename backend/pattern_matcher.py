@@ -514,12 +514,16 @@ class DailyPatternEngine:
         """
         from datetime import datetime as dt
 
+        logger.info(f"run_match_from_1min: num_days={self.num_days}, bars_count={len(bars_1min) if bars_1min else 0}")
+
         if self.num_days < 20:
+            logger.warning(f"Pattern matcher: not enough days ({self.num_days} < 20)")
             return None
 
         # Find the most recent trading day with RTH bars.
         # Timestamps are ET-as-UTC, so utcfromtimestamp gives ET values.
         if not bars_1min:
+            logger.warning("Pattern matcher: no bars_1min provided")
             return None
 
         # Collect all RTH bars grouped by date, find the latest date with enough bars
@@ -531,14 +535,20 @@ class DailyPatternEngine:
             if 570 <= minutes < 960:
                 rth_by_date[d.strftime('%Y-%m-%d')].append(b)
 
+        logger.info(f"Pattern matcher: {len(rth_by_date)} dates with RTH bars, top dates: {sorted(rth_by_date.keys(), reverse=True)[:5]}")
+
         # Find most recent date with >= 15 RTH bars
         today_str = None
         today_bars = []
         for date_str in sorted(rth_by_date.keys(), reverse=True):
-            if len(rth_by_date[date_str]) >= 15:
+            count = len(rth_by_date[date_str])
+            if count >= 15:
                 today_str = date_str
                 today_bars = sorted(rth_by_date[date_str], key=lambda x: x['time'])
+                logger.info(f"Pattern matcher: using {date_str} with {count} RTH bars")
                 break
+            else:
+                logger.info(f"Pattern matcher: skipping {date_str} ({count} RTH bars)")
 
         if not today_bars:
             logger.warning("Pattern matcher: no trading day found with >= 15 RTH bars")
@@ -575,17 +585,24 @@ class DailyPatternEngine:
                 yesterday = day
                 break
         if not yesterday:
+            logger.warning(f"Pattern matcher: no yesterday found before {today_str} (days range: {self.days[0].date_str} to {self.days[-1].date_str})")
             return None
+
+        logger.info(f"Pattern matcher: yesterday={yesterday.date_str}, today_str={today_str}")
 
         today_open = today_bars[0]['open']
         today_gap = (today_open - yesterday.day_close) / yesterday.day_close if yesterday.day_close else 0.0
         today_atr = yesterday.atr_10  # Use yesterday's ATR as proxy
         today_trend = yesterday.trend_context
 
+        logger.info(f"Pattern matcher: gap={today_gap:.4f}, atr={today_atr:.2f}, trend={today_trend}")
+
         # ── Layer 1: Regime filter ──
         filtered = self._filter_by_regime(today_gap, today_atr, today_trend)
         if not filtered:
+            logger.warning(f"Pattern matcher: regime filter returned no matches")
             return None
+        logger.info(f"Pattern matcher: regime filter passed {len(filtered)} candidates")
 
         # ── Layer 2: Hourly similarity ──
         today_norm = normalize_returns(today_hourly)
