@@ -396,25 +396,16 @@ def initialize_pattern_engines():
 
 async def pattern_match_loop():
     """
-    Background task: run daily pattern matching every 30 minutes during RTH.
-    Schedule: 9:30 AM initial, then every 30 min until 2:00 PM ET.
+    Background task: run daily pattern matching every 30 minutes, 24/7.
+    Runs immediately on first iteration, then every 30 min.
     """
-    import pytz
-    from datetime import datetime as dt
-
-    eastern = pytz.timezone('US/Eastern')
+    # Run immediately on startup
+    await run_all_pattern_matches()
 
     while True:
         try:
-            now_et = dt.now(eastern)
-            if now_et.weekday() < 5:
-                current_minutes = now_et.hour * 60 + now_et.minute
-                # 9:30 AM (570) to 2:00 PM (840)
-                if 570 <= current_minutes < 840:
-                    await run_all_pattern_matches()
-
-            # Sleep 30 minutes (1800 seconds)
             await asyncio.sleep(1800)
+            await run_all_pattern_matches()
         except asyncio.CancelledError:
             logger.info("Pattern match loop cancelled")
             break
