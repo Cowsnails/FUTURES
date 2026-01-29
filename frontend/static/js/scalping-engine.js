@@ -475,22 +475,11 @@ export function detectDivergence(bars, rsiValues, lookback = 5) {
  * Convert UTC timestamp to Eastern Time minutes-of-day.
  * Properly detects EDT (UTC-4) vs EST (UTC-5) using JS Date.
  */
-const _etFormatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    hour: 'numeric', minute: 'numeric', hour12: false
-});
-
+// bar.time from backend is ET disguised as UTC (Eastern time stamped as UTC)
+// So use getUTCHours/getUTCMinutes to read the ET values directly
 function getETMinutes(unixSeconds) {
     const d = new Date(unixSeconds * 1000);
-    const parts = _etFormatter.formatToParts(d);
-    let h = 0, m = 0;
-    for (const p of parts) {
-        if (p.type === 'hour') h = parseInt(p.value);
-        if (p.type === 'minute') m = parseInt(p.value);
-    }
-    // hour12:false can give 24 for midnight
-    if (h === 24) h = 0;
-    return h * 60 + m;
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
 }
 
 function getETHour(unixSeconds) {
