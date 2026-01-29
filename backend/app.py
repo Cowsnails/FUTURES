@@ -91,7 +91,7 @@ from .security import (
     validate_bar_size,
     validate_indicator_params
 )
-from .pattern_matcher import DailyPatternEngine
+from .pattern_matcher import DailyPatternEngine, OvernightPatternEngine
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
@@ -122,6 +122,7 @@ TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
 
 # Daily pattern matching engines per symbol
 pattern_engines: Dict[str, DailyPatternEngine] = {}
+overnight_engines: Dict[str, OvernightPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
 
 
@@ -393,6 +394,11 @@ def initialize_pattern_engines():
         pattern_engines[symbol] = engine
         logger.info(f"✓ Daily pattern matcher for {symbol}: {engine.num_days} days loaded")
 
+        on_engine = OvernightPatternEngine()
+        on_engine.load_from_1min_bars(bars)
+        overnight_engines[symbol] = on_engine
+        logger.info(f"✓ Overnight pattern matcher for {symbol}: {on_engine.num_sessions} sessions loaded")
+
 
 async def pattern_match_loop():
     """
@@ -438,6 +444,26 @@ async def run_all_pattern_matches():
                 )
         except Exception as e:
             logger.error(f"Daily pattern match error for {symbol}: {e}")
+
+    # Overnight pattern matching
+    for symbol, engine in overnight_engines.items():
+        try:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if not bars_1min:
+                continue
+
+            result = engine.run_match_from_1min(bars_1min)
+            if result:
+                result['symbol'] = symbol
+                await connection_manager.broadcast(
+                    symbol, result, immediate=True
+                )
+                logger.info(
+                    f"Overnight pattern {symbol}: {result['match_count']} matches, "
+                    f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
+                )
+        except Exception as e:
+            logger.error(f"Overnight pattern match error for {symbol}: {e}")
 
 
 @asynccontextmanager
@@ -655,6 +681,20 @@ async def trigger_pattern_match(symbol: str):
     if engine.latest_result:
         return engine.latest_result
     return {"status": "no_results", "message": "Not enough data for matching"}
+
+
+@app.get("/api/pattern/{symbol}/overnight")
+async def get_overnight_pattern(symbol: str):
+    """Get latest overnight pattern match results for a symbol."""
+    if symbol not in overnight_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No overnight engine for {symbol}"}
+        )
+    engine = overnight_engines[symbol]
+    if engine.latest_result is None:
+        return {"status": "no_results", "message": "Overnight matching hasn't run yet"}
+    return engine.latest_result
 
 
 @app.get("/api/cache/{symbol}")

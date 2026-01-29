@@ -540,6 +540,17 @@
                 <div class="dash-row"><span>Matches</span><span class="dash-val" id="dash-pm-count">—</span></div>
                 <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-pm-signal">—</span></div>
             </div>
+            <div class="dash-section">
+                <div class="dash-label">Overnight Pattern</div>
+                <div class="dash-row"><span>Status</span><span class="dash-val" id="dash-on-status" style="color:#758696">waiting</span></div>
+                <div class="dash-row"><span>Direction</span><span class="dash-val" id="dash-on-dir">—</span></div>
+                <div class="dash-row"><span>Consensus</span><span class="dash-val" id="dash-on-consensus">—</span></div>
+                <div class="dash-row"><span>Avg Corr</span><span class="dash-val" id="dash-on-corr">—</span></div>
+                <div class="dash-row"><span>Mean Move</span><span class="dash-val" id="dash-on-move">—</span></div>
+                <div class="dash-row"><span>EOS Proj</span><span class="dash-val" id="dash-on-eos">—</span></div>
+                <div class="dash-row"><span>Matches</span><span class="dash-val" id="dash-on-count">—</span></div>
+                <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-on-signal">—</span></div>
+            </div>
         </div>
     </div>
 
@@ -846,10 +857,14 @@
                 console.log(`WebSocket connected to ${symbol}`);
                 updateStatus('connected', `${symbol} Connected`);
                 reconnectAttempts = 0;
-                // Fetch cached pattern match result
+                // Fetch cached pattern match results
                 fetch(`/api/pattern/${symbol}`)
                     .then(r => r.json())
                     .then(data => { if (data && data.match_count) handlePatternUpdate(data); })
+                    .catch(() => {});
+                fetch(`/api/pattern/${symbol}/overnight`)
+                    .then(r => r.json())
+                    .then(data => { if (data && data.match_count) handleOvernightPatternUpdate(data); })
                     .catch(() => {});
             };
 
@@ -910,6 +925,10 @@
 
                 case 'pattern_update':
                     handlePatternUpdate(msg);
+                    break;
+
+                case 'overnight_pattern_update':
+                    handleOvernightPatternUpdate(msg);
                     break;
 
                 case 'ping':
@@ -1782,6 +1801,51 @@
             if (projectionSeries) { try { chart.removeSeries(projectionSeries); } catch (e) {} projectionSeries = null; }
             if (confUpperSeries) { try { chart.removeSeries(confUpperSeries); } catch (e) {} confUpperSeries = null; }
             if (confLowerSeries) { try { chart.removeSeries(confLowerSeries); } catch (e) {} confLowerSeries = null; }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // OVERNIGHT PATTERN HANDLER
+        // ═══════════════════════════════════════════════════════════
+        function handleOvernightPatternUpdate(msg) {
+            const f = msg.forecast;
+            const proj = msg.projection;
+            if (f) {
+                const dirEl = document.getElementById('dash-on-dir');
+                if (f.direction_signal > 0.1) {
+                    dirEl.textContent = '↑ Bullish';
+                    dirEl.className = 'dash-val pos';
+                } else if (f.direction_signal < -0.1) {
+                    dirEl.textContent = '↓ Bearish';
+                    dirEl.className = 'dash-val neg';
+                } else {
+                    dirEl.textContent = '— Neutral';
+                    dirEl.className = 'dash-val neutral';
+                }
+                document.getElementById('dash-on-consensus').textContent = f.consensus;
+                document.getElementById('dash-on-corr').textContent = (f.avg_correlation * 100).toFixed(0) + '%';
+                const moveEl = document.getElementById('dash-on-move');
+                moveEl.textContent = (f.mean_move > 0 ? '+' : '') + f.mean_move.toFixed(2) + '%';
+                moveEl.className = 'dash-val ' + (f.mean_move > 0 ? 'pos' : f.mean_move < 0 ? 'neg' : 'neutral');
+                document.getElementById('dash-on-count').textContent = `${f.sample_size}/${msg.filtered_count}`;
+
+                const sigEl = document.getElementById('dash-on-signal');
+                sigEl.textContent = f.direction_signal.toFixed(3);
+                sigEl.className = 'dash-val ' + (f.direction_signal > 0.05 ? 'pos' : f.direction_signal < -0.05 ? 'neg' : 'neutral');
+
+                document.getElementById('dash-on-status').textContent = 'active';
+                document.getElementById('dash-on-status').style.color = '#26a69a';
+            } else {
+                document.getElementById('dash-on-status').textContent = 'no match';
+                document.getElementById('dash-on-status').style.color = '#ef5350';
+            }
+
+            // EOS projection
+            if (proj && proj.end_of_session_price) {
+                const eosEl = document.getElementById('dash-on-eos');
+                const ret = proj.end_of_session_return || 0;
+                eosEl.textContent = proj.end_of_session_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
+                eosEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
+            }
         }
 
         // ═══════════════════════════════════════════════════════════
