@@ -616,11 +616,14 @@ class DailyPatternEngine:
                 hist_portions.append(portion)
                 filtered_indices.append(idx)
 
+        logger.info(f"Pattern matcher: {len(hist_portions)} candidates with enough hourly data (need {MIN_MATCHES_REQUIRED})")
         if len(hist_portions) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: not enough hist_portions ({len(hist_portions)} < {MIN_MATCHES_REQUIRED})")
             return None
 
         hist_matrix = np.array(hist_portions, dtype=np.float64)
         correlations = batch_pearson(today_norm, hist_matrix)
+        logger.info(f"Pattern matcher: correlations range [{correlations.min():.4f}, {correlations.max():.4f}], mean={correlations.mean():.4f}")
 
         # Apply recency weighting (more recent days get higher weight)
         days_ago = np.array([
@@ -635,13 +638,30 @@ class DailyPatternEngine:
         for li in sorted_local[:TOP_N_MATCHES]:
             corr = float(correlations[li])
             if corr < MIN_CORRELATION:
+                logger.debug(f"Pattern matcher: skipping match corr={corr:.4f} < {MIN_CORRELATION}")
                 continue
             day = self.days[filtered_indices[li]]
             if day.is_half_day or day.is_extreme:
                 continue
             top_matches.append((day, corr))
 
+        logger.info(f"Pattern matcher: {len(top_matches)} top matches after correlation filter (need {MIN_MATCHES_REQUIRED}, min_corr={MIN_CORRELATION})")
         if len(top_matches) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: not enough matches ({len(top_matches)} < {MIN_MATCHES_REQUIRED}), lowering threshold")
+            # Retry with lower correlation threshold
+            top_matches = []
+            for li in sorted_local[:TOP_N_MATCHES]:
+                corr = float(correlations[li])
+                if corr < 0.3:  # Much more lenient fallback
+                    continue
+                day = self.days[filtered_indices[li]]
+                if day.is_half_day or day.is_extreme:
+                    continue
+                top_matches.append((day, corr))
+            logger.info(f"Pattern matcher: {len(top_matches)} matches with lowered threshold (0.3)")
+
+        if len(top_matches) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: still not enough matches even with lowered threshold")
             return None
 
         # ── Forecast ──
