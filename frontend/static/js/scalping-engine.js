@@ -591,8 +591,8 @@ export function evaluateScalpEntry(data) {
         choppy: false,
     };
 
-    // LAYER 1: Time Filter
-    if (isNoTradeWindow(data.time)) {
+    // LAYER 1: Time Filter (skipped if sessionOverride is active)
+    if (!data.sessionOverride && isNoTradeWindow(data.time)) {
         result.reason = `Time filter: ${sessionFilter(data.time).session}`;
         return result;
     }
@@ -737,7 +737,7 @@ export class ScalpingEngine {
      * @param {Object[]} allBars - full bar history
      * @param {boolean} renderOverlays - if true, build full series arrays for chart
      */
-    compute(allBars, renderOverlays = true) {
+    compute(allBars, renderOverlays = true, sessionOverride = false) {
         this.bars = allBars;
         const totalLen = allBars.length;
         if (totalLen < 30) return null;
@@ -822,6 +822,7 @@ export class ScalpingEngine {
             stDirection, stDirection15m: null,
             vwapResult: vwapScoreResult, vwapBias: vwapScoreResult.bias,
             confluence: confluenceResult, levels, choppy, volatilityEvent, divergence, emaPullback,
+            sessionOverride,
         });
 
         // ── Build state ──

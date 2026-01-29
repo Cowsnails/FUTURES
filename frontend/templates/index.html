@@ -414,6 +414,7 @@
             <div class="dash-section">
                 <div class="dash-label">Session</div>
                 <div class="dash-row"><span>Window</span><span class="dash-val" id="dash-session">—</span></div>
+                <div class="dash-row"><span>Time Filter</span><button id="btn-override-session" style="background:rgba(239,83,80,0.15);border:1px solid #ef5350;color:#ef5350;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:600;cursor:pointer;">OFF</button></div>
             </div>
             <div class="dash-section">
                 <div class="dash-label">Edge Cases</div>
@@ -457,7 +458,7 @@
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
         import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=8';
-        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=5';
+        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=6';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -1284,7 +1285,7 @@
 
             if (isNewBar) {
                 // New bar: full compute + overlays
-                const state = scalpingEngine.compute(bars, true);
+                const state = scalpingEngine.compute(bars, true, sessionOverride);
                 if (!state) return;
                 updateDashboard(state);
                 renderEngineOverlays(bars, state);
@@ -1293,7 +1294,7 @@
                 const now = Date.now();
                 if (now - engineThrottleTime < ENGINE_THROTTLE_MS) return;
                 engineThrottleTime = now;
-                const state = scalpingEngine.compute(bars, false);
+                const state = scalpingEngine.compute(bars, false, sessionOverride);
                 if (!state) return;
                 updateDashboard(state);
             }
@@ -1500,6 +1501,24 @@
         // Dashboard toggle
         document.getElementById('dash-toggle').addEventListener('click', () => {
             document.getElementById('scalping-dashboard').classList.toggle('visible');
+        });
+
+        // Session override toggle
+        let sessionOverride = false;
+        document.getElementById('btn-override-session').addEventListener('click', () => {
+            sessionOverride = !sessionOverride;
+            const btn = document.getElementById('btn-override-session');
+            if (sessionOverride) {
+                btn.textContent = 'OVERRIDE';
+                btn.style.background = 'rgba(38,166,154,0.2)';
+                btn.style.borderColor = '#26a69a';
+                btn.style.color = '#26a69a';
+            } else {
+                btn.textContent = 'OFF';
+                btn.style.background = 'rgba(239,83,80,0.15)';
+                btn.style.borderColor = '#ef5350';
+                btn.style.color = '#ef5350';
+            }
         });
 
         // ═══════════════════════════════════════════════════════════
