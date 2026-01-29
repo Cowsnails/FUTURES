@@ -306,6 +306,7 @@
         .dash-regime.trending { background: rgba(38,166,154,0.2); color: #26a69a; }
         .dash-regime.ranging { background: rgba(255,167,38,0.2); color: #ffa726; }
         .dash-regime.volatile { background: rgba(239,83,80,0.2); color: #ef5350; }
+        .dash-regime.chaos { background: rgba(239,83,80,0.4); color: #ff1744; }
         .dash-regime.transition { background: rgba(117,134,150,0.2); color: #758696; }
         .dash-regime.unknown { background: rgba(117,134,150,0.2); color: #758696; }
 
@@ -400,12 +401,27 @@
                 <div class="dash-reason" id="dash-reason"></div>
             </div>
             <div class="dash-section">
+                <div class="dash-label">Trade Details</div>
+                <div class="dash-row"><span>Size</span><span class="dash-val" id="dash-size">—</span></div>
+                <div class="dash-row"><span>Entry</span><span class="dash-val" id="dash-entry-type">—</span></div>
+                <div class="dash-row"><span>Stop</span><span class="dash-val" id="dash-stop">—</span></div>
+                <div class="dash-row"><span>Target</span><span class="dash-val" id="dash-target">—</span></div>
+            </div>
+            <div class="dash-section">
                 <div class="dash-label">Regime</div>
                 <div><span class="dash-regime unknown" id="dash-regime">—</span></div>
             </div>
             <div class="dash-section">
                 <div class="dash-label">Session</div>
                 <div class="dash-row"><span>Window</span><span class="dash-val" id="dash-session">—</span></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Edge Cases</div>
+                <div class="dash-row"><span>Volatility</span><span class="dash-val" id="dash-vol-event">—</span></div>
+                <div class="dash-row"><span>Divergence</span><span class="dash-val" id="dash-divergence">—</span></div>
+                <div class="dash-row"><span>Choppy</span><span class="dash-val" id="dash-choppy">—</span></div>
+                <div class="dash-row"><span>ATR Pct</span><span class="dash-val" id="dash-atr-pct">—</span></div>
+                <div class="dash-row"><span>Chop Idx</span><span class="dash-val" id="dash-chop">—</span></div>
             </div>
             <div class="dash-section">
                 <div class="dash-label">Indicators</div>
@@ -441,7 +457,7 @@
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
         import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=8';
-        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=1';
+        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=2';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -1280,6 +1296,26 @@
             // Reason
             document.getElementById('dash-reason').textContent = d.reason;
 
+            // Trade details (position size, entry type, stop/target)
+            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
+            if (d.action !== 'NO_TRADE') {
+                document.getElementById('dash-size').textContent = (d.positionSize * 100).toFixed(0) + '%';
+                document.getElementById('dash-entry-type').textContent = d.entryType.replace(/_/g, ' ');
+                const atr = ind.atr10;
+                if (atr !== null) {
+                    document.getElementById('dash-stop').textContent = fmt(d.stopATR * atr) + ' (' + d.stopATR + 'x ATR)';
+                    document.getElementById('dash-target').textContent = fmt(d.targetATR * atr) + ' (' + d.targetATR + 'x ATR)';
+                } else {
+                    document.getElementById('dash-stop').textContent = d.stopATR + 'x ATR';
+                    document.getElementById('dash-target').textContent = d.targetATR + 'x ATR';
+                }
+            } else {
+                document.getElementById('dash-size').textContent = '—';
+                document.getElementById('dash-entry-type').textContent = '—';
+                document.getElementById('dash-stop').textContent = '—';
+                document.getElementById('dash-target').textContent = '—';
+            }
+
             // Regime
             const regEl = document.getElementById('dash-regime');
             regEl.textContent = state.regime;
@@ -1288,8 +1324,22 @@
             // Session
             document.getElementById('dash-session').textContent = state.session.session.replace(/_/g, ' ');
 
+            // Edge cases
+            const volEventEl = document.getElementById('dash-vol-event');
+            volEventEl.textContent = state.volatilityEvent;
+            volEventEl.className = 'dash-val ' + (state.volatilityEvent === 'NORMAL' ? 'neutral' : state.volatilityEvent === 'ELEVATED' ? 'neutral' : 'neg');
+
+            const divEl = document.getElementById('dash-divergence');
+            divEl.textContent = state.divergence.replace(/_/g, ' ');
+            divEl.className = 'dash-val ' + (state.divergence === 'BULLISH_DIVERGENCE' ? 'pos' : state.divergence === 'BEARISH_DIVERGENCE' ? 'neg' : 'neutral');
+
+            document.getElementById('dash-choppy').textContent = state.choppy ? 'YES' : 'No';
+            document.getElementById('dash-choppy').className = 'dash-val ' + (state.choppy ? 'neg' : 'neutral');
+
+            document.getElementById('dash-atr-pct').textContent = ind.atrPercentile !== null ? ind.atrPercentile.toFixed(0) + '%' : '—';
+            document.getElementById('dash-chop').textContent = ind.chop14 !== null ? ind.chop14.toFixed(1) : '—';
+
             // Indicator values
-            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
             document.getElementById('dash-vwap').textContent = fmt(ind.vwap);
             document.getElementById('dash-ema').textContent = fmt(ind.ema9);
             document.getElementById('dash-rsi').textContent = fmt(ind.rsi7, 1);
@@ -1298,7 +1348,7 @@
             const volRatio = ind.volSMA20 ? (ind.volume / ind.volSMA20).toFixed(1) + 'x' : '—';
             document.getElementById('dash-vol').textContent = volRatio;
 
-            // Scores
+            // Scores (now from confluence.raw)
             const fmtScore = (v) => {
                 if (v === null || v === undefined) return '—';
                 const el = v.toFixed(2);
@@ -1314,8 +1364,8 @@
             setScore('dash-s-ema', s.ema);
             setScore('dash-s-rsi', s.rsi);
             setScore('dash-s-adx', s.adx);
-            setScore('dash-s-vol', s.volume);
-            setScore('dash-confluence', s.confluence);
+            setScore('dash-s-vol', s.vol);
+            setScore('dash-confluence', state.confluence.total);
 
             // Levels
             const fmtLvl = (v) => v !== null && v !== undefined ? v.toFixed(2) : '—';

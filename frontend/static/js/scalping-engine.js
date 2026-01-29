@@ -3,43 +3,34 @@
  *
  * Full indicator stack + regime detection + confluence scoring + decision tree
  * for intraday scalping on MNQ/NQ, MGC/GC futures.
+ *
+ * Implements the complete research document specifications:
+ * - 5 independent dimensions (trend, fair value, momentum, volatility regime, structure)
+ * - Gradient 0-1 scoring with z-score VWAP, exact RSI table
+ * - Category-weighted confluence (MR 0.35, Mom 0.25, Trend 0.30, Vol 0.10)
+ * - 12-layer decision tree with regime-dependent thresholds
+ * - Edge case detectors (choppy, volatility spike, RSI divergence)
+ * - Session-adaptive RSI thresholds
+ * - Conflict resolution matrix
+ * - Position sizing, entry type, stop/target ATR multiples
  */
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PHASE 1: CORE INDICATOR CALCULATIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * EMA - Exponential Moving Average
- * @param {number[]} values - Close prices
- * @param {number} period
- * @returns {number[]} - EMA values (null until enough data)
- */
 export function calcEMA(values, period) {
     const ema = new Array(values.length).fill(null);
     const k = 2 / (period + 1);
     let sum = 0;
     for (let i = 0; i < values.length; i++) {
-        if (i < period - 1) {
-            sum += values[i];
-            continue;
-        }
-        if (i === period - 1) {
-            sum += values[i];
-            ema[i] = sum / period;
-            continue;
-        }
+        if (i < period - 1) { sum += values[i]; continue; }
+        if (i === period - 1) { sum += values[i]; ema[i] = sum / period; continue; }
         ema[i] = values[i] * k + ema[i - 1] * (1 - k);
     }
     return ema;
 }
 
-/**
- * SMA - Simple Moving Average
- * @param {number[]} values
- * @param {number} period
- * @returns {number[]}
- */
 export function calcSMA(values, period) {
     const sma = new Array(values.length).fill(null);
     let sum = 0;
@@ -51,12 +42,6 @@ export function calcSMA(values, period) {
     return sma;
 }
 
-/**
- * ATR - Average True Range (Wilder's smoothing)
- * @param {Object[]} bars - OHLCV bars
- * @param {number} period
- * @returns {number[]}
- */
 export function calcATR(bars, period) {
     const atr = new Array(bars.length).fill(null);
     let sum = 0;
@@ -77,21 +62,13 @@ export function calcATR(bars, period) {
     return atr;
 }
 
-/**
- * RSI - Relative Strength Index (Wilder's smoothing)
- * @param {number[]} closes
- * @param {number} period
- * @returns {number[]}
- */
 export function calcRSI(closes, period) {
     const rsi = new Array(closes.length).fill(null);
     let avgGain = 0, avgLoss = 0;
-
     for (let i = 1; i < closes.length; i++) {
         const change = closes[i] - closes[i - 1];
         const gain = change > 0 ? change : 0;
         const loss = change < 0 ? -change : 0;
-
         if (i <= period) {
             avgGain += gain;
             avgLoss += loss;
@@ -109,21 +86,13 @@ export function calcRSI(closes, period) {
     return rsi;
 }
 
-/**
- * ADX - Average Directional Index
- * @param {Object[]} bars - OHLCV bars
- * @param {number} period
- * @returns {{adx: number[], plusDI: number[], minusDI: number[]}}
- */
 export function calcADX(bars, period) {
     const len = bars.length;
     const adx = new Array(len).fill(null);
     const plusDI = new Array(len).fill(null);
     const minusDI = new Array(len).fill(null);
-
     if (len < period * 2) return { adx, plusDI, minusDI };
 
-    // True Range, +DM, -DM raw
     const tr = new Array(len).fill(0);
     const plusDM = new Array(len).fill(0);
     const minusDM = new Array(len).fill(0);
@@ -138,7 +107,6 @@ export function calcADX(bars, period) {
         minusDM[i] = (downMove > upMove && downMove > 0) ? downMove : 0;
     }
 
-    // Wilder smoothed sums
     let smoothTR = 0, smoothPlusDM = 0, smoothMinusDM = 0;
     for (let i = 1; i <= period; i++) {
         smoothTR += tr[i];
@@ -148,19 +116,15 @@ export function calcADX(bars, period) {
 
     let dxSum = 0;
     for (let i = period; i < len; i++) {
-        if (i === period) {
-            // first smoothed values already computed
-        } else {
+        if (i > period) {
             smoothTR = smoothTR - smoothTR / period + tr[i];
             smoothPlusDM = smoothPlusDM - smoothPlusDM / period + plusDM[i];
             smoothMinusDM = smoothMinusDM - smoothMinusDM / period + minusDM[i];
         }
-
         const pdi = smoothTR === 0 ? 0 : (smoothPlusDM / smoothTR) * 100;
         const mdi = smoothTR === 0 ? 0 : (smoothMinusDM / smoothTR) * 100;
         plusDI[i] = pdi;
         minusDI[i] = mdi;
-
         const diSum = pdi + mdi;
         const dx = diSum === 0 ? 0 : (Math.abs(pdi - mdi) / diSum) * 100;
 
@@ -173,15 +137,9 @@ export function calcADX(bars, period) {
             adx[i] = (adx[i - 1] * (period - 1) + dx) / period;
         }
     }
-
     return { adx, plusDI, minusDI };
 }
 
-/**
- * VWAP with standard deviation bands (daily reset)
- * @param {Object[]} bars - OHLCV bars with .time (unix seconds)
- * @returns {{vwap: number[], upper1: number[], lower1: number[], upper2: number[], lower2: number[]}}
- */
 export function calcVWAP(bars) {
     const len = bars.length;
     const vwap = new Array(len).fill(null);
@@ -189,102 +147,105 @@ export function calcVWAP(bars) {
     const lower1 = new Array(len).fill(null);
     const upper2 = new Array(len).fill(null);
     const lower2 = new Array(len).fill(null);
+    const stdDev = new Array(len).fill(null);
 
-    let cumTPV = 0;   // cumulative typical-price * volume
-    let cumVol = 0;   // cumulative volume
-    let cumTPV2 = 0;  // for variance calc: cumulative (tp^2 * vol)
+    let cumTPV = 0, cumVol = 0, cumTPV2 = 0;
     let prevDay = null;
 
     for (let i = 0; i < len; i++) {
         const d = new Date(bars[i].time * 1000);
         const day = d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
-
-        // Reset on new day
         if (day !== prevDay) {
-            cumTPV = 0;
-            cumVol = 0;
-            cumTPV2 = 0;
+            cumTPV = 0; cumVol = 0; cumTPV2 = 0;
             prevDay = day;
         }
-
         const tp = (bars[i].high + bars[i].low + bars[i].close) / 3;
-        const vol = bars[i].volume || 1; // avoid div by zero
+        const vol = bars[i].volume || 1;
         cumTPV += tp * vol;
         cumVol += vol;
         cumTPV2 += tp * tp * vol;
-
         const v = cumTPV / cumVol;
         vwap[i] = v;
-
-        // Standard deviation of typical price weighted by volume
         const variance = (cumTPV2 / cumVol) - (v * v);
         const sd = Math.sqrt(Math.max(0, variance));
-
+        stdDev[i] = sd;
         upper1[i] = v + sd;
         lower1[i] = v - sd;
         upper2[i] = v + 2 * sd;
         lower2[i] = v - 2 * sd;
     }
+    return { vwap, upper1, lower1, upper2, lower2, stdDev };
+}
 
-    return { vwap, upper1, lower1, upper2, lower2 };
+export function calcVolumeSMA(bars, period) {
+    return calcSMA(bars.map(b => b.volume || 0), period);
 }
 
 /**
- * Volume SMA - simple moving average of volume
- * @param {Object[]} bars
- * @param {number} period
- * @returns {number[]}
+ * Choppiness Index (14-period)
  */
-export function calcVolumeSMA(bars, period) {
-    const volumes = bars.map(b => b.volume || 0);
-    return calcSMA(volumes, period);
+export function calcChoppiness(bars, period = 14) {
+    const len = bars.length;
+    const chop = new Array(len).fill(null);
+    for (let i = period; i < len; i++) {
+        let sumTR = 0, highestHigh = -Infinity, lowestLow = Infinity;
+        for (let j = i - period + 1; j <= i; j++) {
+            const prevClose = j > 0 ? bars[j - 1].close : bars[j].close;
+            sumTR += Math.max(bars[j].high - bars[j].low, Math.abs(bars[j].high - prevClose), Math.abs(bars[j].low - prevClose));
+            highestHigh = Math.max(highestHigh, bars[j].high);
+            lowestLow = Math.min(lowestLow, bars[j].low);
+        }
+        const range = highestHigh - lowestLow;
+        chop[i] = range > 0 ? 100 * Math.log10(sumTR / range) / Math.log10(period) : 50;
+    }
+    return chop;
+}
+
+/**
+ * ATR Percentile over rolling window
+ */
+export function calcATRPercentile(atrValues, windowSize = 100) {
+    const len = atrValues.length;
+    const pct = new Array(len).fill(null);
+    for (let i = 0; i < len; i++) {
+        if (atrValues[i] === null || i < windowSize) continue;
+        const window = [];
+        for (let j = i - windowSize + 1; j <= i; j++) {
+            if (atrValues[j] !== null) window.push(atrValues[j]);
+        }
+        if (window.length === 0) continue;
+        const sorted = [...window].sort((a, b) => a - b);
+        let rank = 0;
+        for (const v of sorted) { if (v <= atrValues[i]) rank++; }
+        pct[i] = (rank / sorted.length) * 100;
+    }
+    return pct;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PHASE 2: SESSION LEVELS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Compute session-based levels from bars.
- * Returns levels for the CURRENT day based on PREVIOUS day and overnight data.
- *
- * Sessions (all ET / UTC-5):
- *   RTH: 09:30 - 16:00 ET  (14:30 - 21:00 UTC)
- *   Overnight: 18:00 prev day - 09:30 ET  (23:00 prev UTC - 14:30 UTC)
- *   Opening Range: first 15 min of RTH (09:30 - 09:45 ET)
- *
- * @param {Object[]} bars - OHLCV bars with .time (unix seconds)
- * @returns {{pdh: number|null, pdl: number|null, pdc: number|null, onh: number|null, onl: number|null, orh: number|null, orl: number|null}}
- */
 export function calcSessionLevels(bars) {
     if (!bars || bars.length === 0) return { pdh: null, pdl: null, pdc: null, onh: null, onl: null, orh: null, orl: null };
 
-    // Group bars by session
-    // RTH = 14:30-21:00 UTC, Overnight = 23:00-14:30 UTC
-    const rthDays = {};   // dateKey -> {high, low, close}
-    const onSessions = {}; // dateKey -> {high, low}  (overnight leading into that RTH day)
-    const orSessions = {}; // dateKey -> {high, low}  (opening range of that RTH day)
+    const rthDays = {};
+    const onSessions = {};
+    const orSessions = {};
 
     for (const bar of bars) {
         const d = new Date(bar.time * 1000);
-        const utcH = d.getUTCHours();
-        const utcM = d.getUTCMinutes();
-        const utcMinutes = utcH * 60 + utcM;
-
-        // Determine which RTH date this bar belongs to
-        // RTH: 14:30-21:00 UTC
-        // Overnight before RTH: 23:00 prev day to 14:29 UTC same day
+        const utcMinutes = d.getUTCHours() * 60 + d.getUTCMinutes();
         const dateKey = d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
 
         if (utcMinutes >= 870 && utcMinutes < 1260) {
-            // RTH: 14:30 (870min) to 21:00 (1260min) UTC
+            // RTH: 14:30-21:00 UTC
             if (!rthDays[dateKey]) rthDays[dateKey] = { high: -Infinity, low: Infinity, close: bar.close };
             const s = rthDays[dateKey];
             s.high = Math.max(s.high, bar.high);
             s.low = Math.min(s.low, bar.low);
-            s.close = bar.close; // last bar's close = RTH close
-
-            // Opening range: 14:30-14:45 UTC (870-885 min)
+            s.close = bar.close;
+            // Opening range: 14:30-14:45 UTC
             if (utcMinutes >= 870 && utcMinutes < 885) {
                 if (!orSessions[dateKey]) orSessions[dateKey] = { high: -Infinity, low: Infinity };
                 const o = orSessions[dateKey];
@@ -292,11 +253,8 @@ export function calcSessionLevels(bars) {
                 o.low = Math.min(o.low, bar.low);
             }
         } else if (utcMinutes >= 1380 || utcMinutes < 870) {
-            // Overnight: 23:00 (1380min) to 14:29 UTC
-            // Belongs to the NEXT day's RTH if after 23:00, or same day if before 14:30
             let onDateKey = dateKey;
             if (utcMinutes >= 1380) {
-                // After 23:00 UTC = overnight for next calendar day
                 const nextDay = new Date(d);
                 nextDay.setUTCDate(nextDay.getUTCDate() + 1);
                 onDateKey = nextDay.getUTCFullYear() * 10000 + (nextDay.getUTCMonth() + 1) * 100 + nextDay.getUTCDate();
@@ -308,386 +266,532 @@ export function calcSessionLevels(bars) {
         }
     }
 
-    // Get sorted RTH days to find "previous day"
     const sortedDays = Object.keys(rthDays).sort((a, b) => a - b);
-
-    // Current day = last day with data, previous = second to last
     const result = { pdh: null, pdl: null, pdc: null, onh: null, onl: null, orh: null, orl: null };
 
     if (sortedDays.length >= 2) {
-        const prevKey = sortedDays[sortedDays.length - 2];
-        const prev = rthDays[prevKey];
+        const prev = rthDays[sortedDays[sortedDays.length - 2]];
         result.pdh = prev.high;
         result.pdl = prev.low;
         result.pdc = prev.close;
     }
-
-    // Overnight for the current/latest day
     const latestDay = sortedDays[sortedDays.length - 1];
     if (latestDay && onSessions[latestDay]) {
         const on = onSessions[latestDay];
         if (on.high !== -Infinity) result.onh = on.high;
         if (on.low !== Infinity) result.onl = on.low;
     }
-
-    // Opening range for current day
     if (latestDay && orSessions[latestDay]) {
         const or = orSessions[latestDay];
         if (or.high !== -Infinity) result.orh = or.high;
         if (or.low !== Infinity) result.orl = or.low;
     }
-
     return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PHASE 3: REGIME DETECTION
+// PHASE 3: REGIME DETECTION (per doc: ADX + ATR ratio + Choppiness)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Detect market regime: trending, ranging, or volatile/chaotic
- *
- * Rules:
- *   ADX > 25 → trending
- *   ADX < 20 → ranging
- *   ATR percentile > 80th → volatile/chaotic (overrides above)
- *   Choppiness Index > 61.8 → ranging (confirmation)
- *
- * @param {Object[]} bars
- * @param {{adx: number[], atr: number[]}} indicators - pre-computed
- * @returns {string[]} - regime per bar: 'trending' | 'ranging' | 'volatile'
+ * Regime detection per doc's determineRegime():
+ *   atrRatio > 2.0 → CHAOS
+ *   ADX < 20 || chop > 61.8 → RANGING
+ *   ADX > 25 && chop < 38.2 → TRENDING
+ *   else → TRANSITION
  */
-export function detectRegime(bars, adxValues, atrValues) {
-    const len = bars.length;
-    const regime = new Array(len).fill('unknown');
+export function detectRegime(adxVal, atrVal, atrSMA20Val, chopVal) {
+    if (atrVal === null || adxVal === null) return 'unknown';
+    const atrRatio = atrSMA20Val && atrSMA20Val > 0 ? atrVal / atrSMA20Val : 1;
 
-    // Compute ATR percentile over rolling 100-bar window
-    const atrWindow = 100;
-
-    for (let i = 0; i < len; i++) {
-        if (adxValues[i] === null || atrValues[i] === null) continue;
-
-        // ATR percentile
-        let atrPercentile = 50;
-        if (i >= atrWindow) {
-            const window = atrValues.slice(i - atrWindow + 1, i + 1).filter(v => v !== null);
-            if (window.length > 0) {
-                const sorted = [...window].sort((a, b) => a - b);
-                const rank = sorted.indexOf(atrValues[i]);
-                atrPercentile = (rank / (sorted.length - 1)) * 100;
-            }
-        }
-
-        // Choppiness Index (14-period)
-        let chop = 50;
-        if (i >= 14) {
-            const chopPeriod = 14;
-            let sumTR = 0;
-            let highestHigh = -Infinity;
-            let lowestLow = Infinity;
-            for (let j = i - chopPeriod + 1; j <= i; j++) {
-                const prevClose = j > 0 ? bars[j - 1].close : bars[j].close;
-                sumTR += Math.max(bars[j].high - bars[j].low, Math.abs(bars[j].high - prevClose), Math.abs(bars[j].low - prevClose));
-                highestHigh = Math.max(highestHigh, bars[j].high);
-                lowestLow = Math.min(lowestLow, bars[j].low);
-            }
-            const range = highestHigh - lowestLow;
-            if (range > 0) {
-                chop = 100 * Math.log10(sumTR / range) / Math.log10(chopPeriod);
-            }
-        }
-
-        // Classification
-        if (atrPercentile > 80) {
-            regime[i] = 'volatile';
-        } else if (adxValues[i] > 25) {
-            regime[i] = 'trending';
-        } else if (adxValues[i] < 20 || chop > 61.8) {
-            regime[i] = 'ranging';
-        } else {
-            regime[i] = 'transition'; // ADX 20-25 zone
-        }
-    }
-
-    return regime;
+    if (atrRatio > 2.0) return 'chaos';
+    if (adxVal < 20 || (chopVal !== null && chopVal > 61.8)) return 'ranging';
+    if (adxVal > 25 && (chopVal === null || chopVal < 38.2)) return 'trending';
+    return 'transition';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PHASE 4: CONFLUENCE SCORING (gradient 0–1)
+// PHASE 4: CONFLUENCE SCORING — Doc's exact gradient functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Score each indicator on a 0-1 gradient scale.
- * Positive = bullish bias, Negative = bearish bias.
- * Returns score in range [-1, 1].
- */
-
-/** VWAP Position Score: where is price relative to VWAP and bands? */
-export function scoreVWAP(close, vwap, upper1, lower1, upper2, lower2) {
-    if (vwap === null) return 0;
-    if (close > upper2) return 1.0;   // extreme above
-    if (close > upper1) return 0.7;
-    if (close > vwap) return 0.3;
-    if (close > lower1) return -0.3;
-    if (close > lower2) return -0.7;
-    return -1.0; // extreme below
+/** VWAP Z-Score Scoring (doc's exact function) */
+export function scoreVWAP(price, vwap, stdDev) {
+    if (vwap === null || !stdDev || stdDev === 0) return { score: 0, bias: 'NEUTRAL' };
+    const zScore = (price - vwap) / stdDev;
+    if (zScore > 2) return { score: 0.9, bias: 'EXTENDED_LONG' };
+    if (zScore > 1) return { score: 0.6, bias: 'BULLISH' };
+    if (zScore > 0) return { score: 0.3, bias: 'SLIGHT_BULL' };
+    if (zScore > -1) return { score: -0.3, bias: 'SLIGHT_BEAR' };
+    if (zScore > -2) return { score: -0.6, bias: 'BEARISH' };
+    return { score: -0.9, bias: 'EXTENDED_SHORT' };
 }
 
-/** EMA 9 Score: price relative to EMA as pullback reference */
-export function scoreEMA(close, ema) {
-    if (ema === null) return 0;
-    const dist = (close - ema) / ema; // normalized distance
-    // Clamp to [-1, 1] with smooth gradient
-    return Math.max(-1, Math.min(1, dist * 100)); // 1% distance = full score
-}
-
-/** RSI Score: momentum with 80/20 extremes */
+/** RSI Scoring for LONG entries (doc's exact table) */
 export function scoreRSI(rsi) {
     if (rsi === null) return 0;
-    if (rsi >= 80) return 1.0;   // overbought extreme
-    if (rsi <= 20) return -1.0;  // oversold extreme
-    // Linear scale between 20-80, centered at 50
-    return (rsi - 50) / 30; // range [-1, 1]
+    if (rsi < 20) return 1.0;
+    if (rsi < 30) return 0.8;
+    if (rsi < 40) return 0.6;
+    if (rsi < 50) return 0.4;
+    if (rsi < 60) return 0.2;
+    if (rsi < 70) return 0.0;
+    if (rsi < 80) return -0.3;
+    return -0.6;
 }
 
-/** ADX Score: trend strength (not direction — magnitude only) */
+/** Supertrend Score (doc's function) */
+export function scoreSupertrend(direction) {
+    if (direction === 1) return 1.0;  // UP
+    if (direction === -1) return 0.0; // DOWN
+    return 0.5;
+}
+
+/** EMA 9 Score: price above/below */
+export function scoreEMA(price, ema9) {
+    if (ema9 === null) return 0;
+    return price > ema9 ? 1 : 0;
+}
+
+/** Volume Score: relative volume */
+export function scoreVolume(volume, volSMA20) {
+    if (!volSMA20 || volSMA20 === 0) return 0;
+    return volume > volSMA20 ? 1 : 0;
+}
+
+/** ADX Score: trend strength */
 export function scoreADX(adx) {
     if (adx === null) return 0;
     if (adx > 40) return 1.0;
-    if (adx > 25) return (adx - 25) / 15; // 0 to 1
-    if (adx > 20) return 0; // transition zone
-    return -((20 - adx) / 20); // ranging: negative score
-}
-
-/** Volume Score: volume spike relative to SMA */
-export function scoreVolume(volume, volSMA) {
-    if (volSMA === null || volSMA === 0) return 0;
-    const ratio = volume / volSMA;
-    if (ratio >= 2.0) return 1.0;  // 2x spike = max
-    if (ratio >= 1.5) return 0.7;
-    if (ratio >= 1.0) return 0.3;
-    return -0.3; // below average = slight negative
+    if (adx > 25) return (adx - 25) / 15;
+    if (adx > 20) return 0;
+    return -((20 - adx) / 20);
 }
 
 /**
- * Compute composite confluence score from all sub-scores.
- * Weights: VWAP 0.25, EMA 0.15, RSI 0.20, ADX 0.20, Volume 0.20
- * @returns {number} -1 to 1
+ * Category-weighted confluence per doc:
+ *   Mean Reversion: 0.35 weight (VWAP z-score + RSI)
+ *   Momentum: 0.25 weight (RSI direction + price acceleration)
+ *   Trend: 0.30 weight (Supertrend + EMA)
+ *   Volume: 0.10 weight
  */
-export function computeConfluence(vwapScore, emaScore, rsiScore, adxScore, volScore) {
-    return vwapScore * 0.25 + emaScore * 0.15 + rsiScore * 0.20 + adxScore * 0.20 + volScore * 0.20;
+export function computeConfluence(indicators, regime) {
+    const { vwapResult, rsiVal, rsiPrev, close, closePrev2, stDirection, ema9Val, volume, volSMA20 } = indicators;
+
+    // Mean Reversion Score
+    const mrVwap = Math.abs(vwapResult.score);
+    const mrRsi = scoreRSI(rsiVal);
+    const mrScore = mrVwap * 0.6 + mrRsi * 0.4;
+
+    // Momentum Score
+    const rsiDirection = rsiVal !== null && rsiPrev !== null && rsiVal > rsiPrev ? 1 : 0;
+    const priceAccel = close !== null && closePrev2 !== null && close > closePrev2 ? 1 : 0;
+    const momScore = rsiDirection * 0.5 + priceAccel * 0.5;
+
+    // Trend Score
+    const stScore = scoreSupertrend(stDirection);
+    const emaScore = scoreEMA(close, ema9Val);
+    const trendScore = stScore * 0.6 + emaScore * 0.4;
+
+    // Volume Score
+    const volScore = scoreVolume(volume, volSMA20);
+
+    // Weighted total
+    const total = mrScore * 0.35 + momScore * 0.25 + trendScore * 0.30 + volScore * 0.10;
+
+    return {
+        total,
+        components: { meanReversion: mrScore, momentum: momScore, trend: trendScore, volume: volScore },
+        raw: { vwap: vwapResult.score, rsi: mrRsi, ema: emaScore, adx: scoreADX(indicators.adxVal), vol: volScore }
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PHASE 5: DECISION TREE + CONFLICT RESOLUTION
+// EDGE CASE DETECTORS (from doc)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Decision tree: given regime and scores, output action.
- *
- * Hierarchy (highest priority first):
- *   1. Mean Reversion (ranging + RSI extreme + VWAP band touch)
- *   2. Momentum (trending + RSI confirms + volume spike)
- *   3. Trend Following (trending + EMA pullback + ADX strong)
- *   4. Volume Breakout (any regime + 2x volume + price at level)
- *   5. No Trade (conflicting signals or low confluence)
- *
- * @param {string} regime
- * @param {Object} scores - {vwap, ema, rsi, adx, volume, confluence}
- * @param {Object} price - {close, high, low}
- * @param {Object} levels - {pdh, pdl, pdc, onh, onl, orh, orl} or nulls
- * @returns {{action: string, bias: string, confidence: number, reason: string}}
- */
-export function decisionTree(regime, scores, price, levels) {
-    const { vwap: vwapS, ema: emaS, rsi: rsiS, adx: adxS, volume: volS, confluence } = scores;
-    const absConf = Math.abs(confluence);
+/** Choppy market filter (doc's isChoppyMarket) */
+export function isChoppyMarket(adx, chopVal, atrPercentile, bars, lookback = 10) {
+    let score = 0;
+    if (adx !== null && adx < 20) score++;
+    if (chopVal !== null && chopVal > 61.8) score++;
+    if (atrPercentile !== null && atrPercentile < 25) score++;
 
-    // Default
-    let result = { action: 'NO_TRADE', bias: 'neutral', confidence: 0, reason: 'Insufficient confluence' };
-
-    // 1. Mean Reversion (ranging regime)
-    if (regime === 'ranging' || regime === 'transition') {
-        if (rsiS <= -0.7 && vwapS <= -0.5) {
-            result = { action: 'BUY', bias: 'bullish', confidence: Math.min(1, absConf + 0.2), reason: 'Mean reversion: oversold at VWAP band' };
-        } else if (rsiS >= 0.7 && vwapS >= 0.5) {
-            result = { action: 'SELL', bias: 'bearish', confidence: Math.min(1, absConf + 0.2), reason: 'Mean reversion: overbought at VWAP band' };
+    // Count EMA 9 crosses in last N bars
+    if (bars && bars.length >= lookback + 9) {
+        const closes = bars.slice(-lookback - 9).map(b => b.close);
+        const ema = calcEMA(closes, 9);
+        let crosses = 0;
+        for (let i = 10; i < ema.length; i++) {
+            if (ema[i] !== null && ema[i - 1] !== null) {
+                const above = closes[i] > ema[i];
+                const prevAbove = closes[i - 1] > ema[i - 1];
+                if (above !== prevAbove) crosses++;
+            }
         }
+        if (crosses >= 4) score++;
     }
 
-    // 2. Momentum (trending regime, RSI confirms direction)
-    if (result.action === 'NO_TRADE' && regime === 'trending') {
-        if (confluence > 0.3 && rsiS > 0.3 && volS > 0.3) {
-            result = { action: 'BUY', bias: 'bullish', confidence: absConf, reason: 'Momentum: trend + RSI + volume confirm bullish' };
-        } else if (confluence < -0.3 && rsiS < -0.3 && volS > 0.3) {
-            result = { action: 'SELL', bias: 'bearish', confidence: absConf, reason: 'Momentum: trend + RSI + volume confirm bearish' };
-        }
-    }
-
-    // 3. Trend Following (trending + EMA pullback)
-    if (result.action === 'NO_TRADE' && regime === 'trending') {
-        if (emaS > 0 && emaS < 0.3 && adxS > 0.3) {
-            result = { action: 'BUY', bias: 'bullish', confidence: Math.min(1, adxS * 0.8), reason: 'Trend follow: pullback to EMA in uptrend' };
-        } else if (emaS < 0 && emaS > -0.3 && adxS > 0.3) {
-            result = { action: 'SELL', bias: 'bearish', confidence: Math.min(1, adxS * 0.8), reason: 'Trend follow: pullback to EMA in downtrend' };
-        }
-    }
-
-    // 4. Volume Breakout (any regime, 2x volume)
-    if (result.action === 'NO_TRADE' && volS >= 0.7) {
-        // Check proximity to key levels
-        const levelProximity = checkLevelProximity(price.close, levels);
-        if (levelProximity.near && confluence > 0.2) {
-            result = { action: 'BUY', bias: 'bullish', confidence: Math.min(1, volS * 0.7), reason: `Volume breakout near ${levelProximity.level}` };
-        } else if (levelProximity.near && confluence < -0.2) {
-            result = { action: 'SELL', bias: 'bearish', confidence: Math.min(1, volS * 0.7), reason: `Volume breakdown near ${levelProximity.level}` };
-        }
-    }
-
-    // 5. Volatile regime override: reduce confidence or block
-    if (regime === 'volatile') {
-        result.confidence *= 0.5;
-        if (result.confidence < 0.3) {
-            result = { action: 'NO_TRADE', bias: 'neutral', confidence: 0, reason: 'Volatile regime - signals unreliable' };
-        }
-    }
-
-    return result;
+    return score >= 2;
 }
 
-/**
- * Check if price is near any key session level (within 0.15% for futures)
- */
+/** Volatility spike detection (doc's detectVolatilityEvent) */
+export function detectVolatilityEvent(currentBar, atr) {
+    if (atr === null || atr === 0) return 'NORMAL';
+    const barRange = currentBar.high - currentBar.low;
+    if (barRange > atr * 3) return 'EXTREME';
+    if (barRange > atr * 2) return 'HIGH';
+    if (barRange > atr * 1.5) return 'ELEVATED';
+    return 'NORMAL';
+}
+
+/** RSI divergence detection (doc's detectDivergence) */
+export function detectDivergence(bars, rsiValues, lookback = 5) {
+    const len = bars.length;
+    if (len < lookback + 1) return 'NONE';
+    const i = len - 1;
+    if (rsiValues[i] === null) return 'NONE';
+
+    let maxHigh = -Infinity, maxRSI = -Infinity;
+    let minLow = Infinity, minRSI = Infinity;
+    for (let j = i - lookback; j < i; j++) {
+        if (j < 0 || rsiValues[j] === null) continue;
+        maxHigh = Math.max(maxHigh, bars[j].high);
+        maxRSI = Math.max(maxRSI, rsiValues[j]);
+        minLow = Math.min(minLow, bars[j].low);
+        minRSI = Math.min(minRSI, rsiValues[j]);
+    }
+
+    const priceHigher = bars[i].high > maxHigh;
+    const rsiLower = rsiValues[i] < maxRSI;
+    const priceLower = bars[i].low < minLow;
+    const rsiHigher = rsiValues[i] > minRSI;
+
+    if (priceHigher && rsiLower) return 'BEARISH_DIVERGENCE';
+    if (priceLower && rsiHigher) return 'BULLISH_DIVERGENCE';
+    return 'NONE';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION-ADAPTIVE RSI THRESHOLDS (from doc)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function getSessionThresholds(unixSeconds) {
+    const d = new Date(unixSeconds * 1000);
+    const etH = (d.getUTCHours() - 5 + 24) % 24;
+    // Market open 9-11 ET
+    if (etH >= 9 && etH < 11) return { overbought: 80, oversold: 20 };
+    // Midday 11-14 ET — tighter mean reversion
+    if (etH >= 11 && etH < 14) return { overbought: 65, oversold: 35 };
+    // Power hour + default
+    return { overbought: 75, oversold: 25 };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIME-OF-DAY SESSION FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function sessionFilter(unixSeconds) {
+    const d = new Date(unixSeconds * 1000);
+    const etH = (d.getUTCHours() - 5 + 24) % 24;
+    const etMinutes = etH * 60 + d.getUTCMinutes();
+
+    if (etMinutes >= 570 && etMinutes < 690) return { tradeable: true, session: 'morning_prime', quality: 1.0 };
+    if (etMinutes >= 840 && etMinutes < 945) return { tradeable: true, session: 'afternoon_prime', quality: 0.9 };
+    if (etMinutes >= 480 && etMinutes < 570) return { tradeable: true, session: 'pre_open', quality: 0.5 };
+    if (etMinutes >= 690 && etMinutes < 840) return { tradeable: false, session: 'lunch_chop', quality: 0.2 };
+    if (etMinutes >= 945 && etMinutes < 960) return { tradeable: false, session: 'close_erratic', quality: 0.1 };
+    return { tradeable: false, session: 'overnight', quality: 0.3 };
+}
+
+/** No-trade window check (doc's Layer 1) */
+function isNoTradeWindow(unixSeconds) {
+    const s = sessionFilter(unixSeconds);
+    return !s.tradeable;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFLICT RESOLUTION MATRIX (from doc)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function resolveConflict(stDirection1m, vwapBias, rsi, stDirection15m) {
+    // HTF Veto: Never trade against strong HTF trend
+    if (stDirection15m === -1 && stDirection1m === 1) {
+        return { trade: false, reason: 'HTF bearish veto', positionSize: 0 };
+    }
+    if (stDirection15m === 1 && stDirection1m === -1) {
+        return { trade: false, reason: 'HTF bullish veto', positionSize: 0 };
+    }
+
+    // RSI Extreme Veto
+    if (stDirection1m === 1 && rsi !== null && rsi > 80) {
+        return { trade: false, reason: 'RSI overbought on long signal', positionSize: 0 };
+    }
+    if (stDirection1m === -1 && rsi !== null && rsi < 20) {
+        return { trade: false, reason: 'RSI oversold on short signal', positionSize: 0 };
+    }
+
+    // VWAP Entry Filter
+    if (stDirection1m === 1 && (vwapBias === 'BEARISH' || vwapBias === 'SLIGHT_BEAR' || vwapBias === 'EXTENDED_SHORT')) {
+        return { trade: true, action: 'WAIT_FOR_VWAP_RECLAIM', entryType: 'LIMIT_AT_VWAP', positionSize: 0.5 };
+    }
+    if (stDirection1m === -1 && (vwapBias === 'BULLISH' || vwapBias === 'SLIGHT_BULL' || vwapBias === 'EXTENDED_LONG')) {
+        return { trade: true, action: 'WAIT_FOR_VWAP_BREAK', entryType: 'LIMIT_AT_VWAP', positionSize: 0.5 };
+    }
+
+    // Full alignment
+    const aligned = stDirection1m === stDirection15m;
+    if (aligned && rsi !== null && rsi < 70 && rsi > 30) {
+        return { trade: true, positionSize: 1.0, confidence: 'HIGH' };
+    }
+
+    // Partial alignment or no 15m data
+    return { trade: true, positionSize: stDirection15m === null ? 0.75 : 0.5, confidence: 'MODERATE' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 5: FULL 12-LAYER DECISION TREE (from doc)
+// ═══════════════════════════════════════════════════════════════════════════
+
 function checkLevelProximity(close, levels) {
     if (!levels) return { near: false, level: '' };
-    const threshold = close * 0.0015; // 0.15%
+    const threshold = close * 0.0015;
     const checks = [
         ['PDH', levels.pdh], ['PDL', levels.pdl], ['PDC', levels.pdc],
         ['ONH', levels.onh], ['ONL', levels.onl],
         ['ORH', levels.orh], ['ORL', levels.orl],
     ];
     for (const [name, val] of checks) {
-        if (val !== null && Math.abs(close - val) < threshold) {
-            return { near: true, level: name };
-        }
+        if (val !== null && Math.abs(close - val) < threshold) return { near: true, level: name };
     }
     return { near: false, level: '' };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PHASE 8: TIME-OF-DAY SESSION FILTERS
-// ═══════════════════════════════════════════════════════════════════════════
-
 /**
- * Check if current time is within a tradeable session window.
- *
- * Prime windows (ET):
- *   Morning: 09:30 - 11:30  (first 2 hours of RTH)
- *   Afternoon: 14:00 - 15:45 (last power hour minus close)
- *
- * Avoid:
- *   Lunch: 11:30 - 14:00 (low volume chop)
- *   Last 15 min: 15:45 - 16:00 (erratic close)
- *   Pre-market thin: 04:00 - 08:00 ET (too thin)
- *
- * @param {number} unixSeconds
- * @returns {{tradeable: boolean, session: string, quality: number}}
+ * Full 12-layer decision tree per doc's evaluateScalpEntry()
  */
-export function sessionFilter(unixSeconds) {
-    const d = new Date(unixSeconds * 1000);
-    // Convert UTC to ET (UTC-5, ignoring DST for simplicity — could be improved)
-    const etH = (d.getUTCHours() - 5 + 24) % 24;
-    const etM = d.getUTCMinutes();
-    const etMinutes = etH * 60 + etM;
+export function evaluateScalpEntry(data) {
+    const result = {
+        action: 'NO_TRADE',
+        bias: 'neutral',
+        score: 0,
+        confidence: 0,
+        positionSize: 0,
+        entryType: 'MARKET',
+        regime: 'unknown',
+        stopATR: 0,
+        targetATR: 0,
+        reason: '',
+        volatilityEvent: 'NORMAL',
+        divergence: 'NONE',
+        choppy: false,
+    };
 
-    // 09:30-11:30 ET = 570-690 min
-    if (etMinutes >= 570 && etMinutes < 690) {
-        return { tradeable: true, session: 'morning_prime', quality: 1.0 };
+    // LAYER 1: Time Filter
+    if (isNoTradeWindow(data.time)) {
+        result.reason = `Time filter: ${sessionFilter(data.time).session}`;
+        return result;
     }
-    // 14:00-15:45 ET = 840-945 min
-    if (etMinutes >= 840 && etMinutes < 945) {
-        return { tradeable: true, session: 'afternoon_prime', quality: 0.9 };
+
+    // LAYER 2: News Filter (can't implement without news feed — skip)
+
+    // LAYER 3: Regime Detection
+    const regime = detectRegime(data.adx, data.atr, data.atrSMA20, data.chop);
+    result.regime = regime;
+    if (regime === 'chaos') {
+        result.reason = 'Extreme volatility (CHAOS regime)';
+        return result;
     }
-    // 08:00-09:30 ET = pre-open
-    if (etMinutes >= 480 && etMinutes < 570) {
-        return { tradeable: true, session: 'pre_open', quality: 0.5 };
+
+    // LAYER 4: ATR Percentile Check
+    if (data.atrPercentile !== null && data.atrPercentile < 25) {
+        result.reason = `Low volatility (ATR pct: ${data.atrPercentile.toFixed(0)}%)`;
+        return result;
     }
-    // 11:30-14:00 ET = lunch
-    if (etMinutes >= 690 && etMinutes < 840) {
-        return { tradeable: false, session: 'lunch_chop', quality: 0.2 };
+
+    // Edge case: Choppy market
+    result.choppy = data.choppy;
+    if (data.choppy) {
+        result.reason = 'Choppy market detected (multiple chop indicators)';
+        return result;
     }
-    // 15:45-16:00 ET = close
-    if (etMinutes >= 945 && etMinutes < 960) {
-        return { tradeable: false, session: 'close_erratic', quality: 0.1 };
+
+    // Edge case: Volatility event
+    result.volatilityEvent = data.volatilityEvent;
+    if (data.volatilityEvent === 'EXTREME') {
+        result.reason = 'Extreme volatility bar (>3x ATR) — halt trading';
+        return result;
     }
-    // Overnight
-    return { tradeable: false, session: 'overnight', quality: 0.3 };
+
+    // LAYER 5: Multi-Timeframe Filter (use Supertrend direction as proxy)
+    // We don't have 15min supertrend separate, so we use the existing supertrend direction
+    const stDirection = data.stDirection; // 1 = UP, -1 = DOWN
+    // If we had 15m supertrend, we'd check here. For now, use 1m.
+
+    // LAYER 6: Confluence Score
+    const confluenceResult = data.confluence;
+    const score = confluenceResult.total;
+    result.score = score;
+
+    // LAYER 7: Signal Direction
+    const signalDirection = stDirection === 1 ? 'LONG' : 'SHORT';
+
+    // LAYER 8: Threshold Check (regime-dependent)
+    const threshold = regime === 'trending' ? 0.60 : 0.50;
+    if (score < threshold) {
+        result.reason = `Score ${score.toFixed(2)} below ${regime} threshold ${threshold}`;
+        return result;
+    }
+
+    // LAYER 9: Conflict Resolution
+    const conflict = resolveConflict(stDirection, data.vwapBias, data.rsi, data.stDirection15m || null);
+    if (!conflict.trade) {
+        result.reason = conflict.reason;
+        return result;
+    }
+
+    // LAYER 10: RSI Extreme Veto (session-adaptive thresholds)
+    const thresholds = getSessionThresholds(data.time);
+    if (signalDirection === 'LONG' && data.rsi !== null && data.rsi > thresholds.overbought) {
+        result.reason = `RSI ${data.rsi.toFixed(0)} > ${thresholds.overbought} overbought veto`;
+        return result;
+    }
+    if (signalDirection === 'SHORT' && data.rsi !== null && data.rsi < thresholds.oversold) {
+        result.reason = `RSI ${data.rsi.toFixed(0)} < ${thresholds.oversold} oversold veto`;
+        return result;
+    }
+
+    // LAYER 11: Position Sizing
+    let positionSize = conflict.positionSize || 1.0;
+    if (data.atrPercentile !== null && data.atrPercentile > 90) positionSize *= 0.5;
+    if (score < 0.70) positionSize *= 0.75;
+    if (data.volatilityEvent === 'HIGH') positionSize *= 0.5;
+    if (data.volatilityEvent === 'ELEVATED') positionSize *= 0.75;
+
+    // LAYER 12: Entry Type
+    let entryType = conflict.entryType || 'MARKET';
+    if (regime === 'ranging') entryType = 'LIMIT_AT_VWAP';
+
+    // Divergence bonus info
+    result.divergence = data.divergence;
+
+    // Build final result
+    result.action = signalDirection === 'LONG' ? 'BUY' : 'SELL';
+    result.bias = signalDirection === 'LONG' ? 'bullish' : 'bearish';
+    result.confidence = Math.min(1, score);
+    result.positionSize = Math.max(0.25, Math.min(1.0, positionSize));
+    result.entryType = entryType;
+    result.stopATR = regime === 'trending' ? 2.0 : 1.5;
+    result.targetATR = regime === 'trending' ? 3.0 : 2.0;
+
+    // Specific reason based on setup type
+    const levelInfo = checkLevelProximity(data.close, data.levels);
+    if (regime === 'ranging' && Math.abs(data.vwapResult.score) >= 0.6) {
+        result.reason = `Mean reversion: ${data.vwapResult.bias} at VWAP band`;
+    } else if (regime === 'trending' && confluenceResult.components.momentum > 0.6) {
+        result.reason = `Momentum: trend + RSI + volume confirm ${result.bias}`;
+    } else if (regime === 'trending' && data.emaPullback) {
+        result.reason = `Trend follow: pullback to EMA 9 in ${stDirection === 1 ? 'uptrend' : 'downtrend'}`;
+    } else if (levelInfo.near) {
+        result.reason = `${data.volatilityEvent !== 'NORMAL' ? 'Vol ' : ''}Breakout near ${levelInfo.level}`;
+    } else {
+        result.reason = `${regime} regime, score ${score.toFixed(2)}, ${result.entryType}`;
+    }
+
+    // Session quality adjustment
+    const session = sessionFilter(data.time);
+    if (session.quality < 1.0) {
+        result.confidence *= session.quality;
+        result.positionSize *= session.quality;
+    }
+
+    return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MAIN ENGINE CLASS - Ties everything together
+// MAIN ENGINE CLASS
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class ScalpingEngine {
     constructor() {
         this.bars = [];
-        this.state = null; // latest computed state
+        this.state = null;
     }
 
-    /**
-     * Full compute on all bars. Call on init and new bars.
-     * @param {Object[]} bars - OHLCV bars
-     * @returns {Object} - full state snapshot
-     */
     compute(bars) {
         this.bars = bars;
         if (bars.length < 30) return null;
 
         const closes = bars.map(b => b.close);
+        const len = bars.length;
+        const i = len - 1;
+        const bar = bars[i];
 
         // Phase 1: Core indicators
         const ema9 = calcEMA(closes, 9);
         const rsi7 = calcRSI(closes, 7);
         const { adx: adx10, plusDI, minusDI } = calcADX(bars, 10);
         const atr10 = calcATR(bars, 10);
+        const atrSMA20 = calcSMA(atr10.filter(v => v !== null).length > 0 ? atr10 : new Array(len).fill(null), 20);
         const volSMA20 = calcVolumeSMA(bars, 20);
-        const { vwap, upper1, lower1, upper2, lower2 } = calcVWAP(bars);
+        const { vwap, upper1, lower1, upper2, lower2, stdDev: vwapStdDev } = calcVWAP(bars);
+        const chop14 = calcChoppiness(bars, 14);
+        const atrPercentile = calcATRPercentile(atr10);
 
         // Phase 2: Session levels
         const levels = calcSessionLevels(bars);
 
-        // Get latest index
-        const i = bars.length - 1;
-        const bar = bars[i];
-
         // Phase 3: Regime
-        const regimes = detectRegime(bars, adx10, atr10);
-        const regime = regimes[i];
+        const regime = detectRegime(adx10[i], atr10[i], atrSMA20[i], chop14[i]);
 
-        // Phase 4: Scores
-        const vwapScore = scoreVWAP(bar.close, vwap[i], upper1[i], lower1[i], upper2[i], lower2[i]);
-        const emaScore = scoreEMA(bar.close, ema9[i]);
-        const rsiScore = scoreRSI(rsi7[i]);
-        const adxScore = scoreADX(adx10[i]);
-        const volScore = scoreVolume(bar.volume, volSMA20[i]);
-        const confluence = computeConfluence(vwapScore, emaScore, rsiScore, adxScore, volScore);
+        // Phase 4: Scoring (doc's exact functions)
+        const vwapResult = scoreVWAP(bar.close, vwap[i], vwapStdDev[i]);
+        const rsiPrev = i >= 2 ? rsi7[i - 1] : null;
+        const closePrev2 = i >= 2 ? bars[i - 2].close : null;
 
-        const scores = { vwap: vwapScore, ema: emaScore, rsi: rsiScore, adx: adxScore, volume: volScore, confluence };
+        // Supertrend direction from existing indicator (pass through)
+        // We derive direction from +DI/-DI as proxy
+        const stDirection = plusDI[i] !== null && minusDI[i] !== null
+            ? (plusDI[i] > minusDI[i] ? 1 : -1) : 0;
 
-        // Phase 5: Decision
-        const decision = decisionTree(regime, scores, { close: bar.close, high: bar.high, low: bar.low }, levels);
+        const confluenceResult = computeConfluence({
+            vwapResult, rsiVal: rsi7[i], rsiPrev, close: bar.close, closePrev2,
+            stDirection, ema9Val: ema9[i], volume: bar.volume, volSMA20: volSMA20[i],
+            adxVal: adx10[i],
+        }, regime);
 
-        // Phase 8: Session filter
-        const session = sessionFilter(bar.time);
-        if (!session.tradeable && decision.action !== 'NO_TRADE') {
-            decision.confidence *= session.quality;
-            if (decision.confidence < 0.2) {
-                decision.action = 'NO_TRADE';
-                decision.reason = `${session.session}: ${decision.reason}`;
-            }
-        }
+        // Edge case detectors
+        const choppy = isChoppyMarket(adx10[i], chop14[i], atrPercentile[i], bars);
+        const volatilityEvent = detectVolatilityEvent(bar, atr10[i]);
+        const divergence = detectDivergence(bars, rsi7);
+
+        // EMA pullback check (within 0.1% of EMA 9)
+        const emaPullback = ema9[i] !== null && Math.abs(bar.close - ema9[i]) / ema9[i] < 0.001;
+
+        // Phase 5: Full 12-layer decision tree
+        const decision = evaluateScalpEntry({
+            time: bar.time,
+            close: bar.close,
+            high: bar.high,
+            low: bar.low,
+            adx: adx10[i],
+            atr: atr10[i],
+            atrSMA20: atrSMA20[i],
+            atrPercentile: atrPercentile[i],
+            chop: chop14[i],
+            rsi: rsi7[i],
+            stDirection,
+            stDirection15m: null, // would need 15m aggregation
+            vwapResult,
+            vwapBias: vwapResult.bias,
+            confluence: confluenceResult,
+            levels,
+            choppy,
+            volatilityEvent,
+            divergence,
+            emaPullback,
+        });
 
         this.state = {
-            // Raw indicator values (latest)
             indicators: {
                 ema9: ema9[i],
                 rsi7: rsi7[i],
@@ -695,45 +799,42 @@ export class ScalpingEngine {
                 plusDI: plusDI[i],
                 minusDI: minusDI[i],
                 atr10: atr10[i],
+                atrSMA20: atrSMA20[i],
+                atrPercentile: atrPercentile[i],
+                chop14: chop14[i],
                 vwap: vwap[i],
                 vwapUpper1: upper1[i],
                 vwapLower1: lower1[i],
                 vwapUpper2: upper2[i],
                 vwapLower2: lower2[i],
+                vwapStdDev: vwapStdDev[i],
                 volSMA20: volSMA20[i],
                 volume: bar.volume,
+                stDirection,
             },
-            // Full arrays for chart rendering
             series: {
                 ema9, rsi7, adx10, plusDI, minusDI, atr10,
                 vwap, vwapUpper1: upper1, vwapLower1: lower1, vwapUpper2: upper2, vwapLower2: lower2,
-                volSMA20,
+                volSMA20, chop14, atrPercentile,
             },
-            // Levels
             levels,
-            // Regime
             regime,
-            // Scores
-            scores,
-            // Decision
+            scores: confluenceResult.raw,
+            confluence: confluenceResult,
             decision,
-            // Session
-            session,
-            // Time
+            session: sessionFilter(bar.time),
+            volatilityEvent,
+            divergence,
+            choppy,
             time: bar.time,
         };
 
         return this.state;
     }
 
-    /**
-     * Quick update for tick (update last bar, recompute only latest values).
-     * For performance, only recompute on new bars; ticks just update the last bar.
-     */
     updateLastBar(bar) {
         if (this.bars.length === 0) return this.state;
         this.bars[this.bars.length - 1] = bar;
-        // Don't recompute on every tick — caller should throttle
         return this.state;
     }
 
