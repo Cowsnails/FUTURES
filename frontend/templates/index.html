@@ -221,6 +221,116 @@
         .countdown-timer .timer-label {
             color: #758696;
         }
+
+        /* ═══ Scalping Dashboard Panel ═══ */
+        .scalping-dashboard {
+            position: absolute;
+            top: 50px;
+            right: 10px;
+            z-index: 100;
+            width: 240px;
+            background: rgba(19, 23, 34, 0.92);
+            border: 1px solid #2a2e39;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: #d1d4dc;
+            display: none;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .scalping-dashboard.visible { display: block; }
+
+        .dash-section {
+            margin-bottom: 8px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #1e222d;
+        }
+        .dash-section:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+
+        .dash-label {
+            color: #758696;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 3px;
+        }
+
+        .dash-action {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+        .dash-action.buy { color: #26a69a; }
+        .dash-action.sell { color: #ef5350; }
+        .dash-action.no-trade { color: #758696; }
+
+        .dash-bias {
+            font-size: 12px;
+            font-weight: 600;
+            margin-top: 2px;
+        }
+
+        .dash-confidence-bar {
+            height: 4px;
+            background: #1e222d;
+            border-radius: 2px;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+        .dash-confidence-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+
+        .dash-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1px 0;
+        }
+
+        .dash-val { font-weight: 600; }
+        .dash-val.pos { color: #26a69a; }
+        .dash-val.neg { color: #ef5350; }
+        .dash-val.neutral { color: #758696; }
+
+        .dash-regime {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 600;
+            font-size: 10px;
+        }
+        .dash-regime.trending { background: rgba(38,166,154,0.2); color: #26a69a; }
+        .dash-regime.ranging { background: rgba(255,167,38,0.2); color: #ffa726; }
+        .dash-regime.volatile { background: rgba(239,83,80,0.2); color: #ef5350; }
+        .dash-regime.transition { background: rgba(117,134,150,0.2); color: #758696; }
+        .dash-regime.unknown { background: rgba(117,134,150,0.2); color: #758696; }
+
+        .dash-reason {
+            font-size: 10px;
+            color: #758696;
+            margin-top: 2px;
+            line-height: 1.3;
+        }
+
+        .dash-toggle {
+            position: absolute;
+            top: 10px;
+            right: 260px;
+            z-index: 101;
+            padding: 6px 10px;
+            background: rgba(26, 29, 39, 0.9);
+            border: 1px solid #2a2e39;
+            border-radius: 6px;
+            color: #d1d4dc;
+            font-size: 11px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .dash-toggle:hover { border-color: #3a3e49; }
     </style>
 </head>
 <body>
@@ -276,11 +386,62 @@
         <div class="info-panel" id="info-panel">
             <span id="info-text"></span>
         </div>
+
+        <!-- Dashboard Toggle -->
+        <button class="dash-toggle" id="dash-toggle">PANEL</button>
+
+        <!-- Scalping Dashboard -->
+        <div class="scalping-dashboard visible" id="scalping-dashboard">
+            <div class="dash-section">
+                <div class="dash-label">Action</div>
+                <div class="dash-action no-trade" id="dash-action">—</div>
+                <div class="dash-bias" id="dash-bias"></div>
+                <div class="dash-confidence-bar"><div class="dash-confidence-fill" id="dash-confidence" style="width:0;background:#758696"></div></div>
+                <div class="dash-reason" id="dash-reason"></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Regime</div>
+                <div><span class="dash-regime unknown" id="dash-regime">—</span></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Session</div>
+                <div class="dash-row"><span>Window</span><span class="dash-val" id="dash-session">—</span></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Indicators</div>
+                <div class="dash-row"><span>VWAP</span><span class="dash-val" id="dash-vwap">—</span></div>
+                <div class="dash-row"><span>EMA 9</span><span class="dash-val" id="dash-ema">—</span></div>
+                <div class="dash-row"><span>RSI 7</span><span class="dash-val" id="dash-rsi">—</span></div>
+                <div class="dash-row"><span>ADX 10</span><span class="dash-val" id="dash-adx">—</span></div>
+                <div class="dash-row"><span>ATR 10</span><span class="dash-val" id="dash-atr">—</span></div>
+                <div class="dash-row"><span>Vol/SMA</span><span class="dash-val" id="dash-vol">—</span></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Scores</div>
+                <div class="dash-row"><span>VWAP</span><span class="dash-val" id="dash-s-vwap">—</span></div>
+                <div class="dash-row"><span>EMA</span><span class="dash-val" id="dash-s-ema">—</span></div>
+                <div class="dash-row"><span>RSI</span><span class="dash-val" id="dash-s-rsi">—</span></div>
+                <div class="dash-row"><span>ADX</span><span class="dash-val" id="dash-s-adx">—</span></div>
+                <div class="dash-row"><span>Volume</span><span class="dash-val" id="dash-s-vol">—</span></div>
+                <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Confluence</span><span class="dash-val" id="dash-confluence">—</span></div>
+            </div>
+            <div class="dash-section">
+                <div class="dash-label">Levels</div>
+                <div class="dash-row"><span>PDH</span><span class="dash-val" id="dash-pdh">—</span></div>
+                <div class="dash-row"><span>PDL</span><span class="dash-val" id="dash-pdl">—</span></div>
+                <div class="dash-row"><span>PDC</span><span class="dash-val" id="dash-pdc">—</span></div>
+                <div class="dash-row"><span>ONH</span><span class="dash-val" id="dash-onh">—</span></div>
+                <div class="dash-row"><span>ONL</span><span class="dash-val" id="dash-onl">—</span></div>
+                <div class="dash-row"><span>ORH</span><span class="dash-val" id="dash-orh">—</span></div>
+                <div class="dash-row"><span>ORL</span><span class="dash-val" id="dash-orl">—</span></div>
+            </div>
+        </div>
     </div>
 
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
         import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=8';
+        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=1';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -320,6 +481,12 @@
         let currentOpenPrice = null;  // Current open price for candle coloring
         let supertrendIndicator = null;  // Supertrend Multi-Timeframe indicator
         let historicalBars = [];  // Store bars for indicator calculations
+        let scalpingEngine = new ScalpingEngine();  // Scalping decision engine
+        let engineThrottleTime = 0;  // Throttle engine updates
+        const ENGINE_THROTTLE_MS = 500;
+
+        // Scalping engine chart series (VWAP, EMA, levels)
+        let engineSeries = {};
 
         // Timeframe to seconds mapping
         const TIMEFRAME_SECONDS = {
@@ -748,6 +915,9 @@
                 }
             }
 
+            // Run scalping engine on historical data
+            runScalpingEngine(sortedData, true);
+
             // Render indicators if present
             if (msg.indicators && Object.keys(msg.indicators).length > 0) {
                 console.log(`Rendering ${Object.keys(msg.indicators).length} indicators`);
@@ -840,6 +1010,15 @@
                         console.warn('Error updating Supertrend:', e);
                     }
                 }
+
+                // Update scalping engine
+                if (isNewBar) {
+                    historicalBars.push(incomingBar);
+                    runScalpingEngine(historicalBars, true);
+                } else {
+                    historicalBars[historicalBars.length - 1] = incomingBar;
+                    runScalpingEngine(historicalBars);
+                }
             } else {
                 // For higher timeframes, aggregate 1-minute bars
                 const result = barAggregator.processBar(incomingBar);
@@ -885,6 +1064,15 @@
                         } catch (e) {
                             console.warn('Error updating Supertrend:', e);
                         }
+                    }
+
+                    // Update scalping engine with aggregated bar
+                    if (result.isNewBar && historicalBars.length > 0) {
+                        historicalBars.push(result.partialBar);
+                        runScalpingEngine(historicalBars, true);
+                    } else if (historicalBars.length > 0) {
+                        historicalBars[historicalBars.length - 1] = result.partialBar;
+                        runScalpingEngine(historicalBars);
                     }
                 }
             }
@@ -1055,6 +1243,200 @@
         }
 
         // ═══════════════════════════════════════════════════════════
+        // SCALPING ENGINE INTEGRATION
+        // ═══════════════════════════════════════════════════════════
+        function runScalpingEngine(bars, force = false) {
+            if (!bars || bars.length < 30) return;
+            const now = Date.now();
+            if (!force && now - engineThrottleTime < ENGINE_THROTTLE_MS) return;
+            engineThrottleTime = now;
+
+            const state = scalpingEngine.compute(bars);
+            if (!state) return;
+
+            updateDashboard(state);
+            renderEngineOverlays(bars, state);
+        }
+
+        function updateDashboard(state) {
+            const d = state.decision;
+            const s = state.scores;
+            const ind = state.indicators;
+
+            // Action
+            const actionEl = document.getElementById('dash-action');
+            actionEl.textContent = d.action;
+            actionEl.className = 'dash-action ' + (d.action === 'BUY' ? 'buy' : d.action === 'SELL' ? 'sell' : 'no-trade');
+
+            // Bias
+            document.getElementById('dash-bias').textContent = d.bias;
+
+            // Confidence bar
+            const confEl = document.getElementById('dash-confidence');
+            const confPct = Math.round(d.confidence * 100);
+            confEl.style.width = confPct + '%';
+            confEl.style.background = d.action === 'BUY' ? '#26a69a' : d.action === 'SELL' ? '#ef5350' : '#758696';
+
+            // Reason
+            document.getElementById('dash-reason').textContent = d.reason;
+
+            // Regime
+            const regEl = document.getElementById('dash-regime');
+            regEl.textContent = state.regime;
+            regEl.className = 'dash-regime ' + state.regime;
+
+            // Session
+            document.getElementById('dash-session').textContent = state.session.session.replace(/_/g, ' ');
+
+            // Indicator values
+            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
+            document.getElementById('dash-vwap').textContent = fmt(ind.vwap);
+            document.getElementById('dash-ema').textContent = fmt(ind.ema9);
+            document.getElementById('dash-rsi').textContent = fmt(ind.rsi7, 1);
+            document.getElementById('dash-adx').textContent = fmt(ind.adx10, 1);
+            document.getElementById('dash-atr').textContent = fmt(ind.atr10);
+            const volRatio = ind.volSMA20 ? (ind.volume / ind.volSMA20).toFixed(1) + 'x' : '—';
+            document.getElementById('dash-vol').textContent = volRatio;
+
+            // Scores
+            const fmtScore = (v) => {
+                if (v === null || v === undefined) return '—';
+                const el = v.toFixed(2);
+                return (v > 0 ? '+' : '') + el;
+            };
+            const scoreClass = (v) => v > 0.1 ? 'pos' : v < -0.1 ? 'neg' : 'neutral';
+            const setScore = (id, val) => {
+                const el = document.getElementById(id);
+                el.textContent = fmtScore(val);
+                el.className = 'dash-val ' + scoreClass(val);
+            };
+            setScore('dash-s-vwap', s.vwap);
+            setScore('dash-s-ema', s.ema);
+            setScore('dash-s-rsi', s.rsi);
+            setScore('dash-s-adx', s.adx);
+            setScore('dash-s-vol', s.volume);
+            setScore('dash-confluence', s.confluence);
+
+            // Levels
+            const fmtLvl = (v) => v !== null && v !== undefined ? v.toFixed(2) : '—';
+            document.getElementById('dash-pdh').textContent = fmtLvl(state.levels.pdh);
+            document.getElementById('dash-pdl').textContent = fmtLvl(state.levels.pdl);
+            document.getElementById('dash-pdc').textContent = fmtLvl(state.levels.pdc);
+            document.getElementById('dash-onh').textContent = fmtLvl(state.levels.onh);
+            document.getElementById('dash-onl').textContent = fmtLvl(state.levels.onl);
+            document.getElementById('dash-orh').textContent = fmtLvl(state.levels.orh);
+            document.getElementById('dash-orl').textContent = fmtLvl(state.levels.orl);
+        }
+
+        function renderEngineOverlays(bars, state) {
+            if (!chart || !state || !state.series) return;
+            const series = state.series;
+
+            // Remove old engine series
+            removeEngineSeries();
+
+            // VWAP line
+            engineSeries.vwap = chart.addLineSeries({
+                color: '#FF6D00', lineWidth: 2, lastValueVisible: false,
+                priceLineVisible: false, crosshairMarkerVisible: false, title: '',
+            });
+            engineSeries.vwapU1 = chart.addLineSeries({
+                color: 'rgba(255,109,0,0.3)', lineWidth: 1, lineStyle: 2,
+                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+            });
+            engineSeries.vwapL1 = chart.addLineSeries({
+                color: 'rgba(255,109,0,0.3)', lineWidth: 1, lineStyle: 2,
+                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+            });
+            engineSeries.vwapU2 = chart.addLineSeries({
+                color: 'rgba(255,109,0,0.15)', lineWidth: 1, lineStyle: 3,
+                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+            });
+            engineSeries.vwapL2 = chart.addLineSeries({
+                color: 'rgba(255,109,0,0.15)', lineWidth: 1, lineStyle: 3,
+                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+            });
+
+            // EMA 9
+            engineSeries.ema9 = chart.addLineSeries({
+                color: '#2962FF', lineWidth: 1, lastValueVisible: false,
+                priceLineVisible: false, crosshairMarkerVisible: false,
+            });
+
+            // Build data arrays
+            const vwapData = [], vu1 = [], vl1 = [], vu2 = [], vl2 = [], emaData = [];
+            for (let i = 0; i < bars.length; i++) {
+                const t = bars[i].time;
+                if (series.vwap[i] !== null) {
+                    vwapData.push({ time: t, value: series.vwap[i] });
+                    vu1.push({ time: t, value: series.vwapUpper1[i] });
+                    vl1.push({ time: t, value: series.vwapLower1[i] });
+                    vu2.push({ time: t, value: series.vwapUpper2[i] });
+                    vl2.push({ time: t, value: series.vwapLower2[i] });
+                }
+                if (series.ema9[i] !== null) {
+                    emaData.push({ time: t, value: series.ema9[i] });
+                }
+            }
+
+            engineSeries.vwap.setData(vwapData);
+            engineSeries.vwapU1.setData(vu1);
+            engineSeries.vwapL1.setData(vl1);
+            engineSeries.vwapU2.setData(vu2);
+            engineSeries.vwapL2.setData(vl2);
+            engineSeries.ema9.setData(emaData);
+
+            // Session level price lines on the candle series
+            renderLevelLines(state.levels);
+        }
+
+        function removeEngineSeries() {
+            for (const key of Object.keys(engineSeries)) {
+                try { chart.removeSeries(engineSeries[key]); } catch (e) {}
+            }
+            engineSeries = {};
+            // Remove level lines
+            if (candleSeries && engineLevelLines) {
+                for (const pl of engineLevelLines) {
+                    try { candleSeries.removePriceLine(pl); } catch (e) {}
+                }
+            }
+            engineLevelLines = [];
+        }
+
+        let engineLevelLines = [];
+        function renderLevelLines(levels) {
+            if (!candleSeries) return;
+            const lines = [
+                { key: 'pdh', color: '#AB47BC', title: 'PDH' },
+                { key: 'pdl', color: '#AB47BC', title: 'PDL' },
+                { key: 'pdc', color: '#7E57C2', title: 'PDC' },
+                { key: 'onh', color: '#42A5F5', title: 'ONH' },
+                { key: 'onl', color: '#42A5F5', title: 'ONL' },
+                { key: 'orh', color: '#FFA726', title: 'ORH' },
+                { key: 'orl', color: '#FFA726', title: 'ORL' },
+            ];
+            for (const l of lines) {
+                if (levels[l.key] !== null && levels[l.key] !== undefined) {
+                    const pl = candleSeries.createPriceLine({
+                        price: levels[l.key],
+                        color: l.color,
+                        lineWidth: 1,
+                        lineStyle: 1, // dotted
+                        axisLabelVisible: true,
+                        title: l.title,
+                    });
+                    engineLevelLines.push(pl);
+                }
+            }
+        }
+
+        // Dashboard toggle
+        document.getElementById('dash-toggle').addEventListener('click', () => {
+            document.getElementById('scalping-dashboard').classList.toggle('visible');
+        });
+
+        // ═══════════════════════════════════════════════════════════
         // EVENT HANDLERS
         // ═══════════════════════════════════════════════════════════
         document.getElementById('symbol-select').addEventListener('change', (e) => {
@@ -1080,6 +1462,7 @@
             if (supertrendIndicator) {
                 supertrendIndicator.remove();
             }
+            removeEngineSeries();
             historicalBars = [];
 
             // Reconnect with new symbol
@@ -1123,6 +1506,7 @@
             if (supertrendIndicator) {
                 supertrendIndicator.remove();
             }
+            removeEngineSeries();
             historicalBars = [];
 
             // Ignore bar updates until new historical data arrives
