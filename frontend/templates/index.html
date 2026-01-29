@@ -499,7 +499,7 @@
         let historicalBars = [];  // Store bars for indicator calculations
         let scalpingEngine = new ScalpingEngine();  // Scalping decision engine
         let engineThrottleTime = 0;  // Throttle engine updates
-        const ENGINE_THROTTLE_MS = 500;
+        const ENGINE_THROTTLE_MS = 1000;
 
         // Scalping engine chart series (VWAP, EMA, levels)
         let engineSeries = {};
@@ -1261,6 +1261,24 @@
         // ═══════════════════════════════════════════════════════════
         // SCALPING ENGINE INTEGRATION
         // ═══════════════════════════════════════════════════════════
+        function initEngineSeries() {
+            // Create series ONCE — never destroy/recreate
+            const opts = (color, width = 1, style = 0) => ({
+                color, lineWidth: width, lineStyle: style,
+                lastValueVisible: false, priceLineVisible: false,
+                crosshairMarkerVisible: false, title: '',
+            });
+            engineSeries.vwap = chart.addLineSeries(opts('#FF6D00', 2));
+            engineSeries.vwapU1 = chart.addLineSeries(opts('rgba(255,109,0,0.3)', 1, 2));
+            engineSeries.vwapL1 = chart.addLineSeries(opts('rgba(255,109,0,0.3)', 1, 2));
+            engineSeries.vwapU2 = chart.addLineSeries(opts('rgba(255,109,0,0.15)', 1, 3));
+            engineSeries.vwapL2 = chart.addLineSeries(opts('rgba(255,109,0,0.15)', 1, 3));
+            engineSeries.ema9 = chart.addLineSeries(opts('#2962FF', 1));
+        }
+
+        let engineSeriesInitialized = false;
+        let lastOverlayBarCount = 0;
+
         function runScalpingEngine(bars, force = false) {
             if (!bars || bars.length < 30) return;
             const now = Date.now();
@@ -1271,7 +1289,12 @@
             if (!state) return;
 
             updateDashboard(state);
-            renderEngineOverlays(bars, state);
+
+            // Only update chart overlays on new bars (not ticks) to avoid lag
+            if (force || bars.length !== lastOverlayBarCount) {
+                lastOverlayBarCount = bars.length;
+                renderEngineOverlays(bars, state);
+            }
         }
 
         function updateDashboard(state) {
@@ -1380,38 +1403,14 @@
 
         function renderEngineOverlays(bars, state) {
             if (!chart || !state || !state.series) return;
+
+            // Lazily create series once
+            if (!engineSeriesInitialized) {
+                initEngineSeries();
+                engineSeriesInitialized = true;
+            }
+
             const series = state.series;
-
-            // Remove old engine series
-            removeEngineSeries();
-
-            // VWAP line
-            engineSeries.vwap = chart.addLineSeries({
-                color: '#FF6D00', lineWidth: 2, lastValueVisible: false,
-                priceLineVisible: false, crosshairMarkerVisible: false, title: '',
-            });
-            engineSeries.vwapU1 = chart.addLineSeries({
-                color: 'rgba(255,109,0,0.3)', lineWidth: 1, lineStyle: 2,
-                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
-            });
-            engineSeries.vwapL1 = chart.addLineSeries({
-                color: 'rgba(255,109,0,0.3)', lineWidth: 1, lineStyle: 2,
-                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
-            });
-            engineSeries.vwapU2 = chart.addLineSeries({
-                color: 'rgba(255,109,0,0.15)', lineWidth: 1, lineStyle: 3,
-                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
-            });
-            engineSeries.vwapL2 = chart.addLineSeries({
-                color: 'rgba(255,109,0,0.15)', lineWidth: 1, lineStyle: 3,
-                lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
-            });
-
-            // EMA 9
-            engineSeries.ema9 = chart.addLineSeries({
-                color: '#2962FF', lineWidth: 1, lastValueVisible: false,
-                priceLineVisible: false, crosshairMarkerVisible: false,
-            });
 
             // Build data arrays
             const vwapData = [], vu1 = [], vl1 = [], vu2 = [], vl2 = [], emaData = [];
@@ -1436,49 +1435,64 @@
             engineSeries.vwapL2.setData(vl2);
             engineSeries.ema9.setData(emaData);
 
-            // Session level price lines on the candle series
+            // Session level price lines — update in place, don't recreate
             renderLevelLines(state.levels);
         }
 
         function removeEngineSeries() {
+            // Only remove the actual chart series objects
             for (const key of Object.keys(engineSeries)) {
                 try { chart.removeSeries(engineSeries[key]); } catch (e) {}
             }
             engineSeries = {};
+            engineSeriesInitialized = false;
+            lastOverlayBarCount = 0;
             // Remove level lines
-            if (candleSeries && engineLevelLines) {
-                for (const pl of engineLevelLines) {
-                    try { candleSeries.removePriceLine(pl); } catch (e) {}
-                }
-            }
-            engineLevelLines = [];
+            clearLevelLines();
         }
 
-        let engineLevelLines = [];
+        const LEVEL_DEFS = [
+            { key: 'pdh', color: '#AB47BC', title: 'PDH' },
+            { key: 'pdl', color: '#AB47BC', title: 'PDL' },
+            { key: 'pdc', color: '#7E57C2', title: 'PDC' },
+            { key: 'onh', color: '#42A5F5', title: 'ONH' },
+            { key: 'onl', color: '#42A5F5', title: 'ONL' },
+            { key: 'orh', color: '#FFA726', title: 'ORH' },
+            { key: 'orl', color: '#FFA726', title: 'ORL' },
+        ];
+        let engineLevelLines = {}; // keyed by level key
+
         function renderLevelLines(levels) {
             if (!candleSeries) return;
-            const lines = [
-                { key: 'pdh', color: '#AB47BC', title: 'PDH' },
-                { key: 'pdl', color: '#AB47BC', title: 'PDL' },
-                { key: 'pdc', color: '#7E57C2', title: 'PDC' },
-                { key: 'onh', color: '#42A5F5', title: 'ONH' },
-                { key: 'onl', color: '#42A5F5', title: 'ONL' },
-                { key: 'orh', color: '#FFA726', title: 'ORH' },
-                { key: 'orl', color: '#FFA726', title: 'ORL' },
-            ];
-            for (const l of lines) {
-                if (levels[l.key] !== null && levels[l.key] !== undefined) {
-                    const pl = candleSeries.createPriceLine({
-                        price: levels[l.key],
-                        color: l.color,
-                        lineWidth: 1,
-                        lineStyle: 1, // dotted
-                        axisLabelVisible: true,
-                        title: l.title,
-                    });
-                    engineLevelLines.push(pl);
+            for (const l of LEVEL_DEFS) {
+                const val = levels[l.key];
+                if (val !== null && val !== undefined) {
+                    if (engineLevelLines[l.key]) {
+                        // Update existing price line in place
+                        engineLevelLines[l.key].applyOptions({ price: val });
+                    } else {
+                        // Create once
+                        engineLevelLines[l.key] = candleSeries.createPriceLine({
+                            price: val, color: l.color,
+                            lineWidth: 1, lineStyle: 1,
+                            axisLabelVisible: true, title: l.title,
+                        });
+                    }
+                } else if (engineLevelLines[l.key]) {
+                    // Level no longer exists, remove it
+                    try { candleSeries.removePriceLine(engineLevelLines[l.key]); } catch (e) {}
+                    delete engineLevelLines[l.key];
                 }
             }
+        }
+
+        function clearLevelLines() {
+            if (candleSeries) {
+                for (const key of Object.keys(engineLevelLines)) {
+                    try { candleSeries.removePriceLine(engineLevelLines[key]); } catch (e) {}
+                }
+            }
+            engineLevelLines = {};
         }
 
         // Dashboard toggle
