@@ -29,12 +29,8 @@ export class SupertrendIndicator {
         this.upSeries = null;
         this.downSeries = null;
 
-        // Marker arrays
-        this.markers = [];
-
         // State tracking
         this.lastDirection = 0;
-        this.lastLargerDirection = 0;
         this.bars = [];
 
         // Throttle: only full recalc on new bars, not every tick
@@ -46,8 +42,6 @@ export class SupertrendIndicator {
         this.colors = {
             bullish: '#4CAF50',
             bearish: '#FF5252',
-            buySignal: 'rgba(0, 230, 118, 1)',
-            sellSignal: 'rgba(255, 82, 82, 1)',
         };
     }
 
@@ -122,34 +116,6 @@ export class SupertrendIndicator {
         return { supertrend, direction, upperBand, lowerBand };
     }
 
-    detectSignals(direction, largerDirection) {
-        const buySignals = [];
-        const sellSignals = [];
-
-        for (let i = 1; i < direction.length; i++) {
-            const largerBullish = largerDirection[i] === 1;
-            const currentBullish = direction[i] === 1;
-            const prevBullish = direction[i - 1] === 1;
-            const largerPrevBullish = largerDirection[i - 1] === 1;
-
-            const crossToBullish = !prevBullish && currentBullish;
-            const largerCrossToBullish = !largerPrevBullish && largerBullish;
-
-            if ((largerBullish && crossToBullish) || (currentBullish && largerCrossToBullish)) {
-                buySignals.push(i);
-            }
-
-            const wasBothBullish = prevBullish && largerPrevBullish;
-            const nowOneBearish = !currentBullish || !largerBullish;
-
-            if (wasBothBullish && nowOneBearish) {
-                sellSignals.push(i);
-            }
-        }
-
-        return { buySignals, sellSignals };
-    }
-
     /**
      * Initialize the indicator with data
      */
@@ -162,7 +128,7 @@ export class SupertrendIndicator {
         this.remove();
         this.bars = [...bars];
 
-        const { upData, downData, markers } = this._computeAllData(bars);
+        const { upData, downData } = this._computeAllData(bars);
 
         this.upSeries = this.chart.addLineSeries({
             lastValueVisible: false,
@@ -182,18 +148,7 @@ export class SupertrendIndicator {
         this.upSeries.setData(upData);
         this.downSeries.setData(downData);
 
-        // Apply markers
-        this.markers = markers;
-        if (this.markers.length > 0 && this.candleSeries) {
-            try {
-                this.markers.sort((a, b) => a.time - b.time);
-                this.candleSeries.setMarkers(this.markers);
-            } catch (e) {
-                console.warn('Error setting markers:', e);
-            }
-        }
-
-        console.log(`Supertrend initialized: ${bars.length} bars, ${markers.length} signals`);
+        console.log(`Supertrend initialized: ${bars.length} bars`);
     }
 
     /**
@@ -201,10 +156,6 @@ export class SupertrendIndicator {
      */
     _computeAllData(bars) {
         const st1 = this.calculateSupertrend(bars, this.settings.factor, this.settings.atrLength);
-
-        const aggregatedBars = this.aggregateBars(bars, this.settings.largerTimeframeMultiplier);
-        const st2 = this.calculateSupertrend(aggregatedBars, this.settings.largerFactor, this.settings.largerAtrLength);
-        const expandedSt2 = this.expandToOriginalTimeframe(st2, bars.length, this.settings.largerTimeframeMultiplier);
 
         // Two series (up/down), both have a point at every timestamp.
         // Active direction: real color. Inactive: transparent color.
@@ -227,38 +178,9 @@ export class SupertrendIndicator {
             }
         }
 
-        // Detect signals (uses larger TF internally for signal logic)
-        const signals = this.detectSignals(st1.direction, expandedSt2.direction);
-        const markers = [];
-
-        for (const idx of signals.buySignals) {
-            if (idx < bars.length) {
-                markers.push({
-                    time: bars[idx].time,
-                    position: 'belowBar',
-                    color: this.colors.buySignal,
-                    shape: 'arrowUp',
-                    size: 1,
-                });
-            }
-        }
-
-        for (const idx of signals.sellSignals) {
-            if (idx < bars.length) {
-                markers.push({
-                    time: bars[idx].time,
-                    position: 'aboveBar',
-                    color: this.colors.sellSignal,
-                    shape: 'arrowDown',
-                    size: 1,
-                });
-            }
-        }
-
         this.lastDirection = st1.direction[st1.direction.length - 1];
-        this.lastLargerDirection = expandedSt2.direction[expandedSt2.direction.length - 1];
 
-        return { upData, downData, markers };
+        return { upData, downData };
     }
 
     /**
@@ -287,17 +209,11 @@ export class SupertrendIndicator {
         if (!this.upSeries || !this.bars || this.bars.length < 20) return;
         this._lastFullRecalcTime = Date.now();
 
-        const { upData, downData, markers } = this._computeAllData(this.bars);
+        const { upData, downData } = this._computeAllData(this.bars);
 
         try {
             this.upSeries.setData(upData);
             this.downSeries.setData(downData);
-
-            this.markers = markers;
-            if (this.markers.length > 0 && this.candleSeries) {
-                this.markers.sort((a, b) => a.time - b.time);
-                this.candleSeries.setMarkers(this.markers);
-            }
         } catch (e) {
             console.warn('Error updating supertrend:', e);
         }
@@ -360,10 +276,6 @@ export class SupertrendIndicator {
                 this.chart.removeSeries(this.downSeries);
                 this.downSeries = null;
             }
-            if (this.candleSeries) {
-                this.candleSeries.setMarkers([]);
-            }
-            this.markers = [];
             this.bars = [];
         } catch (e) {
             console.warn('Error removing supertrend series:', e);
