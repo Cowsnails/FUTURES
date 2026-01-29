@@ -475,24 +475,22 @@ export function detectDivergence(bars, rsiValues, lookback = 5) {
  * Convert UTC timestamp to Eastern Time minutes-of-day.
  * Properly detects EDT (UTC-4) vs EST (UTC-5) using JS Date.
  */
+const _etFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', hour12: false
+});
+
 function getETMinutes(unixSeconds) {
     const d = new Date(unixSeconds * 1000);
-    // Use Intl to get actual ET offset (handles DST automatically)
-    // Fallback: compute from local timezone offset of the date itself
-    // JS getTimezoneOffset() returns offset for the DATE's timezone, not current
-    // We need ET specifically, so we use a trick: format in America/New_York
-    try {
-        const etStr = d.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false });
-        const parts = etStr.split(', ')[1].split(':');
-        return parseInt(parts[0]) * 60 + parseInt(parts[1]);
-    } catch (e) {
-        // Fallback: assume EDT (UTC-4) Mar-Nov, EST (UTC-5) Nov-Mar
-        const month = d.getUTCMonth(); // 0-based
-        const isEDT = month >= 2 && month <= 10; // Mar(2) through Nov(10)
-        const offset = isEDT ? 4 : 5;
-        const etH = (d.getUTCHours() - offset + 24) % 24;
-        return etH * 60 + d.getUTCMinutes();
+    const parts = _etFormatter.formatToParts(d);
+    let h = 0, m = 0;
+    for (const p of parts) {
+        if (p.type === 'hour') h = parseInt(p.value);
+        if (p.type === 'minute') m = parseInt(p.value);
     }
+    // hour12:false can give 24 for midnight
+    if (h === 24) h = 0;
+    return h * 60 + m;
 }
 
 function getETHour(unixSeconds) {
