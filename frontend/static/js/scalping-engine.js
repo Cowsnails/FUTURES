@@ -368,13 +368,17 @@ export function scoreADX(adx) {
 }
 
 /**
- * Category-weighted confluence per doc:
- *   Mean Reversion: 0.35 weight (VWAP z-score + RSI)
- *   Momentum: 0.25 weight (RSI direction + price acceleration)
- *   Trend: 0.30 weight (Supertrend + EMA)
+ * Category-weighted confluence per doc + pattern matching:
+ *   Mean Reversion: 0.30 weight (VWAP z-score + RSI)
+ *   Momentum: 0.20 weight (RSI direction + price acceleration)
+ *   Trend: 0.25 weight (Supertrend + EMA)
  *   Volume: 0.10 weight
+ *   Pattern: 0.15 weight (historical intraday pattern match)
+ *
+ * When no pattern signal is available, weights revert to original
+ * (MR 0.35, Mom 0.25, Trend 0.30, Vol 0.10).
  */
-export function computeConfluence(indicators, regime) {
+export function computeConfluence(indicators, regime, patternSignal = null) {
     const { vwapResult, rsiVal, rsiPrev, close, closePrev2, stDirection, ema9Val, volume, volSMA20 } = indicators;
 
     // Mean Reversion Score
@@ -395,13 +399,22 @@ export function computeConfluence(indicators, regime) {
     // Volume Score
     const volScore = scoreVolume(volume, volSMA20);
 
-    // Weighted total
-    const total = mrScore * 0.35 + momScore * 0.25 + trendScore * 0.30 + volScore * 0.10;
+    // Pattern Score (from backend pattern matcher, -1 to +1)
+    const hasPattern = patternSignal !== null && patternSignal !== 0;
+    const patScore = hasPattern ? Math.abs(patternSignal) : 0;
+
+    // Weighted total — use 5-category weights when pattern available, else 4-category
+    let total;
+    if (hasPattern) {
+        total = mrScore * 0.30 + momScore * 0.20 + trendScore * 0.25 + volScore * 0.10 + patScore * 0.15;
+    } else {
+        total = mrScore * 0.35 + momScore * 0.25 + trendScore * 0.30 + volScore * 0.10;
+    }
 
     return {
         total,
-        components: { meanReversion: mrScore, momentum: momScore, trend: trendScore, volume: volScore },
-        raw: { vwap: vwapResult.score, rsi: mrRsi, ema: emaScore, adx: scoreADX(indicators.adxVal), vol: volScore }
+        components: { meanReversion: mrScore, momentum: momScore, trend: trendScore, volume: volScore, pattern: patScore },
+        raw: { vwap: vwapResult.score, rsi: mrRsi, ema: emaScore, adx: scoreADX(indicators.adxVal), vol: volScore, pattern: hasPattern ? patternSignal : 0 }
     };
 }
 
@@ -737,7 +750,7 @@ export class ScalpingEngine {
      * @param {Object[]} allBars - full bar history
      * @param {boolean} renderOverlays - if true, build full series arrays for chart
      */
-    compute(allBars, renderOverlays = true, sessionOverride = false) {
+    compute(allBars, renderOverlays = true, sessionOverride = false, patternSignal = null) {
         this.bars = allBars;
         const totalLen = allBars.length;
         if (totalLen < 30) return null;
@@ -806,7 +819,7 @@ export class ScalpingEngine {
             vwapResult: vwapScoreResult, rsiVal: rsi7[wi], rsiPrev, close: bar.close, closePrev2,
             stDirection, ema9Val: ema9[wi], volume: bar.volume, volSMA20: volSMA20[wi],
             adxVal: adx10[wi],
-        }, regime);
+        }, regime, patternSignal);
 
         // ── Edge case detectors ──
         const choppy = isChoppyMarket(adx10[wi], chop14[wi], atrPercentile[wi], wBars);

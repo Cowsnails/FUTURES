@@ -91,6 +91,7 @@ from .security import (
     validate_bar_size,
     validate_indicator_params
 )
+from .pattern_matcher import PatternMatchEngine
 
 # Configure logging
 logging.basicConfig(
@@ -115,6 +116,10 @@ indicator_manager: Optional[IndicatorManager] = None
 # Structure: { 'MNQ': { '1min': [...], '5min': [...], ... }, ... }
 preloaded_data: Dict[str, Dict[str, list]] = {}
 TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
+
+# Pattern matching engines per symbol
+pattern_engines: Dict[str, PatternMatchEngine] = {}
+pattern_task: Optional[asyncio.Task] = None
 
 
 class ConnectionManager:
@@ -367,6 +372,144 @@ async def prefetch_all_tickers():
     logger.info(f"✓ Preloaded {total_bars:,} total bars into memory for instant switching")
 
 
+def initialize_pattern_engines():
+    """
+    Build PatternMatchEngine for each symbol from preloaded 1-min data.
+    Splits the 1-min bars into per-day arrays (RTH: 9:30-16:00 ET).
+    """
+    import pytz
+    from datetime import datetime as dt
+
+    for symbol in ['MNQ', 'MES', 'MGC']:
+        bars = preloaded_data.get(symbol, {}).get('1min', [])
+        if not bars:
+            logger.warning(f"Pattern matcher: no 1-min data for {symbol}")
+            continue
+
+        # Group bars by trading day (bar.time is ET-as-UTC unix seconds)
+        days_map = {}  # date_str -> list of bars
+        for b in bars:
+            # bar.time is Eastern time encoded as UTC timestamp
+            d = dt.utcfromtimestamp(b['time'])
+            h, m = d.hour, d.minute
+            # RTH filter: 9:30 - 16:00 ET
+            minutes = h * 60 + m
+            if minutes < 570 or minutes >= 960:  # 9:30=570, 16:00=960
+                continue
+            date_key = d.strftime('%Y-%m-%d')
+            if date_key not in days_map:
+                days_map[date_key] = []
+            days_map[date_key].append(b)
+
+        # Sort dates, take last 60 trading days
+        sorted_dates = sorted(days_map.keys())
+        if len(sorted_dates) > 61:
+            # Keep 61 so we have prior_close for the first day
+            sorted_dates = sorted_dates[-61:]
+
+        daily_bars_list = []
+        for i, date_key in enumerate(sorted_dates):
+            day_bars = sorted(days_map[date_key], key=lambda x: x['time'])
+            prior_close = 0.0
+            if i > 0:
+                prev_date = sorted_dates[i - 1]
+                prev_bars = days_map[prev_date]
+                if prev_bars:
+                    prior_close = sorted(prev_bars, key=lambda x: x['time'])[-1]['close']
+
+            daily_bars_list.append({
+                'date': date_key,
+                'bars': day_bars,
+                'prior_close': prior_close,
+            })
+
+        # Skip the first day if we used it just for prior_close
+        if len(daily_bars_list) > 60:
+            daily_bars_list = daily_bars_list[1:]
+
+        engine = PatternMatchEngine()
+        engine.load_historical_data(daily_bars_list)
+        pattern_engines[symbol] = engine
+        logger.info(f"✓ Pattern matcher for {symbol}: {engine.num_days} days loaded")
+
+
+async def pattern_match_loop():
+    """
+    Background task: run pattern matching every 5 minutes during RTH.
+    Broadcasts results to all connected WebSocket clients.
+    """
+    import pytz
+    from datetime import datetime as dt, time as dtime
+
+    eastern = pytz.timezone('US/Eastern')
+
+    while True:
+        try:
+            now_et = dt.now(eastern)
+            # Only run 10:00 AM - 2:00 PM ET on weekdays
+            if now_et.weekday() < 5:
+                current_minutes = now_et.hour * 60 + now_et.minute
+                if 600 <= current_minutes < 840:  # 10:00 - 14:00
+                    await run_all_pattern_matches()
+
+            # Sleep 5 minutes
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            logger.info("Pattern match loop cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Pattern match loop error: {e}")
+            await asyncio.sleep(60)
+
+
+async def run_all_pattern_matches():
+    """Run pattern matching for all symbols and broadcast results."""
+    from datetime import datetime as dt
+    import pytz
+    eastern = pytz.timezone('US/Eastern')
+
+    for symbol, engine in pattern_engines.items():
+        try:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if not bars_1min:
+                continue
+
+            # Get today's RTH bars
+            now_et = dt.now(eastern)
+            today_str = now_et.strftime('%Y-%m-%d')
+
+            today_bars = []
+            prior_close = 0.0
+            for b in bars_1min:
+                d = dt.utcfromtimestamp(b['time'])
+                date_key = d.strftime('%Y-%m-%d')
+                minutes = d.hour * 60 + d.minute
+                if date_key == today_str and 570 <= minutes < 960:
+                    today_bars.append(b)
+                elif date_key < today_str:
+                    prior_close = b['close']
+
+            today_bars.sort(key=lambda x: x['time'])
+
+            if len(today_bars) < 30:
+                continue
+
+            result = engine.run_match(today_bars, prior_close)
+            if result:
+                result['symbol'] = symbol
+                result['type'] = 'pattern_update'
+                # Broadcast to all connected clients
+                await connection_manager.broadcast(
+                    symbol, result, immediate=True
+                )
+                logger.info(
+                    f"Pattern match {symbol}: {result['match_count']} matches, "
+                    f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
+                )
+        except Exception as e:
+            logger.error(f"Pattern match error for {symbol}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
@@ -411,12 +554,27 @@ async def lifespan(app: FastAPI):
         logger.info("Pre-fetching historical data for all tickers...")
         await prefetch_all_tickers()
 
+        # Initialize pattern matching engines from preloaded data
+        logger.info("Initializing pattern matching engines...")
+        initialize_pattern_engines()
+
+        # Start pattern matching background loop
+        global pattern_task
+        pattern_task = asyncio.create_task(pattern_match_loop())
+
         logger.info("Application started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down application...")
+
+    if pattern_task:
+        pattern_task.cancel()
+        try:
+            await pattern_task
+        except asyncio.CancelledError:
+            pass
 
     if realtime_manager:
         realtime_manager.stop_all_streams()
@@ -538,6 +696,35 @@ async def list_timeframes():
             {"value": "4H", "label": "4 Hours", "seconds": 14400}
         ]
     }
+
+
+@app.get("/api/pattern/{symbol}")
+async def get_pattern_match(symbol: str):
+    """Get latest pattern match results for a symbol."""
+    if symbol not in pattern_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No pattern engine for {symbol}"}
+        )
+    engine = pattern_engines[symbol]
+    if engine.latest_result is None:
+        return {"status": "no_results", "message": "Pattern matching hasn't run yet"}
+    return engine.latest_result
+
+
+@app.post("/api/pattern/{symbol}/run")
+async def trigger_pattern_match(symbol: str):
+    """Manually trigger pattern matching for a symbol (for testing)."""
+    if symbol not in pattern_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No pattern engine for {symbol}"}
+        )
+    await run_all_pattern_matches()
+    engine = pattern_engines[symbol]
+    if engine.latest_result:
+        return engine.latest_result
+    return {"status": "no_results", "message": "Not enough data for matching"}
 
 
 @app.get("/api/cache/{symbol}")

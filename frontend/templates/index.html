@@ -452,13 +452,23 @@
                 <div class="dash-row"><span>ORH</span><span class="dash-val" id="dash-orh">—</span></div>
                 <div class="dash-row"><span>ORL</span><span class="dash-val" id="dash-orl">—</span></div>
             </div>
+            <div class="dash-section">
+                <div class="dash-label">Pattern Match</div>
+                <div class="dash-row"><span>Status</span><span class="dash-val" id="dash-pm-status" style="color:#758696">waiting</span></div>
+                <div class="dash-row"><span>Direction</span><span class="dash-val" id="dash-pm-dir">—</span></div>
+                <div class="dash-row"><span>Consensus</span><span class="dash-val" id="dash-pm-consensus">—</span></div>
+                <div class="dash-row"><span>Avg Corr</span><span class="dash-val" id="dash-pm-corr">—</span></div>
+                <div class="dash-row"><span>Mean Move</span><span class="dash-val" id="dash-pm-move">—</span></div>
+                <div class="dash-row"><span>Matches</span><span class="dash-val" id="dash-pm-count">—</span></div>
+                <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-pm-signal">—</span></div>
+            </div>
         </div>
     </div>
 
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
         import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=8';
-        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=6';
+        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=7';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -813,6 +823,10 @@
                 case 'error':
                     hideLoading();  // CRITICAL: Hide loading overlay on error!
                     showError(msg.message);
+                    break;
+
+                case 'pattern_update':
+                    handlePatternUpdate(msg);
                     break;
 
                 case 'ping':
@@ -1285,7 +1299,7 @@
 
             if (isNewBar) {
                 // New bar: full compute + overlays
-                const state = scalpingEngine.compute(bars, true, sessionOverride);
+                const state = scalpingEngine.compute(bars, true, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
                 updateDashboard(state);
                 renderEngineOverlays(bars, state);
@@ -1294,7 +1308,7 @@
                 const now = Date.now();
                 if (now - engineThrottleTime < ENGINE_THROTTLE_MS) return;
                 engineThrottleTime = now;
-                const state = scalpingEngine.compute(bars, false, sessionOverride);
+                const state = scalpingEngine.compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
                 updateDashboard(state);
             }
@@ -1520,6 +1534,112 @@
                 btn.style.color = '#ef5350';
             }
         });
+
+        // ═══════════════════════════════════════════════════════════
+        // PATTERN MATCHING OVERLAY
+        // ═══════════════════════════════════════════════════════════
+        const patternOverlayColors = [
+            'rgba(255, 82, 82, 0.45)',
+            'rgba(255, 193, 7, 0.45)',
+            'rgba(76, 175, 80, 0.45)',
+            'rgba(33, 150, 243, 0.45)',
+            'rgba(156, 39, 176, 0.45)',
+        ];
+        let patternOverlaySeries = [];
+        let latestPatternData = null;
+
+        function handlePatternUpdate(msg) {
+            latestPatternData = msg;
+
+            // Update dashboard panel
+            const f = msg.forecast;
+            if (f) {
+                const dirEl = document.getElementById('dash-pm-dir');
+                if (f.direction_signal > 0.1) {
+                    dirEl.textContent = '↑ Bullish';
+                    dirEl.className = 'dash-val pos';
+                } else if (f.direction_signal < -0.1) {
+                    dirEl.textContent = '↓ Bearish';
+                    dirEl.className = 'dash-val neg';
+                } else {
+                    dirEl.textContent = '— Neutral';
+                    dirEl.className = 'dash-val neutral';
+                }
+                document.getElementById('dash-pm-consensus').textContent = f.consensus;
+                document.getElementById('dash-pm-corr').textContent = (f.avg_correlation * 100).toFixed(0) + '%';
+                document.getElementById('dash-pm-move').textContent = f.mean_move > 0
+                    ? '+' + f.mean_move.toFixed(2) + '%'
+                    : f.mean_move.toFixed(2) + '%';
+                document.getElementById('dash-pm-move').className = 'dash-val ' + (f.mean_move > 0 ? 'pos' : f.mean_move < 0 ? 'neg' : 'neutral');
+                document.getElementById('dash-pm-count').textContent = `${f.sample_size}/${msg.filtered_day_count}`;
+
+                const sigEl = document.getElementById('dash-pm-signal');
+                sigEl.textContent = f.confluence_score.toFixed(3);
+                sigEl.className = 'dash-val ' + (f.confluence_score > 0.05 ? 'pos' : f.confluence_score < -0.05 ? 'neg' : 'neutral');
+
+                document.getElementById('dash-pm-status').textContent = 'active';
+                document.getElementById('dash-pm-status').style.color = '#26a69a';
+            } else {
+                document.getElementById('dash-pm-status').textContent = 'no match';
+                document.getElementById('dash-pm-status').style.color = '#ef5350';
+            }
+
+            // Render chart overlays
+            renderPatternOverlays(msg);
+        }
+
+        function renderPatternOverlays(msg) {
+            if (!chart || !msg.matches || msg.matches.length === 0) return;
+
+            // Remove old overlay series
+            for (const s of patternOverlaySeries) {
+                try { chart.removeSeries(s); } catch (e) {}
+            }
+            patternOverlaySeries = [];
+
+            // Get the last bar's time and price as anchor point
+            const bars = candleSeries.data ? candleSeries.data() : [];
+            if (!bars || bars.length === 0) return;
+            const lastBar = bars[bars.length - 1];
+            const anchorTime = lastBar.time;
+            const anchorPrice = lastBar.close;
+
+            // Create a line series for each matched day's projection
+            for (let mi = 0; mi < Math.min(msg.matches.length, 5); mi++) {
+                const match = msg.matches[mi];
+                const returns = match.projection_returns;
+                if (!returns || returns.length === 0) continue;
+
+                const color = patternOverlayColors[mi % patternOverlayColors.length];
+                const lineWidth = match.correlation >= 0.90 ? 2 : 1;
+
+                const series = chart.addLineSeries({
+                    color: color,
+                    lineWidth: lineWidth,
+                    priceLineVisible: false,
+                    lastValueVisible: false,
+                    crosshairMarkerVisible: false,
+                });
+
+                // Map returns to projected prices starting from anchor
+                const projData = [];
+                for (let i = 0; i < returns.length; i++) {
+                    const projTime = anchorTime + (i + 1) * 60; // 1-minute bars
+                    const projPrice = anchorPrice * (1 + returns[i] / 100);
+                    projData.push({ time: projTime, value: projPrice });
+                }
+                series.setData(projData);
+                patternOverlaySeries.push(series);
+            }
+        }
+
+        function clearPatternOverlays() {
+            for (const s of patternOverlaySeries) {
+                try { chart.removeSeries(s); } catch (e) {}
+            }
+            patternOverlaySeries = [];
+            latestPatternData = null;
+        }
 
         // ═══════════════════════════════════════════════════════════
         // EVENT HANDLERS
