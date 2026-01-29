@@ -15,7 +15,7 @@ import pytz
 
 from .historical_data import HistoricalDataFetcher
 from .cache import DataCache
-from .contracts import get_current_contract
+from .contracts import create_continuous_contract
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +158,10 @@ async def _grab_loop(
     _grabber_state['batch_number'] = 0
 
     try:
-        contract = get_current_contract(symbol)
+        # Use continuous contract to fetch across multiple expirations
+        contract = create_continuous_contract(symbol)
         await ib.qualifyContractsAsync(contract)
+        logger.info(f"[DataGrab] Using continuous contract: {contract}")
 
         # Find earliest date in existing cache
         existing = cache.load(symbol, bar_size='1min', max_age_hours=None)
