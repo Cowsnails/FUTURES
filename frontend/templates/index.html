@@ -457,7 +457,7 @@
     <script type="module">
         import { createChart, ColorType } from 'https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.mjs';
         import { IndicatorRenderer, IndicatorManager, SupertrendIndicator } from '/static/js/indicators.js?v=8';
-        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=2';
+        import { ScalpingEngine } from '/static/js/scalping-engine.js?v=3';
 
         // ═══════════════════════════════════════════════════════════
         // TRADINGVIEW EXACT COLOR SCHEME
@@ -931,7 +931,7 @@
                 }
             }
 
-            // Run scalping engine on historical data
+            // Run scalping engine on historical data (treat as new bar for full render)
             runScalpingEngine(sortedData, true);
 
             // Render indicators if present
@@ -1033,7 +1033,7 @@
                     runScalpingEngine(historicalBars, true);
                 } else {
                     historicalBars[historicalBars.length - 1] = incomingBar;
-                    runScalpingEngine(historicalBars);
+                    runScalpingEngine(historicalBars, false);
                 }
             } else {
                 // For higher timeframes, aggregate 1-minute bars
@@ -1088,7 +1088,7 @@
                         runScalpingEngine(historicalBars, true);
                     } else if (historicalBars.length > 0) {
                         historicalBars[historicalBars.length - 1] = result.partialBar;
-                        runScalpingEngine(historicalBars);
+                        runScalpingEngine(historicalBars, false);
                     }
                 }
             }
@@ -1279,21 +1279,23 @@
         let engineSeriesInitialized = false;
         let lastOverlayBarCount = 0;
 
-        function runScalpingEngine(bars, force = false) {
+        function runScalpingEngine(bars, isNewBar = false) {
             if (!bars || bars.length < 30) return;
-            const now = Date.now();
-            if (!force && now - engineThrottleTime < ENGINE_THROTTLE_MS) return;
-            engineThrottleTime = now;
 
-            const state = scalpingEngine.compute(bars);
-            if (!state) return;
-
-            updateDashboard(state);
-
-            // Only update chart overlays on new bars (not ticks) to avoid lag
-            if (force || bars.length !== lastOverlayBarCount) {
-                lastOverlayBarCount = bars.length;
+            if (isNewBar) {
+                // New bar: full compute + overlays
+                const state = scalpingEngine.compute(bars, true);
+                if (!state) return;
+                updateDashboard(state);
                 renderEngineOverlays(bars, state);
+            } else {
+                // Tick update: throttle, compute without overlays
+                const now = Date.now();
+                if (now - engineThrottleTime < ENGINE_THROTTLE_MS) return;
+                engineThrottleTime = now;
+                const state = scalpingEngine.compute(bars, false);
+                if (!state) return;
+                updateDashboard(state);
             }
         }
 
@@ -1402,7 +1404,7 @@
         }
 
         function renderEngineOverlays(bars, state) {
-            if (!chart || !state || !state.series) return;
+            if (!chart || !state || !state.series || !bars) return;
 
             // Lazily create series once
             if (!engineSeriesInitialized) {
