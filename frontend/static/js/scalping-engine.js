@@ -368,13 +368,17 @@ export function scoreADX(adx) {
 }
 
 /**
- * Category-weighted confluence per doc:
- *   Mean Reversion: 0.35 weight (VWAP z-score + RSI)
- *   Momentum: 0.25 weight (RSI direction + price acceleration)
- *   Trend: 0.30 weight (Supertrend + EMA)
+ * Category-weighted confluence per doc + pattern matching:
+ *   Mean Reversion: 0.30 weight (VWAP z-score + RSI)
+ *   Momentum: 0.20 weight (RSI direction + price acceleration)
+ *   Trend: 0.25 weight (Supertrend + EMA)
  *   Volume: 0.10 weight
+ *   Pattern: 0.15 weight (historical intraday pattern match)
+ *
+ * When no pattern signal is available, weights revert to original
+ * (MR 0.35, Mom 0.25, Trend 0.30, Vol 0.10).
  */
-export function computeConfluence(indicators, regime) {
+export function computeConfluence(indicators, regime, patternSignal = null) {
     const { vwapResult, rsiVal, rsiPrev, close, closePrev2, stDirection, ema9Val, volume, volSMA20 } = indicators;
 
     // Mean Reversion Score
@@ -395,13 +399,22 @@ export function computeConfluence(indicators, regime) {
     // Volume Score
     const volScore = scoreVolume(volume, volSMA20);
 
-    // Weighted total
-    const total = mrScore * 0.35 + momScore * 0.25 + trendScore * 0.30 + volScore * 0.10;
+    // Pattern Score (from backend pattern matcher, -1 to +1)
+    const hasPattern = patternSignal !== null && patternSignal !== 0;
+    const patScore = hasPattern ? Math.abs(patternSignal) : 0;
+
+    // Weighted total — use 5-category weights when pattern available, else 4-category
+    let total;
+    if (hasPattern) {
+        total = mrScore * 0.30 + momScore * 0.20 + trendScore * 0.25 + volScore * 0.10 + patScore * 0.15;
+    } else {
+        total = mrScore * 0.35 + momScore * 0.25 + trendScore * 0.30 + volScore * 0.10;
+    }
 
     return {
         total,
-        components: { meanReversion: mrScore, momentum: momScore, trend: trendScore, volume: volScore },
-        raw: { vwap: vwapResult.score, rsi: mrRsi, ema: emaScore, adx: scoreADX(indicators.adxVal), vol: volScore }
+        components: { meanReversion: mrScore, momentum: momScore, trend: trendScore, volume: volScore, pattern: patScore },
+        raw: { vwap: vwapResult.score, rsi: mrRsi, ema: emaScore, adx: scoreADX(indicators.adxVal), vol: volScore, pattern: hasPattern ? patternSignal : 0 }
     };
 }
 
@@ -471,18 +484,25 @@ export function detectDivergence(bars, rsiValues, lookback = 5) {
     return 'NONE';
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SESSION-ADAPTIVE RSI THRESHOLDS (from doc)
-// ═══════════════════════════════════════════════════════════════════════════
+/**
+ * Convert UTC timestamp to Eastern Time minutes-of-day.
+ * Properly detects EDT (UTC-4) vs EST (UTC-5) using JS Date.
+ */
+// bar.time from backend is ET disguised as UTC (Eastern time stamped as UTC)
+// So use getUTCHours/getUTCMinutes to read the ET values directly
+function getETMinutes(unixSeconds) {
+    const d = new Date(unixSeconds * 1000);
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+function getETHour(unixSeconds) {
+    return Math.floor(getETMinutes(unixSeconds) / 60);
+}
 
 export function getSessionThresholds(unixSeconds) {
-    const d = new Date(unixSeconds * 1000);
-    const etH = (d.getUTCHours() - 5 + 24) % 24;
-    // Market open 9-11 ET
+    const etH = getETHour(unixSeconds);
     if (etH >= 9 && etH < 11) return { overbought: 80, oversold: 20 };
-    // Midday 11-14 ET — tighter mean reversion
     if (etH >= 11 && etH < 14) return { overbought: 65, oversold: 35 };
-    // Power hour + default
     return { overbought: 75, oversold: 25 };
 }
 
@@ -491,9 +511,7 @@ export function getSessionThresholds(unixSeconds) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export function sessionFilter(unixSeconds) {
-    const d = new Date(unixSeconds * 1000);
-    const etH = (d.getUTCHours() - 5 + 24) % 24;
-    const etMinutes = etH * 60 + d.getUTCMinutes();
+    const etMinutes = getETMinutes(unixSeconds);
 
     if (etMinutes >= 570 && etMinutes < 690) return { tradeable: true, session: 'morning_prime', quality: 1.0 };
     if (etMinutes >= 840 && etMinutes < 945) return { tradeable: true, session: 'afternoon_prime', quality: 0.9 };
@@ -586,8 +604,8 @@ export function evaluateScalpEntry(data) {
         choppy: false,
     };
 
-    // LAYER 1: Time Filter
-    if (isNoTradeWindow(data.time)) {
+    // LAYER 1: Time Filter (skipped if sessionOverride is active)
+    if (!data.sessionOverride && isNoTradeWindow(data.time)) {
         result.reason = `Time filter: ${sessionFilter(data.time).session}`;
         return result;
     }
@@ -715,119 +733,162 @@ export class ScalpingEngine {
     constructor() {
         this.bars = [];
         this.state = null;
+        this._cachedLevels = null;
+        this._levelsBarCount = 0;
     }
 
-    compute(bars) {
-        this.bars = bars;
-        if (bars.length < 30) return null;
+    /**
+     * PERFORMANCE-OPTIMIZED compute.
+     *
+     * Problem: 51k bars × 10+ indicator passes = millions of ops per call.
+     * Solution:
+     *   - Indicators (EMA, RSI, ADX, ATR, Vol SMA, Chop, ATR%): last 500 bars only
+     *   - VWAP: needs full day, but we find today's start and only compute from there
+     *   - Session levels: cached, only recomputed every 100 new bars
+     *   - Series arrays for chart overlays: only built when renderOverlays=true (new bars)
+     *
+     * @param {Object[]} allBars - full bar history
+     * @param {boolean} renderOverlays - if true, build full series arrays for chart
+     */
+    compute(allBars, renderOverlays = true, sessionOverride = false, patternSignal = null) {
+        this.bars = allBars;
+        const totalLen = allBars.length;
+        if (totalLen < 30) return null;
 
-        const closes = bars.map(b => b.close);
-        const len = bars.length;
-        const i = len - 1;
-        const bar = bars[i];
+        // ── Windowed bars for indicators (last 500) ──
+        const WINDOW = 500;
+        const windowStart = Math.max(0, totalLen - WINDOW);
+        const wBars = allBars.slice(windowStart);
+        const wCloses = wBars.map(b => b.close);
+        const wLen = wBars.length;
+        const wi = wLen - 1; // index of latest bar in window
+        const bar = wBars[wi];
 
-        // Phase 1: Core indicators
-        const ema9 = calcEMA(closes, 9);
-        const rsi7 = calcRSI(closes, 7);
-        const { adx: adx10, plusDI, minusDI } = calcADX(bars, 10);
-        const atr10 = calcATR(bars, 10);
-        const atrSMA20 = calcSMA(atr10.filter(v => v !== null).length > 0 ? atr10 : new Array(len).fill(null), 20);
-        const volSMA20 = calcVolumeSMA(bars, 20);
-        const { vwap, upper1, lower1, upper2, lower2, stdDev: vwapStdDev } = calcVWAP(bars);
-        const chop14 = calcChoppiness(bars, 14);
-        const atrPercentile = calcATRPercentile(atr10);
+        // ── Core indicators on windowed data ──
+        const ema9 = calcEMA(wCloses, 9);
+        const rsi7 = calcRSI(wCloses, 7);
+        const { adx: adx10, plusDI, minusDI } = calcADX(wBars, 10);
+        const atr10 = calcATR(wBars, 10);
+        const atrSMA20 = calcSMA(atr10, 20);
+        const volSMA20 = calcVolumeSMA(wBars, 20);
+        const chop14 = calcChoppiness(wBars, 14);
+        const atrPercentile = calcATRPercentile(atr10, 100);
 
-        // Phase 2: Session levels
-        const levels = calcSessionLevels(bars);
+        // ── VWAP: only compute from today's start ──
+        // Find today's first bar (same UTC date as last bar)
+        const lastDate = new Date(bar.time * 1000);
+        const lastDay = lastDate.getUTCFullYear() * 10000 + (lastDate.getUTCMonth() + 1) * 100 + lastDate.getUTCDate();
+        let todayStart = totalLen - 1;
+        for (let j = totalLen - 1; j >= 0; j--) {
+            const d = new Date(allBars[j].time * 1000);
+            const day = d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+            if (day !== lastDay) { todayStart = j + 1; break; }
+            if (j === 0) todayStart = 0;
+        }
+        const todayBars = allBars.slice(todayStart);
+        const vwapResult = calcVWAP(todayBars);
+        const vwapI = todayBars.length - 1;
+        const vwapVal = vwapResult.vwap[vwapI];
+        const vwapSD = vwapResult.stdDev[vwapI];
 
-        // Phase 3: Regime
-        const regime = detectRegime(adx10[i], atr10[i], atrSMA20[i], chop14[i]);
+        // ── Session levels: cache, recompute only every 100 bars ──
+        if (!this._cachedLevels || totalLen - this._levelsBarCount > 100) {
+            // Only need last 3 days of data for levels
+            const threeDaysAgo = bar.time - 3 * 86400;
+            let levelsStart = totalLen - 1;
+            for (let j = totalLen - 1; j >= 0; j--) {
+                if (allBars[j].time < threeDaysAgo) { levelsStart = j; break; }
+                if (j === 0) levelsStart = 0;
+            }
+            this._cachedLevels = calcSessionLevels(allBars.slice(levelsStart));
+            this._levelsBarCount = totalLen;
+        }
+        const levels = this._cachedLevels;
 
-        // Phase 4: Scoring (doc's exact functions)
-        const vwapResult = scoreVWAP(bar.close, vwap[i], vwapStdDev[i]);
-        const rsiPrev = i >= 2 ? rsi7[i - 1] : null;
-        const closePrev2 = i >= 2 ? bars[i - 2].close : null;
+        // ── Phase 3: Regime ──
+        const regime = detectRegime(adx10[wi], atr10[wi], atrSMA20[wi], chop14[wi]);
 
-        // Supertrend direction from existing indicator (pass through)
-        // We derive direction from +DI/-DI as proxy
-        const stDirection = plusDI[i] !== null && minusDI[i] !== null
-            ? (plusDI[i] > minusDI[i] ? 1 : -1) : 0;
+        // ── Phase 4: Scoring ──
+        const vwapScoreResult = scoreVWAP(bar.close, vwapVal, vwapSD);
+        const rsiPrev = wi >= 2 ? rsi7[wi - 1] : null;
+        const closePrev2 = wi >= 2 ? wBars[wi - 2].close : null;
+        const stDirection = plusDI[wi] !== null && minusDI[wi] !== null
+            ? (plusDI[wi] > minusDI[wi] ? 1 : -1) : 0;
 
         const confluenceResult = computeConfluence({
-            vwapResult, rsiVal: rsi7[i], rsiPrev, close: bar.close, closePrev2,
-            stDirection, ema9Val: ema9[i], volume: bar.volume, volSMA20: volSMA20[i],
-            adxVal: adx10[i],
-        }, regime);
+            vwapResult: vwapScoreResult, rsiVal: rsi7[wi], rsiPrev, close: bar.close, closePrev2,
+            stDirection, ema9Val: ema9[wi], volume: bar.volume, volSMA20: volSMA20[wi],
+            adxVal: adx10[wi],
+        }, regime, patternSignal);
 
-        // Edge case detectors
-        const choppy = isChoppyMarket(adx10[i], chop14[i], atrPercentile[i], bars);
-        const volatilityEvent = detectVolatilityEvent(bar, atr10[i]);
-        const divergence = detectDivergence(bars, rsi7);
+        // ── Edge case detectors ──
+        const choppy = isChoppyMarket(adx10[wi], chop14[wi], atrPercentile[wi], wBars);
+        const volatilityEvent = detectVolatilityEvent(bar, atr10[wi]);
+        const divergence = detectDivergence(wBars, rsi7);
+        const emaPullback = ema9[wi] !== null && Math.abs(bar.close - ema9[wi]) / ema9[wi] < 0.001;
 
-        // EMA pullback check (within 0.1% of EMA 9)
-        const emaPullback = ema9[i] !== null && Math.abs(bar.close - ema9[i]) / ema9[i] < 0.001;
-
-        // Phase 5: Full 12-layer decision tree
+        // ── Phase 5: Decision tree ──
         const decision = evaluateScalpEntry({
-            time: bar.time,
-            close: bar.close,
-            high: bar.high,
-            low: bar.low,
-            adx: adx10[i],
-            atr: atr10[i],
-            atrSMA20: atrSMA20[i],
-            atrPercentile: atrPercentile[i],
-            chop: chop14[i],
-            rsi: rsi7[i],
-            stDirection,
-            stDirection15m: null, // would need 15m aggregation
-            vwapResult,
-            vwapBias: vwapResult.bias,
-            confluence: confluenceResult,
-            levels,
-            choppy,
-            volatilityEvent,
-            divergence,
-            emaPullback,
+            time: bar.time, close: bar.close, high: bar.high, low: bar.low,
+            adx: adx10[wi], atr: atr10[wi], atrSMA20: atrSMA20[wi],
+            atrPercentile: atrPercentile[wi], chop: chop14[wi], rsi: rsi7[wi],
+            stDirection, stDirection15m: null,
+            vwapResult: vwapScoreResult, vwapBias: vwapScoreResult.bias,
+            confluence: confluenceResult, levels, choppy, volatilityEvent, divergence, emaPullback,
+            sessionOverride,
         });
 
+        // ── Build state ──
         this.state = {
             indicators: {
-                ema9: ema9[i],
-                rsi7: rsi7[i],
-                adx10: adx10[i],
-                plusDI: plusDI[i],
-                minusDI: minusDI[i],
-                atr10: atr10[i],
-                atrSMA20: atrSMA20[i],
-                atrPercentile: atrPercentile[i],
-                chop14: chop14[i],
-                vwap: vwap[i],
-                vwapUpper1: upper1[i],
-                vwapLower1: lower1[i],
-                vwapUpper2: upper2[i],
-                vwapLower2: lower2[i],
-                vwapStdDev: vwapStdDev[i],
-                volSMA20: volSMA20[i],
-                volume: bar.volume,
-                stDirection,
+                ema9: ema9[wi], rsi7: rsi7[wi], adx10: adx10[wi],
+                plusDI: plusDI[wi], minusDI: minusDI[wi],
+                atr10: atr10[wi], atrSMA20: atrSMA20[wi],
+                atrPercentile: atrPercentile[wi], chop14: chop14[wi],
+                vwap: vwapVal,
+                vwapUpper1: vwapResult.upper1[vwapI], vwapLower1: vwapResult.lower1[vwapI],
+                vwapUpper2: vwapResult.upper2[vwapI], vwapLower2: vwapResult.lower2[vwapI],
+                vwapStdDev: vwapSD,
+                volSMA20: volSMA20[wi], volume: bar.volume, stDirection,
             },
-            series: {
-                ema9, rsi7, adx10, plusDI, minusDI, atr10,
-                vwap, vwapUpper1: upper1, vwapLower1: lower1, vwapUpper2: upper2, vwapLower2: lower2,
-                volSMA20, chop14, atrPercentile,
-            },
-            levels,
-            regime,
+            levels, regime,
             scores: confluenceResult.raw,
             confluence: confluenceResult,
             decision,
             session: sessionFilter(bar.time),
-            volatilityEvent,
-            divergence,
-            choppy,
+            volatilityEvent, divergence, choppy,
             time: bar.time,
+            // Series only populated when rendering overlays (new bars)
+            series: null,
         };
+
+        // ── Series arrays for chart overlays (expensive — only on new bars) ──
+        if (renderOverlays) {
+            // EMA/indicators: map windowed arrays back to full bar timestamps
+            // For chart rendering, we need VWAP for today + EMA for windowed
+            const seriesData = {
+                ema9: new Array(totalLen).fill(null),
+                vwap: new Array(totalLen).fill(null),
+                vwapUpper1: new Array(totalLen).fill(null),
+                vwapLower1: new Array(totalLen).fill(null),
+                vwapUpper2: new Array(totalLen).fill(null),
+                vwapLower2: new Array(totalLen).fill(null),
+            };
+            // EMA mapped to original indices
+            for (let j = 0; j < wLen; j++) {
+                if (ema9[j] !== null) seriesData.ema9[windowStart + j] = ema9[j];
+            }
+            // VWAP mapped from today's bars
+            for (let j = 0; j < todayBars.length; j++) {
+                const idx = todayStart + j;
+                seriesData.vwap[idx] = vwapResult.vwap[j];
+                seriesData.vwapUpper1[idx] = vwapResult.upper1[j];
+                seriesData.vwapLower1[idx] = vwapResult.lower1[j];
+                seriesData.vwapUpper2[idx] = vwapResult.upper2[j];
+                seriesData.vwapLower2[idx] = vwapResult.lower2[j];
+            }
+            this.state.series = seriesData;
+        }
 
         return this.state;
     }

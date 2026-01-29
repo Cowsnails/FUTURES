@@ -91,6 +91,10 @@ from .security import (
     validate_bar_size,
     validate_indicator_params
 )
+from .pattern_matcher import DailyPatternEngine
+from .data_grabber import (
+    get_grabber_status, start_grab, stop_grab, update_all_day_counts
+)
 
 # Configure logging
 logging.basicConfig(
@@ -115,6 +119,10 @@ indicator_manager: Optional[IndicatorManager] = None
 # Structure: { 'MNQ': { '1min': [...], '5min': [...], ... }, ... }
 preloaded_data: Dict[str, Dict[str, list]] = {}
 TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
+
+# Daily pattern matching engines per symbol
+pattern_engines: Dict[str, DailyPatternEngine] = {}
+pattern_task: Optional[asyncio.Task] = None
 
 
 class ConnectionManager:
@@ -367,6 +375,80 @@ async def prefetch_all_tickers():
     logger.info(f"✓ Preloaded {total_bars:,} total bars into memory for instant switching")
 
 
+def initialize_pattern_engines():
+    """
+    Build DailyPatternEngine for each symbol from preloaded 1-min data.
+    Groups 1-min bars into daily OHLCV + hourly bars for 750-day matching.
+    """
+    from datetime import datetime as dt
+
+    for symbol in ['MNQ', 'MES', 'MGC']:
+        bars = preloaded_data.get(symbol, {}).get('1min', [])
+        if not bars:
+            logger.warning(f"Pattern matcher: no 1-min data for {symbol}")
+            continue
+
+        engine = DailyPatternEngine()
+        engine.load_from_1min_bars(bars)
+        pattern_engines[symbol] = engine
+        logger.info(f"✓ Daily pattern matcher for {symbol}: {engine.num_days} days loaded")
+
+
+async def pattern_match_loop():
+    """
+    Background task: run daily pattern matching every 30 minutes during RTH.
+    Schedule: 9:30 AM initial, then every 30 min until 2:00 PM ET.
+    """
+    import pytz
+    from datetime import datetime as dt
+
+    eastern = pytz.timezone('US/Eastern')
+
+    while True:
+        try:
+            now_et = dt.now(eastern)
+            if now_et.weekday() < 5:
+                current_minutes = now_et.hour * 60 + now_et.minute
+                # 9:30 AM (570) to 2:00 PM (840)
+                if 570 <= current_minutes < 840:
+                    await run_all_pattern_matches()
+
+            # Sleep 30 minutes (1800 seconds)
+            await asyncio.sleep(1800)
+        except asyncio.CancelledError:
+            logger.info("Pattern match loop cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Pattern match loop error: {e}")
+            await asyncio.sleep(120)
+
+
+async def run_all_pattern_matches():
+    """Run daily pattern matching for all symbols and broadcast results."""
+    from datetime import datetime as dt
+
+    for symbol, engine in pattern_engines.items():
+        try:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if not bars_1min:
+                continue
+
+            result = engine.run_match_from_1min(bars_1min)
+            if result:
+                result['symbol'] = symbol
+                result['type'] = 'pattern_update'
+                await connection_manager.broadcast(
+                    symbol, result, immediate=True
+                )
+                logger.info(
+                    f"Daily pattern {symbol}: {result['match_count']} matches, "
+                    f"phase={result.get('projection', {}).get('current_phase', 'n/a')}, "
+                    f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
+                )
+        except Exception as e:
+            logger.error(f"Daily pattern match error for {symbol}: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
@@ -411,12 +493,27 @@ async def lifespan(app: FastAPI):
         logger.info("Pre-fetching historical data for all tickers...")
         await prefetch_all_tickers()
 
+        # Initialize pattern matching engines from preloaded data
+        logger.info("Initializing pattern matching engines...")
+        initialize_pattern_engines()
+
+        # Start pattern matching background loop
+        global pattern_task
+        pattern_task = asyncio.create_task(pattern_match_loop())
+
         logger.info("Application started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down application...")
+
+    if pattern_task:
+        pattern_task.cancel()
+        try:
+            await pattern_task
+        except asyncio.CancelledError:
+            pass
 
     if realtime_manager:
         realtime_manager.stop_all_streams()
@@ -538,6 +635,35 @@ async def list_timeframes():
             {"value": "4H", "label": "4 Hours", "seconds": 14400}
         ]
     }
+
+
+@app.get("/api/pattern/{symbol}")
+async def get_pattern_match(symbol: str):
+    """Get latest pattern match results for a symbol."""
+    if symbol not in pattern_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No pattern engine for {symbol}"}
+        )
+    engine = pattern_engines[symbol]
+    if engine.latest_result is None:
+        return {"status": "no_results", "message": "Pattern matching hasn't run yet"}
+    return engine.latest_result
+
+
+@app.post("/api/pattern/{symbol}/run")
+async def trigger_pattern_match(symbol: str):
+    """Manually trigger pattern matching for a symbol (for testing)."""
+    if symbol not in pattern_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No pattern engine for {symbol}"}
+        )
+    await run_all_pattern_matches()
+    engine = pattern_engines[symbol]
+    if engine.latest_result:
+        return engine.latest_result
+    return {"status": "no_results", "message": "Not enough data for matching"}
 
 
 @app.get("/api/cache/{symbol}")
@@ -983,6 +1109,54 @@ async def rate_limit_info():
         },
         "note": "Rate limits are per IP address"
     }
+
+
+# --- Data Grabber Endpoints ---
+
+@app.get("/api/data-grab/status")
+async def data_grab_status():
+    """Get current data grabber status for frontend polling."""
+    return get_grabber_status()
+
+
+@app.post("/api/data-grab/{symbol}/start")
+async def data_grab_start(symbol: str):
+    """Start grabbing historical data for a symbol."""
+    if symbol not in ['MNQ', 'MES', 'MGC']:
+        raise HTTPException(status_code=400, detail=f"Invalid symbol: {symbol}")
+
+    if not ib_manager or not ib_manager.is_connected():
+        raise HTTPException(status_code=503, detail="IB Gateway not connected")
+
+    status = get_grabber_status()
+    if status['active']:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Already grabbing {status['symbol']}. One at a time."
+        )
+
+    # Update day counts before starting
+    update_all_day_counts(cache)
+
+    success = await start_grab(symbol, ib_manager.ib, cache)
+    if success:
+        return {"status": "started", "symbol": symbol}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to start grab")
+
+
+@app.post("/api/data-grab/stop")
+async def data_grab_stop():
+    """Stop the active data grab."""
+    await stop_grab()
+    return {"status": "stopped"}
+
+
+@app.get("/api/data-grab/day-counts")
+async def data_grab_day_counts():
+    """Get day counts for all symbols."""
+    update_all_day_counts(cache)
+    return get_grabber_status()['days_in_cache']
 
 
 if __name__ == '__main__':
