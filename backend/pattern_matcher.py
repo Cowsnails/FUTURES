@@ -517,25 +517,31 @@ class DailyPatternEngine:
         if self.num_days < 20:
             return None
 
-        # Find today's date (from latest bar)
+        # Find the most recent trading day with RTH bars.
+        # Timestamps are ET-as-UTC, so utcfromtimestamp gives ET values.
         if not bars_1min:
             return None
-        latest_time = max(b['time'] for b in bars_1min)
-        today_dt = dt.utcfromtimestamp(latest_time)
-        today_str = today_dt.strftime('%Y-%m-%d')
 
-        # Extract today's RTH bars
-        today_bars = []
+        # Collect all RTH bars grouped by date, find the latest date with enough bars
+        from collections import defaultdict
+        rth_by_date = defaultdict(list)
         for b in bars_1min:
             d = dt.utcfromtimestamp(b['time'])
-            if d.strftime('%Y-%m-%d') != today_str:
-                continue
             minutes = d.hour * 60 + d.minute
             if 570 <= minutes < 960:
-                today_bars.append(b)
-        today_bars.sort(key=lambda x: x['time'])
+                rth_by_date[d.strftime('%Y-%m-%d')].append(b)
 
-        if len(today_bars) < 15:  # Need at least ~15 min
+        # Find most recent date with >= 15 RTH bars
+        today_str = None
+        today_bars = []
+        for date_str in sorted(rth_by_date.keys(), reverse=True):
+            if len(rth_by_date[date_str]) >= 15:
+                today_str = date_str
+                today_bars = sorted(rth_by_date[date_str], key=lambda x: x['time'])
+                break
+
+        if not today_bars:
+            logger.warning("Pattern matcher: no trading day found with >= 15 RTH bars")
             return None
 
         # Aggregate today's bars into hourly slots

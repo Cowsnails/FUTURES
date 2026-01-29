@@ -846,6 +846,11 @@
                 console.log(`WebSocket connected to ${symbol}`);
                 updateStatus('connected', `${symbol} Connected`);
                 reconnectAttempts = 0;
+                // Fetch cached pattern match result
+                fetch(`/api/pattern/${symbol}`)
+                    .then(r => r.json())
+                    .then(data => { if (data && data.match_count) handlePatternUpdate(data); })
+                    .catch(() => {});
             };
 
             ws.onmessage = (event) => {
