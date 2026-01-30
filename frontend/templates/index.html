@@ -1577,11 +1577,19 @@
             renderMtfSignalList();
         }
 
+        // Signal dedup: track last action per TF to avoid rapid-fire duplicates
+        const mtfLastAction = { '1min': null, '5min': null, '15min': null };
+        const mtfSignalLog = [];  // Recent unique signals (max 20)
+        const MTF_SIGNAL_LOG_MAX = 20;
+
         function renderMtfSignalList() {
             const container = document.getElementById('mtf-signal-list');
             if (!container) return;
 
-            let html = '';
+            const now = Date.now();
+
+            // Build current state cards + detect new signals
+            let currentHtml = '';
             for (const tf of MTF_TIMEFRAMES) {
                 const state = mtfStates[tf];
                 if (!state || !state.decision) continue;
@@ -1592,13 +1600,22 @@
                 const actionClass = action === 'BUY' ? 'buy' : action === 'SELL' ? 'sell' : 'no-trade';
                 const confPct = Math.round((state.confluence?.total || 0) * 100);
                 const confColor = action === 'BUY' ? '#26a69a' : action === 'SELL' ? '#ef5350' : '#555';
-
-                // Compute TP/SL points from ATR
                 const atr = ind.atr10 || 0;
                 const stopPts = atr ? (d.stopATR * atr).toFixed(1) : '—';
                 const targetPts = atr ? (d.targetATR * atr).toFixed(1) : '—';
 
-                html += `
+                // Dedup: only log to signal history if action changed
+                if (action !== 'NO_TRADE' && action !== mtfLastAction[tf]) {
+                    mtfSignalLog.unshift({
+                        tf, action, confPct, stopPts, targetPts, atr,
+                        bias: d.bias || '',
+                        time: now,
+                    });
+                    if (mtfSignalLog.length > MTF_SIGNAL_LOG_MAX) mtfSignalLog.pop();
+                }
+                mtfLastAction[tf] = action;
+
+                currentHtml += `
                     <div class="mtf-card ${actionClass}">
                         <div class="mtf-card-header">
                             <span class="mtf-tf-badge">${MTF_LABELS[tf]}</span>
@@ -1622,7 +1639,28 @@
                 `;
             }
 
-            container.innerHTML = html || '<div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>';
+            // Build signal history (recent unique BUY/SELL triggers)
+            let histHtml = '';
+            if (mtfSignalLog.length > 0) {
+                histHtml = '<div style="margin-top:6px;border-top:1px solid #1e222d;padding-top:4px">';
+                histHtml += '<div style="font-size:10px;color:#555;margin-bottom:3px">Recent Signals</div>';
+                for (const sig of mtfSignalLog) {
+                    const ago = Math.round((now - sig.time) / 1000);
+                    const agoStr = ago < 60 ? `${ago}s ago` : `${Math.floor(ago / 60)}m ago`;
+                    const cls = sig.action === 'BUY' ? 'buy' : 'sell';
+                    histHtml += `
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:10px;opacity:0.7">
+                            <span><span class="mtf-tf-badge" style="font-size:9px">${MTF_LABELS[sig.tf]}</span>
+                            <span class="mtf-action ${cls}" style="font-size:10px">${sig.action}</span></span>
+                            <span style="color:#555">${sig.confPct}% | SL:${sig.stopPts} TP:${sig.targetPts}</span>
+                            <span style="color:#444">${agoStr}</span>
+                        </div>
+                    `;
+                }
+                histHtml += '</div>';
+            }
+
+            container.innerHTML = (currentHtml + histHtml) || '<div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>';
         }
 
         function updateDashboard(state) {

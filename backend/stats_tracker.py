@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
 
-STATS_DIR = Path(__file__).parent.parent / "trading_stats"
+STATS_DIR = Path.home() / "trading_stats"
 DB_PATH = STATS_DIR / "live" / "signals.db"
 
 # Signal state machine
