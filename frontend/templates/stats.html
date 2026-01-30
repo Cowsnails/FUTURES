@@ -186,6 +186,12 @@
             <div class="card"><div class="no-data">Loading pattern stats...</div></div>
         </div>
 
+        <!-- Anchored Session Predictions -->
+        <div class="section-title">Anchored Session Predictions (Live)</div>
+        <div id="sessionCards" class="stats-grid">
+            <div class="card"><div class="no-data">Loading session predictions...</div></div>
+        </div>
+
         <!-- Rolling Stats -->
         <div class="section-title">Rolling Performance (7-Day / 30-Day)</div>
         <div class="stats-grid" id="rollingCards">
@@ -356,6 +362,89 @@
             container.innerHTML = html || '<div class="card"><div class="no-data">No rolling data yet.</div></div>';
         }
 
+        function renderSessionCards(sessions) {
+            const container = document.getElementById('sessionCards');
+            // Merge active + history, dedupe by key
+            const all = [...(sessions.active || []), ...(sessions.history || [])];
+            const seen = new Set();
+            const unique = [];
+            for (const s of all) {
+                const key = `${s.session_date}-${s.session_type}-${s.symbol}`;
+                if (!seen.has(key)) { seen.add(key); unique.push(s); }
+            }
+
+            if (unique.length === 0) {
+                container.innerHTML = '<div class="card"><div class="no-data">No session predictions yet. Data accumulates as pattern engines run each minute.</div></div>';
+                return;
+            }
+
+            let html = '';
+            for (const s of unique) {
+                const dirClass = s.final_direction === 'bullish' ? 'bullish' : 'bearish';
+                const anchorClass = s.anchor_direction === 'bullish' ? 'bullish' : 'bearish';
+                const stability = s.direction_stability || 0;
+                const stabilityColor = stability >= 0.8 ? '#26a69a' : stability >= 0.6 ? '#ffca28' : '#ef5350';
+                const sessClass = s.session_type === 'rth' ? 'rth' : 'overnight';
+                const isLive = !s.is_closed;
+
+                html += `
+                    <div class="card" style="${isLive ? 'border-color:#333' : ''}">
+                        <h2>
+                            <span class="badge ${sessClass}">${s.session_type}</span>
+                            ${s.symbol} - ${s.session_date}
+                            ${isLive ? ' <span style="color:#26a69a;font-size:11px">LIVE</span>' : ''}
+                        </h2>
+                        <div class="stat-row">
+                            <span class="stat-label">Anchor Direction</span>
+                            <span class="stat-value"><span class="badge ${anchorClass}">${s.anchor_direction}</span> @ ${s.anchor_price ? s.anchor_price.toFixed(1) : '-'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Current Verdict</span>
+                            <span class="stat-value"><span class="badge ${dirClass}">${s.final_direction}</span></span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Direction Stability</span>
+                            <span class="stat-value" style="color:${stabilityColor}">${(stability * 100).toFixed(1)}%</span>
+                        </div>
+                        <div class="winrate-bar">
+                            <div class="winrate-fill" style="width:${(stability*100)}%; background:${stabilityColor}"></div>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Votes (Bull / Bear)</span>
+                            <span class="stat-value"><span class="green">${s.bullish_votes || 0}</span> / <span class="red">${s.bearish_votes || 0}</span> (${s.total_votes || 0} total)</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Regime Changes</span>
+                            <span class="stat-value" style="color:${s.regime_changes > 0 ? '#ffca28' : '#666'}">${s.regime_changes || 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg EOS Projected</span>
+                            <span class="stat-value">${s.avg_eod_projected ? s.avg_eod_projected.toFixed(1) : '-'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg Peak Projected</span>
+                            <span class="stat-value">${s.avg_peak_projected ? s.avg_peak_projected.toFixed(1) : '-'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Last Price</span>
+                            <span class="stat-value">${s.last_price ? s.last_price.toFixed(1) : '-'}</span>
+                        </div>
+                        ${s.direction_correct !== null && s.direction_correct !== undefined ? `
+                        <div class="stat-row">
+                            <span class="stat-label">Direction Correct?</span>
+                            <span class="stat-value ${s.direction_correct ? 'green' : 'red'}">${s.direction_correct ? 'YES' : 'NO'}</span>
+                        </div>` : ''}
+                        ${s.eod_error_points ? `
+                        <div class="stat-row">
+                            <span class="stat-label">EOS Error (pts)</span>
+                            <span class="stat-value">${s.eod_error_points.toFixed(1)}</span>
+                        </div>` : ''}
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+
         function renderPredictions(predictions) {
             const container = document.getElementById('predictionsCard');
             if (!predictions || predictions.length === 0) {
@@ -404,11 +493,16 @@
 
         async function loadAllStats() {
             try {
-                const resp = await fetch('/api/stats/full');
+                const [resp, sessResp] = await Promise.all([
+                    fetch('/api/stats/full'),
+                    fetch('/api/stats/sessions'),
+                ]);
                 const data = await resp.json();
+                const sessData = await sessResp.json();
 
                 renderSignalCards(data.signal_stats);
                 renderPatternCards(data.pattern_accuracy, data.prediction_counts);
+                renderSessionCards(sessData);
                 renderRollingCards(data.rolling_7d, data.rolling_30d);
                 renderPredictions(data.recent_predictions);
 

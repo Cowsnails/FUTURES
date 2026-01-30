@@ -337,6 +337,171 @@ class PatternSnapshotManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ANCHORED SESSION TRACKER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AnchoredSessionTracker:
+    """
+    Aggregates per-minute pattern predictions into one session-level prediction.
+
+    Instead of treating each minute as a separate prediction, this:
+    - Locks an anchor on the first prediction of a session
+    - Tallies bullish/bearish votes every minute
+    - Tracks regime changes (direction flips)
+    - Computes direction_stability (% of votes for majority direction)
+    - At session end, evaluates ONE verdict against actual outcome
+
+    This solves the "60 predictions per hour" problem by producing
+    ONE evaluable prediction per session with a confidence score.
+    """
+
+    def __init__(self):
+        # Key: (session_date, session_type, symbol) -> live session state
+        self._active_sessions: Dict[tuple, dict] = {}
+
+    def _session_key(self, session_date: str, session_type: str, symbol: str) -> tuple:
+        return (session_date, session_type, symbol)
+
+    def process_prediction(self, prediction: dict, symbol: str) -> Optional[dict]:
+        """
+        Feed a per-minute prediction into the session anchor.
+        Returns a session_update dict with current aggregated state.
+        """
+        if not prediction:
+            return None
+
+        session_date = prediction.get('session_date', '')
+        session_type = prediction.get('session_type', '')
+        direction = prediction.get('direction', '')
+        current_price = prediction.get('current_price', 0)
+        eod_proj = prediction.get('eod_projected_price', 0)
+        peak_proj = prediction.get('peak_projected_price', 0)
+        correlation = prediction.get('avg_correlation', 0)
+        timestamp = prediction.get('timestamp', int(time.time()))
+
+        key = self._session_key(session_date, session_type, symbol)
+
+        if key not in self._active_sessions:
+            # First prediction of session — this is the anchor
+            self._active_sessions[key] = {
+                'session_date': session_date,
+                'session_type': session_type,
+                'symbol': symbol,
+                'anchor_direction': direction,
+                'anchor_price': current_price,
+                'anchor_eod_proj': eod_proj,
+                'anchor_peak_proj': peak_proj,
+                'anchor_time': timestamp,
+                'total_votes': 0,
+                'bullish_votes': 0,
+                'bearish_votes': 0,
+                'eod_proj_sum': 0.0,
+                'peak_proj_sum': 0.0,
+                'corr_sum': 0.0,
+                'regime_changes': 0,
+                'regime_change_log': [],
+                'last_direction': None,
+                'last_price': current_price,
+                'last_update_time': timestamp,
+            }
+
+        state = self._active_sessions[key]
+
+        # Tally vote
+        state['total_votes'] += 1
+        if direction == 'bullish':
+            state['bullish_votes'] += 1
+        else:
+            state['bearish_votes'] += 1
+
+        # Running sums for averages
+        state['eod_proj_sum'] += eod_proj
+        state['peak_proj_sum'] += peak_proj
+        state['corr_sum'] += correlation
+
+        # Detect regime change
+        if state['last_direction'] and direction != state['last_direction']:
+            state['regime_changes'] += 1
+            state['regime_change_log'].append({
+                'time': timestamp,
+                'from': state['last_direction'],
+                'to': direction,
+                'price': current_price,
+            })
+            logger.info(f"[{symbol}] Regime change #{state['regime_changes']}: "
+                       f"{state['last_direction']} -> {direction} @ {current_price:.1f}")
+
+        state['last_direction'] = direction
+        state['last_price'] = current_price
+        state['last_update_time'] = timestamp
+
+        # Compute current aggregated state
+        total = state['total_votes']
+        bull = state['bullish_votes']
+        bear = state['bearish_votes']
+        majority_dir = 'bullish' if bull >= bear else 'bearish'
+        majority_pct = max(bull, bear) / total if total > 0 else 0
+
+        return {
+            'session_date': session_date,
+            'session_type': session_type,
+            'symbol': symbol,
+            'anchor_direction': state['anchor_direction'],
+            'anchor_price': state['anchor_price'],
+            'anchor_eod_proj': state['anchor_eod_proj'],
+            'anchor_peak_proj': state['anchor_peak_proj'],
+            'anchor_time': state['anchor_time'],
+            'total_votes': total,
+            'bullish_votes': bull,
+            'bearish_votes': bear,
+            'direction_stability': round(majority_pct, 3),
+            'avg_eod_projected': round(state['eod_proj_sum'] / total, 2) if total else 0,
+            'avg_peak_projected': round(state['peak_proj_sum'] / total, 2) if total else 0,
+            'avg_correlation': round(state['corr_sum'] / total, 4) if total else 0,
+            'final_direction': majority_dir,
+            'final_confidence': round(majority_pct, 3),
+            'regime_changes': state['regime_changes'],
+            'regime_change_log': json.dumps(state['regime_change_log']),
+            'last_price': current_price,
+            'last_direction': direction,
+            'last_update_time': timestamp,
+        }
+
+    def get_active_sessions(self) -> list:
+        """Return current state of all active session predictions."""
+        results = []
+        for key, state in self._active_sessions.items():
+            total = state['total_votes']
+            bull = state['bullish_votes']
+            bear = state['bearish_votes']
+            majority_dir = 'bullish' if bull >= bear else 'bearish'
+            majority_pct = max(bull, bear) / total if total > 0 else 0
+            results.append({
+                'session_date': state['session_date'],
+                'session_type': state['session_type'],
+                'symbol': state['symbol'],
+                'anchor_direction': state['anchor_direction'],
+                'anchor_price': state['anchor_price'],
+                'total_votes': total,
+                'bullish_votes': bull,
+                'bearish_votes': bear,
+                'direction_stability': round(majority_pct, 3),
+                'final_direction': majority_dir,
+                'regime_changes': state['regime_changes'],
+                'avg_eod_projected': round(state['eod_proj_sum'] / total, 2) if total else 0,
+                'avg_peak_projected': round(state['peak_proj_sum'] / total, 2) if total else 0,
+                'last_price': state['last_price'],
+                'last_update_time': state['last_update_time'],
+            })
+        return results
+
+    def clear_session(self, session_date: str, session_type: str, symbol: str):
+        """Remove a closed session from active tracking."""
+        key = self._session_key(session_date, session_type, symbol)
+        self._active_sessions.pop(key, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # DATABASE (SQLite + WAL + Buffered Writes)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -432,6 +597,54 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     updated_at INTEGER,
     PRIMARY KEY (session_date, signal_source)
 );
+
+-- Anchored session predictions (one per session per symbol per session_type)
+-- Aggregates all per-minute predictions into a single evaluable verdict
+CREATE TABLE IF NOT EXISTS session_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date TEXT NOT NULL,
+    session_type TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    -- Anchor (first prediction of session)
+    anchor_direction TEXT,
+    anchor_price REAL,
+    anchor_eod_proj REAL,
+    anchor_peak_proj REAL,
+    anchor_time INTEGER,
+    -- Aggregated consensus over entire session
+    total_votes INTEGER DEFAULT 0,
+    bullish_votes INTEGER DEFAULT 0,
+    bearish_votes INTEGER DEFAULT 0,
+    direction_stability REAL DEFAULT 0,
+    avg_eod_projected REAL DEFAULT 0,
+    avg_peak_projected REAL DEFAULT 0,
+    avg_correlation REAL DEFAULT 0,
+    -- Final verdict (majority vote direction)
+    final_direction TEXT,
+    final_confidence REAL,
+    -- Regime changes (direction flips during session)
+    regime_changes INTEGER DEFAULT 0,
+    regime_change_log TEXT,
+    -- Last update
+    last_price REAL,
+    last_direction TEXT,
+    last_update_time INTEGER,
+    -- Outcome (filled at session end)
+    actual_close_price REAL,
+    actual_peak_price REAL,
+    actual_low_price REAL,
+    direction_correct INTEGER,
+    eod_error_points REAL,
+    peak_error_points REAL,
+    -- Status
+    is_closed INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    UNIQUE(session_date, session_type, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_pred_date ON session_predictions(session_date, session_type);
+CREATE INDEX IF NOT EXISTS idx_session_pred_symbol ON session_predictions(symbol);
+CREATE INDEX IF NOT EXISTS idx_session_pred_closed ON session_predictions(is_closed);
 
 -- Rolling stats cache
 CREATE TABLE IF NOT EXISTS rolling_stats (
@@ -566,6 +779,13 @@ class TradingStatsDB:
             if len(self._buffer) >= BUFFER_SIZE:
                 self._flush_now()
 
+    def upsert_session_prediction(self, data: dict):
+        """Insert or update a session-level anchored prediction (called every minute)."""
+        with self._buffer_lock:
+            self._buffer.append(('session_pred', data))
+            if len(self._buffer) >= BUFFER_SIZE:
+                self._flush_now()
+
     def _background_flush(self):
         while self._running:
             time.sleep(1.0)
@@ -585,6 +805,7 @@ class TradingStatsDB:
         signal_rows = [row for typ, row in items if typ == 'signal']
         pattern_rows = [row for typ, row in items if typ == 'pattern']
         prediction_rows = [row for typ, row in items if typ == 'prediction']
+        session_pred_rows = [row for typ, row in items if typ == 'session_pred']
 
         try:
             cursor = self.conn.cursor()
@@ -637,8 +858,46 @@ class TradingStatsDB:
                     )
                 """, prediction_rows)
 
+            if session_pred_rows:
+                for sp in session_pred_rows:
+                    cursor.execute("""
+                        INSERT INTO session_predictions (
+                            session_date, session_type, symbol,
+                            anchor_direction, anchor_price, anchor_eod_proj, anchor_peak_proj, anchor_time,
+                            total_votes, bullish_votes, bearish_votes, direction_stability,
+                            avg_eod_projected, avg_peak_projected, avg_correlation,
+                            final_direction, final_confidence,
+                            regime_changes, regime_change_log,
+                            last_price, last_direction, last_update_time
+                        ) VALUES (
+                            :session_date, :session_type, :symbol,
+                            :anchor_direction, :anchor_price, :anchor_eod_proj, :anchor_peak_proj, :anchor_time,
+                            :total_votes, :bullish_votes, :bearish_votes, :direction_stability,
+                            :avg_eod_projected, :avg_peak_projected, :avg_correlation,
+                            :final_direction, :final_confidence,
+                            :regime_changes, :regime_change_log,
+                            :last_price, :last_direction, :last_update_time
+                        )
+                        ON CONFLICT(session_date, session_type, symbol) DO UPDATE SET
+                            total_votes = excluded.total_votes,
+                            bullish_votes = excluded.bullish_votes,
+                            bearish_votes = excluded.bearish_votes,
+                            direction_stability = excluded.direction_stability,
+                            avg_eod_projected = excluded.avg_eod_projected,
+                            avg_peak_projected = excluded.avg_peak_projected,
+                            avg_correlation = excluded.avg_correlation,
+                            final_direction = excluded.final_direction,
+                            final_confidence = excluded.final_confidence,
+                            regime_changes = excluded.regime_changes,
+                            regime_change_log = excluded.regime_change_log,
+                            last_price = excluded.last_price,
+                            last_direction = excluded.last_direction,
+                            last_update_time = excluded.last_update_time
+                    """, sp)
+
             self.conn.commit()
-            logger.debug(f"Stats flush: {len(signal_rows)} signals, {len(pattern_rows)} patterns, {len(prediction_rows)} predictions")
+            logger.debug(f"Stats flush: {len(signal_rows)} signals, {len(pattern_rows)} patterns, "
+                        f"{len(prediction_rows)} predictions, {len(session_pred_rows)} session preds")
         except Exception as e:
             try:
                 self.conn.rollback()
@@ -831,6 +1090,47 @@ class TradingStatsDB:
             logger.error(f"Error reading prediction history: {e}")
             return []
 
+    def get_session_predictions(self, symbol: str = None, is_closed: int = None,
+                                 limit: int = 50) -> list:
+        """Get session-level anchored predictions."""
+        try:
+            cursor = self.conn.cursor()
+            where_parts = []
+            params = []
+            if symbol:
+                where_parts.append("symbol = ?")
+                params.append(symbol)
+            if is_closed is not None:
+                where_parts.append("is_closed = ?")
+                params.append(is_closed)
+            where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+            cursor.execute(f"""
+                SELECT session_date, session_type, symbol,
+                       anchor_direction, anchor_price, anchor_eod_proj, anchor_peak_proj, anchor_time,
+                       total_votes, bullish_votes, bearish_votes, direction_stability,
+                       avg_eod_projected, avg_peak_projected, avg_correlation,
+                       final_direction, final_confidence,
+                       regime_changes, regime_change_log,
+                       last_price, last_direction, last_update_time,
+                       actual_close_price, direction_correct, eod_error_points,
+                       is_closed
+                FROM session_predictions {where}
+                ORDER BY session_date DESC, session_type DESC LIMIT ?
+            """, params + [limit])
+            cols = ['session_date', 'session_type', 'symbol',
+                    'anchor_direction', 'anchor_price', 'anchor_eod_proj', 'anchor_peak_proj', 'anchor_time',
+                    'total_votes', 'bullish_votes', 'bearish_votes', 'direction_stability',
+                    'avg_eod_projected', 'avg_peak_projected', 'avg_correlation',
+                    'final_direction', 'final_confidence',
+                    'regime_changes', 'regime_change_log',
+                    'last_price', 'last_direction', 'last_update_time',
+                    'actual_close_price', 'direction_correct', 'eod_error_points',
+                    'is_closed']
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error reading session predictions: {e}")
+            return []
+
     def get_all_stats_summary(self) -> dict:
         """Get comprehensive stats summary for the stats page."""
         try:
@@ -869,12 +1169,16 @@ class TradingStatsDB:
                     'accuracy': round((row[2] or 0) / evaluated, 3) if evaluated > 0 else None,
                 }
 
+            # Session-level anchored predictions
+            session_predictions = self.get_session_predictions(limit=20)
+
             return {
                 'session_date': today,
                 'signal_stats': signal_stats,
                 'prediction_counts': prediction_counts,
                 'recent_predictions': recent_predictions,
                 'pattern_accuracy': pattern_accuracy,
+                'session_predictions': session_predictions,
                 'rolling_7d': self.get_rolling_stats(7),
                 'rolling_30d': self.get_rolling_stats(30),
             }
@@ -921,6 +1225,7 @@ class StatsManager:
         self.trade_trackers: Dict[str, TradeSignalTracker] = {}  # per symbol
         self.rth_snapshots: Dict[str, PatternSnapshotManager] = {}
         self.overnight_snapshots: Dict[str, PatternSnapshotManager] = {}
+        self.session_tracker = AnchoredSessionTracker()
 
         logger.info("StatsManager initialized")
 
@@ -974,6 +1279,11 @@ class StatsManager:
         # Log every prediction cycle
         if prediction:
             self.db.log_prediction(prediction, symbol)
+
+            # Feed into anchored session tracker
+            session_update = self.session_tracker.process_prediction(prediction, symbol)
+            if session_update:
+                self.db.upsert_session_prediction(session_update)
 
         if snapshot:
             snapshot['symbol'] = symbol

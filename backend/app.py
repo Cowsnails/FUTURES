@@ -760,6 +760,17 @@ async def get_predictions(session_type: str = None, symbol: str = None, limit: i
     return stats_manager.db.get_prediction_history(session_type, symbol, limit)
 
 
+@app.get("/api/stats/sessions")
+async def get_session_predictions(symbol: str = None):
+    """Get anchored session-level predictions."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return {
+        'active': stats_manager.session_tracker.get_active_sessions(),
+        'history': stats_manager.db.get_session_predictions(symbol=symbol, limit=30),
+    }
+
+
 @app.get("/stats")
 async def stats_page():
     """Serve the stats dashboard page."""
