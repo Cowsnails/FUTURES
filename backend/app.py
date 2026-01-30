@@ -807,23 +807,51 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
         # Helper function to send timeframe data from memory
         async def send_timeframe_data(tf: str):
             """Send preloaded data for a timeframe - instant from memory"""
+            import json as _json
+
             if symbol not in preloaded_data:
                 logger.warning(f"[{symbol}] No preloaded data at all")
                 return
 
             data_list = preloaded_data[symbol].get(tf, [])
-            if data_list:
-                await connection_manager.send_to_client(websocket, {
-                    'type': 'historical',
-                    'data': data_list,
-                    'symbol': symbol,
-                    'timeframe': tf,
-                    'bar_count': len(data_list),
-                    'indicators': {}
-                })
-                logger.info(f"[{symbol}] Sent {len(data_list)} bars for {tf}")
-            else:
+            logger.info(f"[{symbol}] send_timeframe_data({tf}): {len(data_list)} bars available")
+
+            if not data_list:
                 logger.warning(f"[{symbol}] No data available for {tf}")
+                return
+
+            # Debug: log first and last bar
+            logger.info(f"[{symbol}] First bar: {data_list[0]}")
+            logger.info(f"[{symbol}] Last bar: {data_list[-1]}")
+
+            payload = {
+                'type': 'historical',
+                'data': data_list,
+                'symbol': symbol,
+                'timeframe': tf,
+                'bar_count': len(data_list),
+                'indicators': {}
+            }
+
+            # Test JSON serialization before sending
+            try:
+                serialized = _json.dumps(payload)
+                logger.info(f"[{symbol}] JSON serialized OK: {len(serialized)} bytes")
+            except Exception as e:
+                logger.error(f"[{symbol}] JSON serialization FAILED for {tf}: {e}")
+                # Fix types and retry
+                fixed_list = [
+                    {k: (int(v) if k == 'time' else float(v))
+                     for k, v in row.items()
+                     if k in ('time', 'open', 'high', 'low', 'close', 'volume')}
+                    for row in data_list
+                ]
+                payload['data'] = fixed_list
+                payload['bar_count'] = len(fixed_list)
+                logger.info(f"[{symbol}] Fixed types, retrying...")
+
+            await websocket.send_json(payload)
+            logger.info(f"[{symbol}] ✓ Sent {len(data_list)} bars for {tf}")
 
         # Step 1: Send initial data from memory (instant!)
         try:
