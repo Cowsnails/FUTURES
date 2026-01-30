@@ -781,8 +781,19 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                 bars_1min = preloaded_data[symbol].get('1min', [])
                 if bars_1min and historical_fetcher:
                     df = pd.DataFrame(bars_1min)
+                    # Keep only OHLCV columns, drop dupes, remove bad rows
+                    cols = ['time', 'open', 'high', 'low', 'close', 'volume']
+                    df = df[[c for c in cols if c in df.columns]].copy()
+                    df = df.dropna(subset=['time'])
+                    df['time'] = df['time'].astype(int)
+                    df = df[df['time'] > 0]
+                    df = df.drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
                     agg_df = historical_fetcher.aggregate_bars(df, tf)
-                    data_list = agg_df.to_dict('records')
+                    # Convert numpy types to native Python for JSON
+                    data_list = [
+                        {k: int(v) if k == 'time' else float(v) for k, v in row.items()}
+                        for row in agg_df.to_dict('records')
+                    ]
                 else:
                     data_list = preloaded_data[symbol].get(tf, [])
 
