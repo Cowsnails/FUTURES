@@ -780,6 +780,17 @@ async def stats_page():
     return {"error": "Stats page not found"}
 
 
+@app.get("/api/bars/{symbol}/{timeframe}")
+async def get_bars(symbol: str, timeframe: str, limit: int = 500):
+    """Get preloaded bar data for a symbol and timeframe (from memory)."""
+    if symbol not in preloaded_data:
+        return {"bars": [], "count": 0}
+    bars = preloaded_data[symbol].get(timeframe, [])
+    # Return last N bars
+    result = bars[-limit:] if len(bars) > limit else bars
+    return {"bars": result, "count": len(result), "symbol": symbol, "timeframe": timeframe}
+
+
 @app.get("/api/cache/{symbol}")
 async def get_cache_info(symbol: str):
     """Get cache information for a symbol"""

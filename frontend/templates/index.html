@@ -341,6 +341,60 @@
             transition: width 0.3s;
         }
 
+        .mtf-card {
+            background: #131722;
+            border: 1px solid #1e222d;
+            border-radius: 5px;
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+        .mtf-card.buy { border-left: 3px solid #26a69a; }
+        .mtf-card.sell { border-left: 3px solid #ef5350; }
+        .mtf-card.no-trade { border-left: 3px solid #333; opacity: 0.6; }
+        .mtf-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3px;
+        }
+        .mtf-tf-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
+            background: #1e222d;
+            color: #B0BEC5;
+        }
+        .mtf-action {
+            font-weight: 700;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }
+        .mtf-action.buy { color: #26a69a; }
+        .mtf-action.sell { color: #ef5350; }
+        .mtf-action.no-trade { color: #555; }
+        .mtf-details {
+            display: flex;
+            gap: 8px;
+            color: #888;
+            font-size: 10px;
+        }
+        .mtf-details span { white-space: nowrap; }
+        .mtf-confluence-bar {
+            height: 3px;
+            background: #1e222d;
+            border-radius: 2px;
+            margin-top: 3px;
+            overflow: hidden;
+        }
+        .mtf-confluence-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+
         .dash-row {
             display: flex;
             justify-content: space-between;
@@ -472,18 +526,10 @@
         <!-- Scalping Dashboard -->
         <div class="scalping-dashboard visible" id="scalping-dashboard">
             <div class="dash-section">
-                <div class="dash-label">Action</div>
-                <div class="dash-action no-trade" id="dash-action">—</div>
-                <div class="dash-bias" id="dash-bias"></div>
-                <div class="dash-confidence-bar"><div class="dash-confidence-fill" id="dash-confidence" style="width:0;background:#758696"></div></div>
-                <div class="dash-reason" id="dash-reason"></div>
-            </div>
-            <div class="dash-section">
-                <div class="dash-label">Trade Details</div>
-                <div class="dash-row"><span>Size</span><span class="dash-val" id="dash-size">—</span></div>
-                <div class="dash-row"><span>Entry</span><span class="dash-val" id="dash-entry-type">—</span></div>
-                <div class="dash-row"><span>Stop</span><span class="dash-val" id="dash-stop">—</span></div>
-                <div class="dash-row"><span>Target</span><span class="dash-val" id="dash-target">—</span></div>
+                <div class="dash-label">Trade Actions (All Timeframes)</div>
+                <div id="mtf-signal-list" style="max-height:220px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#333 transparent;">
+                    <div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>
+                </div>
             </div>
             <div class="dash-section">
                 <div class="dash-label">Regime</div>
@@ -602,9 +648,22 @@
         let currentOpenPrice = null;  // Current open price for candle coloring
         let supertrendIndicator = null;  // Supertrend Multi-Timeframe indicator
         let historicalBars = [];  // Store bars for indicator calculations
-        let scalpingEngine = new ScalpingEngine();  // Scalping decision engine
+        let scalpingEngine = new ScalpingEngine();  // Scalping decision engine (1m - primary)
         let engineThrottleTime = 0;  // Throttle engine updates
         const ENGINE_THROTTLE_MS = 1000;
+
+        // Multi-timeframe scalping engines
+        const MTF_TIMEFRAMES = ['1min', '5min', '15min'];
+        const MTF_LABELS = { '1min': '1m', '5min': '5m', '15min': '15m' };
+        const mtfEngines = {
+            '1min': scalpingEngine,  // reuse primary engine
+            '5min': new ScalpingEngine(),
+            '15min': new ScalpingEngine(),
+        };
+        const mtfBars = { '1min': null, '5min': [], '15min': [] };  // 1min uses historicalBars
+        const mtfStates = { '1min': null, '5min': null, '15min': null };
+        let mtfLastFetch = 0;
+        const MTF_FETCH_INTERVAL = 60000;  // re-fetch higher TF bars every 60s
 
         // Scalping engine chart series (VWAP, EMA, levels)
         let engineSeries = {};
@@ -1408,8 +1467,10 @@
                 // New bar: full compute + overlays
                 const state = scalpingEngine.compute(bars, true, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
+                mtfStates['1min'] = state;
                 updateDashboard(state);
                 renderEngineOverlays(bars, state);
+                renderMtfSignalList();
 
                 // Send trade signal to backend for stats tracking
                 if (ws && ws.readyState === WebSocket.OPEN && state.decision) {
@@ -1434,6 +1495,9 @@
                         },
                     }));
                 }
+
+                // Refresh higher TF engines on new 1m bar
+                refreshMtfEngines();
             } else {
                 // Tick update: throttle, compute without overlays
                 const now = Date.now();
@@ -1441,7 +1505,9 @@
                 engineThrottleTime = now;
                 const state = scalpingEngine.compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
+                mtfStates['1min'] = state;
                 updateDashboard(state);
+                renderMtfSignalList();
 
                 // Also send tick-level BUY/SELL to backend for stats
                 // (signals are fleeting — seconds to 1 min max — must catch on ticks too)
@@ -1471,47 +1537,100 @@
             }
         }
 
+        // ═══════════════════════════════════════════════════════════
+        // MULTI-TIMEFRAME SIGNAL SYSTEM
+        // ═══════════════════════════════════════════════════════════
+
+        async function fetchMtfBars(tf) {
+            try {
+                const resp = await fetch(`/api/bars/${currentSymbol}/${tf}?limit=500`);
+                const data = await resp.json();
+                if (data.bars && data.bars.length > 0) {
+                    mtfBars[tf] = data.bars;
+                }
+            } catch (e) {
+                console.debug(`MTF fetch error (${tf}):`, e);
+            }
+        }
+
+        async function refreshMtfEngines() {
+            const now = Date.now();
+            // Re-fetch higher TF bars periodically (they update server-side via _update_higher_timeframes)
+            if (now - mtfLastFetch > MTF_FETCH_INTERVAL) {
+                mtfLastFetch = now;
+                await Promise.all([fetchMtfBars('5min'), fetchMtfBars('15min')]);
+            }
+
+            // Run engines on higher TF bars
+            for (const tf of ['5min', '15min']) {
+                const bars = mtfBars[tf];
+                if (!bars || bars.length < 30) continue;
+                try {
+                    const state = mtfEngines[tf].compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
+                    if (state) {
+                        mtfStates[tf] = state;
+                    }
+                } catch (e) {
+                    console.debug(`MTF engine error (${tf}):`, e);
+                }
+            }
+            renderMtfSignalList();
+        }
+
+        function renderMtfSignalList() {
+            const container = document.getElementById('mtf-signal-list');
+            if (!container) return;
+
+            let html = '';
+            for (const tf of MTF_TIMEFRAMES) {
+                const state = mtfStates[tf];
+                if (!state || !state.decision) continue;
+
+                const d = state.decision;
+                const ind = state.indicators || {};
+                const action = d.action || 'NO_TRADE';
+                const actionClass = action === 'BUY' ? 'buy' : action === 'SELL' ? 'sell' : 'no-trade';
+                const confPct = Math.round((state.confluence?.total || 0) * 100);
+                const confColor = action === 'BUY' ? '#26a69a' : action === 'SELL' ? '#ef5350' : '#555';
+
+                // Compute TP/SL points from ATR
+                const atr = ind.atr10 || 0;
+                const stopPts = atr ? (d.stopATR * atr).toFixed(1) : '—';
+                const targetPts = atr ? (d.targetATR * atr).toFixed(1) : '—';
+
+                html += `
+                    <div class="mtf-card ${actionClass}">
+                        <div class="mtf-card-header">
+                            <span class="mtf-tf-badge">${MTF_LABELS[tf]}</span>
+                            <span class="mtf-action ${actionClass}">${action}</span>
+                            <span style="color:#666;font-size:10px">${confPct}%</span>
+                        </div>
+                        ${action !== 'NO_TRADE' ? `
+                        <div class="mtf-details">
+                            <span>SL: ${stopPts}</span>
+                            <span>TP: ${targetPts}</span>
+                            <span>ATR: ${atr ? atr.toFixed(1) : '—'}</span>
+                            <span>${d.bias || ''}</span>
+                        </div>` : `
+                        <div class="mtf-details">
+                            <span>${d.reason || ''}</span>
+                        </div>`}
+                        <div class="mtf-confluence-bar">
+                            <div class="mtf-confluence-fill" style="width:${confPct}%;background:${confColor}"></div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            container.innerHTML = html || '<div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>';
+        }
+
         function updateDashboard(state) {
             const d = state.decision;
             const s = state.scores;
             const ind = state.indicators;
 
-            // Action
-            const actionEl = document.getElementById('dash-action');
-            actionEl.textContent = d.action;
-            actionEl.className = 'dash-action ' + (d.action === 'BUY' ? 'buy' : d.action === 'SELL' ? 'sell' : 'no-trade');
-
-            // Bias
-            document.getElementById('dash-bias').textContent = d.bias;
-
-            // Confidence bar
-            const confEl = document.getElementById('dash-confidence');
-            const confPct = Math.round(d.confidence * 100);
-            confEl.style.width = confPct + '%';
-            confEl.style.background = d.action === 'BUY' ? '#26a69a' : d.action === 'SELL' ? '#ef5350' : '#758696';
-
-            // Reason
-            document.getElementById('dash-reason').textContent = d.reason;
-
-            // Trade details (position size, entry type, stop/target)
-            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
-            if (d.action !== 'NO_TRADE') {
-                document.getElementById('dash-size').textContent = (d.positionSize * 100).toFixed(0) + '%';
-                document.getElementById('dash-entry-type').textContent = d.entryType.replace(/_/g, ' ');
-                const atr = ind.atr10;
-                if (atr !== null) {
-                    document.getElementById('dash-stop').textContent = fmt(d.stopATR * atr) + ' (' + d.stopATR + 'x ATR)';
-                    document.getElementById('dash-target').textContent = fmt(d.targetATR * atr) + ' (' + d.targetATR + 'x ATR)';
-                } else {
-                    document.getElementById('dash-stop').textContent = d.stopATR + 'x ATR';
-                    document.getElementById('dash-target').textContent = d.targetATR + 'x ATR';
-                }
-            } else {
-                document.getElementById('dash-size').textContent = '—';
-                document.getElementById('dash-entry-type').textContent = '—';
-                document.getElementById('dash-stop').textContent = '—';
-                document.getElementById('dash-target').textContent = '—';
-            }
+            // (Action + Trade Details moved to multi-TF signal list — rendered by renderMtfSignalList)
 
             // Regime
             const regEl = document.getElementById('dash-regime');
@@ -1993,6 +2112,14 @@
             }
             removeEngineSeries();
             historicalBars = [];
+
+            // Clear MTF state on symbol switch
+            mtfBars['5min'] = [];
+            mtfBars['15min'] = [];
+            mtfStates['1min'] = null;
+            mtfStates['5min'] = null;
+            mtfStates['15min'] = null;
+            mtfLastFetch = 0;
 
             // Reconnect with new symbol
             connect(newSymbol);
