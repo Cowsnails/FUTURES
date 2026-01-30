@@ -480,6 +480,14 @@ async def run_all_pattern_matches():
         except Exception as e:
             logger.error(f"Overnight pattern match error for {symbol}: {e}")
 
+    # Evaluate any sessions that have ended (e.g. overnight -> rth transition)
+    if stats_manager:
+        for symbol in pattern_engines:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if bars_1min:
+                current_price = bars_1min[-1].get('close', 0)
+                stats_manager.evaluate_closed_sessions(symbol, current_price)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -749,7 +757,16 @@ async def get_full_stats():
     """Get comprehensive stats for the stats page."""
     if not stats_manager:
         return {"error": "Stats not initialized"}
-    return stats_manager.db.get_all_stats_summary()
+    summary = stats_manager.db.get_all_stats_summary()
+    # Add bracket stats
+    from .stats_tracker import get_trading_date
+    today = get_trading_date(int(time.time()))
+    summary['bracket_today'] = stats_manager.db.get_bracket_stats(session_date=today)
+    summary['bracket_all'] = stats_manager.db.get_bracket_stats()
+    summary['bracket_trades'] = stats_manager.db.get_bracket_trades(limit=20)
+    summary['bracket_7d'] = stats_manager.db.get_rolling_bracket_stats(7)
+    summary['bracket_30d'] = stats_manager.db.get_rolling_bracket_stats(30)
+    return summary
 
 
 @app.get("/api/stats/predictions")
@@ -769,6 +786,22 @@ async def get_session_predictions(symbol: str = None):
         'active': stats_manager.session_tracker.get_active_sessions(),
         'history': stats_manager.db.get_session_predictions(symbol=symbol, limit=30),
     }
+
+
+@app.get("/api/stats/bracket")
+async def get_bracket_stats(session_date: str = None):
+    """Get bracket resolution statistics."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_bracket_stats(session_date=session_date)
+
+
+@app.get("/api/stats/bracket/trades")
+async def get_bracket_trades(session_date: str = None, limit: int = 50):
+    """Get recent bracket trade resolutions."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_bracket_trades(session_date=session_date, limit=limit)
 
 
 @app.get("/stats")
@@ -967,6 +1000,19 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             preloaded_data[symbol]['1min'].append(bar_data)
                         _update_higher_timeframes(symbol, bar_data, is_new_bar)
 
+                    # Feed every bar to stats tracker so pending signals get resolved
+                    # (outcome tracking needs continuous price updates at +1m, +5m, +15m)
+                    # Now passes OHLC for bracket resolution
+                    if stats_manager and is_new_bar:
+                        stats_manager.update_pending_outcomes(
+                            symbol=symbol,
+                            bar_time=bar_data.get('time', 0),
+                            price=bar_data.get('close', 0),
+                            bar_open=bar_data.get('open', 0),
+                            bar_high=bar_data.get('high', 0),
+                            bar_low=bar_data.get('low', 0),
+                        )
+
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
@@ -1042,6 +1088,9 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             confluence=msg.get('confluence', 0),
                             atr=msg.get('atr', 0),
                             indicators=msg.get('indicators', {}),
+                            bar_high=msg.get('bar_high', 0),
+                            bar_low=msg.get('bar_low', 0),
+                            bar_open=msg.get('bar_open', 0),
                         )
                         if events:
                             await websocket.send_json({

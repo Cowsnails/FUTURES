@@ -21,7 +21,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
+
+from .signal_resolution import (
+    Direction, ResolutionOutcome, TrailingStopState,
+    BracketParams, MFEMAETracker, TrailingStopTracker,
+    SignalResolution, BarData, resolve_signal_on_bar,
+    score_signal_quality, calculate_sqn, WinRateStats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +47,9 @@ MIN_SIGNAL_GAP_SECONDS = 60    # Minimum gap between confirmed signals (cooldown
 # Outcome measurement horizons (minutes)
 OUTCOME_HORIZONS = [1, 5, 15]
 
-# Win thresholds (points in signal direction)
+# DEPRECATED: Fixed-point win thresholds (legacy time-snapshot system).
+# The bracket resolution system (BracketParams / R-multiples) replaces these.
+# Kept only for backward-compatible legacy queries in get_today_stats/get_rolling_stats.
 WIN_THRESHOLD_1M = 5.0
 WIN_THRESHOLD_5M_ATR_MULT = 0.10
 WIN_THRESHOLD_15M_ATR_MULT = 0.25
@@ -123,6 +132,11 @@ class ActiveSignal:
 class TradeSignalTracker:
     """
     State machine for scalping decision engine signals.
+
+    Dual-mode tracking:
+    1. Legacy time-snapshot resolution (backward compatible)
+    2. New bracket-order resolution with ATR-based stops/targets
+
     Instant confirmation — signals are fleeting (last seconds to 1 min).
     Cooldown prevents duplicate fires within MIN_SIGNAL_GAP_SECONDS.
     """
@@ -130,8 +144,12 @@ class TradeSignalTracker:
     def __init__(self):
         self._signal_counter = 0
         self.current_signal: Optional[ActiveSignal] = None
-        self.pending_outcomes: List[ActiveSignal] = []  # Confirmed signals awaiting outcomes
-        self._last_confirmed_time: int = 0  # Cooldown tracking
+        self.pending_outcomes: List[ActiveSignal] = []  # Legacy outcome tracking
+        self._last_confirmed_time: int = 0
+
+        # Bracket resolution tracking
+        self.active_bracket_signals: Dict[str, SignalResolution] = {}
+        self._bar_index_counter: int = 0  # Running bar index for bracket resolution
 
     def _next_id(self) -> str:
         self._signal_counter += 1
@@ -139,32 +157,41 @@ class TradeSignalTracker:
 
     def process_bar(self, bar_time: int, price: float, action: str,
                     confluence: float, atr: float,
-                    indicator_data: dict) -> Optional[dict]:
+                    indicator_data: dict,
+                    bar_high: float = 0, bar_low: float = 0,
+                    bar_open: float = 0) -> Optional[dict]:
         """
         Process a new bar from the scalping engine.
         Returns a dict event if state changed, None otherwise.
+
+        bar_high/bar_low/bar_open: OHLC data for bracket resolution.
+        If not provided, falls back to price-only (legacy mode).
         """
         direction = 'long' if action == 'BUY' else ('short' if action == 'SELL' else '')
         has_signal = action in ('BUY', 'SELL')
 
-        # ── Update pending outcome signals ──
+        # Use price as fallback for OHLC if not provided
+        if bar_high == 0:
+            bar_high = price
+        if bar_low == 0:
+            bar_low = price
+        if bar_open == 0:
+            bar_open = price
+
+        # ── Update pending outcome signals (legacy) ──
         events = []
         for sig in self.pending_outcomes:
             sig.bars_since_entry += 1
             self._update_outcomes(sig, bar_time, price, atr)
 
-        # Remove fully resolved
+        # Remove fully resolved (legacy)
         resolved = [s for s in self.pending_outcomes if s.resolved]
         for s in resolved:
             events.append(self._make_event(s, 'TRADE_RESOLVED'))
         self.pending_outcomes = [s for s in self.pending_outcomes if not s.resolved]
 
         # ── State machine (instant confirmation for fleeting signals) ──
-        # Signals last seconds to 1 min max, so we confirm immediately
-        # on first BUY/SELL with sufficient confluence. Cooldown prevents
-        # duplicate fires within MIN_SIGNAL_GAP_SECONDS.
         if has_signal:
-            # Check cooldown
             if (bar_time - self._last_confirmed_time) >= MIN_SIGNAL_GAP_SECONDS:
                 sig = ActiveSignal(
                     signal_id=self._next_id(),
@@ -182,18 +209,122 @@ class TradeSignalTracker:
                 )
                 events.append(self._make_event(sig, 'SIGNAL_CONFIRMED'))
 
-                # Move to active and start outcome tracking
+                # Move to active and start legacy outcome tracking
                 sig.state = SignalState.ACTIVE
                 self.pending_outcomes.append(sig)
                 self._last_confirmed_time = bar_time
 
+                # Create bracket resolution signal
+                stop_mult = indicator_data.get('stopATR', 1.5) or 1.5
+                target_mult = indicator_data.get('targetATR', 2.0) or 2.0
+                if atr > 0:
+                    bracket_sig = self._create_bracket_signal(
+                        signal_id=sig.signal_id,
+                        direction=direction,
+                        entry_price=price,
+                        entry_time=bar_time,
+                        atr=atr,
+                        confluence=confluence,
+                        stop_mult=stop_mult,
+                        target_mult=target_mult,
+                        indicator_data=indicator_data,
+                    )
+                    if bracket_sig:
+                        events.append({
+                            'event_type': 'BRACKET_SIGNAL_CREATED',
+                            'signal_id': sig.signal_id,
+                            'source': 'trade_signal',
+                            'direction': direction,
+                            'entry_price': price,
+                            'stop_price': bracket_sig.bracket.stop_price,
+                            'target_price': bracket_sig.bracket.target_price,
+                            'atr': atr,
+                            'initial_risk': bracket_sig.bracket.initial_risk,
+                            'reward_risk_ratio': bracket_sig.bracket.reward_risk_ratio,
+                            'bar_time': bar_time,
+                        })
+
                 logger.info(f"Signal confirmed: {direction} @ {price:.2f} "
-                           f"(conf={confluence:.3f}, cooldown until +{MIN_SIGNAL_GAP_SECONDS}s)")
+                           f"(conf={confluence:.3f}, ATR={atr:.2f}, "
+                           f"stop_mult={stop_mult}, target_mult={target_mult})")
 
         return events if events else None
 
+    def _create_bracket_signal(self, signal_id: str, direction: str,
+                                entry_price: float, entry_time: int,
+                                atr: float, confluence: float,
+                                stop_mult: float, target_mult: float,
+                                indicator_data: dict) -> Optional[SignalResolution]:
+        """Create a bracket resolution signal from trade signal parameters."""
+        dir_enum = Direction.LONG if direction == 'long' else Direction.SHORT
+        bracket = BracketParams.from_atr(
+            entry_price, atr, dir_enum, stop_mult, target_mult
+        )
+
+        sig = SignalResolution(
+            signal_id=signal_id,
+            symbol='',  # Will be set by StatsManager
+            direction=dir_enum,
+            confluence_score=confluence,
+            bracket=bracket,
+            entry_time=entry_time,
+            entry_bar_index=self._bar_index_counter,
+            max_bars=15,
+            indicator_data=indicator_data,
+        )
+        sig.trailing.initialize(bracket)
+
+        self.active_bracket_signals[signal_id] = sig
+        return sig
+
+    def update_brackets(self, bar_time: int, bar_open: float,
+                        bar_high: float, bar_low: float,
+                        bar_close: float) -> List[SignalResolution]:
+        """
+        Process a new bar through all active bracket signals.
+        Returns list of resolved signals.
+        """
+        self._bar_index_counter += 1
+        bar = BarData(
+            timestamp=bar_time,
+            bar_index=self._bar_index_counter,
+            open=bar_open,
+            high=bar_high,
+            low=bar_low,
+            close=bar_close,
+        )
+
+        resolved = []
+        for sig_id in list(self.active_bracket_signals.keys()):
+            sig = self.active_bracket_signals[sig_id]
+            if resolve_signal_on_bar(sig, bar):
+                resolved.append(sig)
+                del self.active_bracket_signals[sig_id]
+                logger.info(
+                    f"Bracket resolved: {sig.signal_id} -> {sig.outcome.value} "
+                    f"(R={sig.r_multiple:.2f}, bars={sig.bars_held})"
+                )
+
+        return resolved
+
+    def update(self, bar_time: int, price: float, atr: float = 0) -> list:
+        """
+        Update pending outcomes with a new bar price WITHOUT processing a new signal.
+        Called from backend on every 1-min bar to resolve pending signals at +1m/+5m/+15m.
+        """
+        events = []
+        for sig in self.pending_outcomes:
+            sig.bars_since_entry += 1
+            self._update_outcomes(sig, bar_time, price, atr)
+
+        resolved = [s for s in self.pending_outcomes if s.resolved]
+        for s in resolved:
+            events.append(self._make_event(s, 'TRADE_RESOLVED'))
+        self.pending_outcomes = [s for s in self.pending_outcomes if not s.resolved]
+        return events
+
     def _update_outcomes(self, sig: ActiveSignal, bar_time: int, price: float, atr: float):
-        """Track outcomes at each horizon and MAE/MFE."""
+        """Track outcomes at each horizon and MAE/MFE (legacy)."""
         minutes_elapsed = (bar_time - sig.entry_bar_time) / 60.0
         is_long = sig.direction == 'long'
 
@@ -660,6 +791,152 @@ CREATE TABLE IF NOT EXISTS rolling_stats (
     computed_at INTEGER,
     PRIMARY KEY (signal_source, window_days)
 );
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- BRACKET RESOLUTION TABLES (new system)
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Bracket signals: ATR-based bracket parameters computed at signal time
+CREATE TABLE IF NOT EXISTS bracket_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT UNIQUE NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+    confluence_score REAL DEFAULT 0,
+
+    -- Entry details
+    entry_price REAL NOT NULL,
+    entry_time INTEGER NOT NULL,
+    entry_bar_index INTEGER NOT NULL,
+
+    -- ATR-based bracket parameters
+    atr_at_entry REAL NOT NULL,
+    stop_atr_mult REAL NOT NULL DEFAULT 1.5,
+    target_atr_mult REAL NOT NULL DEFAULT 2.0,
+    stop_price REAL NOT NULL,
+    target_price REAL NOT NULL,
+    initial_risk REAL NOT NULL,
+    reward_risk_ratio REAL NOT NULL,
+
+    -- Configuration
+    max_bars INTEGER NOT NULL DEFAULT 15,
+
+    -- Session info
+    session_date TEXT NOT NULL,
+    session_type TEXT NOT NULL,
+
+    -- Indicator snapshot at entry (JSON)
+    indicator_data TEXT,
+
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_bracket_sig_symbol ON bracket_signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_bracket_sig_time ON bracket_signals(entry_time);
+CREATE INDEX IF NOT EXISTS idx_bracket_sig_session ON bracket_signals(session_date);
+
+-- Bracket resolutions: primary bracket + secondary time snapshots
+CREATE TABLE IF NOT EXISTS bracket_resolutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL REFERENCES bracket_signals(signal_id),
+
+    -- Resolution type
+    resolution_type TEXT NOT NULL CHECK (resolution_type IN (
+        'BRACKET', 'SNAPSHOT_1M', 'SNAPSHOT_5M', 'SNAPSHOT_15M'
+    )),
+
+    -- Outcome (for BRACKET type)
+    outcome TEXT CHECK (outcome IN (
+        'TARGET_HIT', 'STOP_HIT', 'TRAILING_STOP', 'BREAKEVEN_STOP',
+        'TIMEOUT_PROFIT', 'TIMEOUT_LOSS', 'TIMEOUT_SCRATCH'
+    )),
+
+    -- Exit details
+    exit_price REAL NOT NULL,
+    exit_time INTEGER,
+    exit_bar_index INTEGER,
+    bars_held INTEGER,
+
+    -- P&L metrics
+    pnl_absolute REAL NOT NULL,
+    pnl_percent REAL NOT NULL,
+    r_multiple REAL NOT NULL,
+
+    -- MFE/MAE tracking
+    mfe_price REAL,
+    mfe_r REAL,
+    mfe_bar_index INTEGER,
+    mae_price REAL,
+    mae_r REAL,
+    mae_bar_index INTEGER,
+
+    -- End-trade drawdown from MFE
+    etd_from_mfe_r REAL,
+
+    -- Trailing stop state at resolution
+    trailing_stop_state TEXT CHECK (trailing_stop_state IN (
+        'INITIAL', 'BREAKEVEN', 'TRAIL_1R', 'TRAIL_2R'
+    )),
+    final_stop_price REAL,
+
+    -- Quality score (0-100)
+    quality_score REAL,
+
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+
+    UNIQUE(signal_id, resolution_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bracket_res_signal ON bracket_resolutions(signal_id);
+CREATE INDEX IF NOT EXISTS idx_bracket_res_type ON bracket_resolutions(resolution_type);
+CREATE INDEX IF NOT EXISTS idx_bracket_res_outcome ON bracket_resolutions(outcome);
+
+-- Bracket stats summary view
+CREATE VIEW IF NOT EXISTS v_bracket_stats AS
+SELECT
+    COUNT(*) as total_trades,
+    SUM(CASE WHEN outcome = 'TARGET_HIT' THEN 1 ELSE 0 END) as target_hits,
+    SUM(CASE WHEN outcome = 'STOP_HIT' THEN 1 ELSE 0 END) as stop_hits,
+    SUM(CASE WHEN outcome IN ('TRAILING_STOP', 'BREAKEVEN_STOP') THEN 1 ELSE 0 END) as trailing_exits,
+    SUM(CASE WHEN outcome LIKE 'TIMEOUT%' THEN 1 ELSE 0 END) as timeouts,
+    SUM(CASE WHEN outcome = 'TIMEOUT_SCRATCH' THEN 1 ELSE 0 END) as scratches,
+    ROUND(
+        CAST(SUM(CASE WHEN outcome = 'TARGET_HIT' THEN 1 ELSE 0 END) AS REAL) /
+        NULLIF(SUM(CASE WHEN outcome IN ('TARGET_HIT', 'STOP_HIT') THEN 1 ELSE 0 END), 0),
+        4
+    ) as bracket_win_rate,
+    ROUND(
+        CAST(SUM(CASE WHEN r_multiple > 0 THEN 1 ELSE 0 END) AS REAL) / COUNT(*),
+        4
+    ) as profitable_rate,
+    ROUND(AVG(r_multiple), 4) as avg_r,
+    ROUND(SUM(r_multiple), 2) as total_r,
+    ROUND(AVG(mfe_r), 4) as avg_mfe_r,
+    ROUND(AVG(mae_r), 4) as avg_mae_r,
+    ROUND(AVG(etd_from_mfe_r), 4) as avg_etd_r,
+    ROUND(AVG(bars_held), 1) as avg_bars_held,
+    ROUND(AVG(quality_score), 1) as avg_quality
+FROM bracket_resolutions
+WHERE resolution_type = 'BRACKET';
+
+-- Per-symbol bracket stats view
+CREATE VIEW IF NOT EXISTS v_symbol_bracket_stats AS
+SELECT
+    s.symbol,
+    COUNT(*) as trades,
+    ROUND(AVG(r.r_multiple), 4) as avg_r,
+    ROUND(SUM(r.r_multiple), 2) as total_r,
+    ROUND(
+        CAST(SUM(CASE WHEN r.outcome = 'TARGET_HIT' THEN 1 ELSE 0 END) AS REAL) /
+        NULLIF(SUM(CASE WHEN r.outcome IN ('TARGET_HIT', 'STOP_HIT') THEN 1 ELSE 0 END), 0),
+        4
+    ) as win_rate,
+    ROUND(AVG(r.mfe_r), 4) as avg_mfe_r,
+    ROUND(AVG(r.mae_r), 4) as avg_mae_r
+FROM bracket_signals s
+JOIN bracket_resolutions r ON s.signal_id = r.signal_id
+WHERE r.resolution_type = 'BRACKET'
+GROUP BY s.symbol;
 """
 
 
@@ -1186,6 +1463,289 @@ class TradingStatsDB:
             logger.error(f"Error building stats summary: {e}")
             return {}
 
+    # ── Bracket Resolution DB Operations ──
+
+    def insert_bracket_signal(self, sig: SignalResolution, session_date: str,
+                               session_type: str) -> None:
+        """Persist a new bracket signal to the database."""
+        try:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO bracket_signals (
+                    signal_id, symbol, direction, confluence_score,
+                    entry_price, entry_time, entry_bar_index,
+                    atr_at_entry, stop_atr_mult, target_atr_mult,
+                    stop_price, target_price, initial_risk, reward_risk_ratio,
+                    max_bars, session_date, session_type, indicator_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                sig.signal_id, sig.symbol, sig.direction.value, sig.confluence_score,
+                sig.bracket.entry_price, sig.entry_time, sig.entry_bar_index,
+                sig.bracket.atr_at_entry, sig.bracket.stop_atr_mult, sig.bracket.target_atr_mult,
+                sig.bracket.stop_price, sig.bracket.target_price,
+                sig.bracket.initial_risk, sig.bracket.reward_risk_ratio,
+                sig.max_bars, session_date, session_type,
+                json.dumps(sig.indicator_data) if sig.indicator_data else '{}',
+            ))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error inserting bracket signal: {e}")
+
+    def save_bracket_resolution(self, sig: SignalResolution) -> None:
+        """Save primary bracket resolution and time snapshots."""
+        try:
+            entry = sig.bracket.entry_price
+            exit_p = sig.exit_price
+            initial_risk = sig.bracket.initial_risk
+
+            if sig.direction == Direction.LONG:
+                pnl_abs = exit_p - entry
+            else:
+                pnl_abs = entry - exit_p
+
+            pnl_pct = (pnl_abs / entry) * 100 if entry != 0 else 0
+            r_mult = pnl_abs / initial_risk if initial_risk != 0 else 0
+            etd = sig.mfe_mae.mfe_r - r_mult if sig.mfe_mae.mfe_r > 0 else 0
+            quality = score_signal_quality(sig)
+
+            self.conn.execute("""
+                INSERT OR IGNORE INTO bracket_resolutions (
+                    signal_id, resolution_type, outcome,
+                    exit_price, exit_time, exit_bar_index, bars_held,
+                    pnl_absolute, pnl_percent, r_multiple,
+                    mfe_price, mfe_r, mfe_bar_index,
+                    mae_price, mae_r, mae_bar_index,
+                    etd_from_mfe_r, trailing_stop_state, final_stop_price,
+                    quality_score
+                ) VALUES (?, 'BRACKET', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                sig.signal_id, sig.outcome.value,
+                exit_p, sig.exit_time, sig.exit_bar_index, sig.bars_held,
+                pnl_abs, pnl_pct, r_mult,
+                sig.mfe_mae.mfe_price, sig.mfe_mae.mfe_r, sig.mfe_mae.mfe_bar_index,
+                sig.mfe_mae.mae_price, sig.mfe_mae.mae_r, sig.mfe_mae.mae_bar_index,
+                etd, sig.trailing.state.value, sig.trailing.current_stop,
+                quality,
+            ))
+
+            # Insert time snapshots as secondary resolutions
+            for snap_type, pnl in [
+                ('SNAPSHOT_1M', sig.snapshot_1m),
+                ('SNAPSHOT_5M', sig.snapshot_5m),
+                ('SNAPSHOT_15M', sig.snapshot_15m),
+            ]:
+                if pnl is not None:
+                    snap_r = pnl / initial_risk if initial_risk != 0 else 0
+                    if sig.direction == Direction.LONG:
+                        snap_price = entry + pnl
+                    else:
+                        snap_price = entry - pnl
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO bracket_resolutions (
+                            signal_id, resolution_type,
+                            exit_price, exit_time, pnl_absolute, pnl_percent, r_multiple
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        sig.signal_id, snap_type,
+                        snap_price, sig.entry_time,
+                        pnl, (pnl / entry) * 100 if entry != 0 else 0, snap_r,
+                    ))
+
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving bracket resolution: {e}")
+
+    def get_bracket_stats(self, session_date: str = None) -> dict:
+        """Get bracket resolution statistics, optionally filtered by date."""
+        try:
+            cursor = self.conn.cursor()
+
+            if session_date:
+                cursor.execute("""
+                    SELECT
+                        COUNT(*) as total_trades,
+                        SUM(CASE WHEN r.outcome = 'TARGET_HIT' THEN 1 ELSE 0 END) as target_hits,
+                        SUM(CASE WHEN r.outcome = 'STOP_HIT' THEN 1 ELSE 0 END) as stop_hits,
+                        SUM(CASE WHEN r.outcome IN ('TRAILING_STOP','BREAKEVEN_STOP') THEN 1 ELSE 0 END) as trailing_exits,
+                        SUM(CASE WHEN r.outcome LIKE 'TIMEOUT%' THEN 1 ELSE 0 END) as timeouts,
+                        SUM(CASE WHEN r.outcome = 'TIMEOUT_SCRATCH' THEN 1 ELSE 0 END) as scratches,
+                        ROUND(AVG(r.r_multiple), 4) as avg_r,
+                        ROUND(SUM(r.r_multiple), 2) as total_r,
+                        ROUND(AVG(r.mfe_r), 4) as avg_mfe_r,
+                        ROUND(AVG(r.mae_r), 4) as avg_mae_r,
+                        ROUND(AVG(r.etd_from_mfe_r), 4) as avg_etd_r,
+                        ROUND(AVG(r.bars_held), 1) as avg_bars_held,
+                        ROUND(AVG(r.quality_score), 1) as avg_quality
+                    FROM bracket_signals s
+                    JOIN bracket_resolutions r ON s.signal_id = r.signal_id
+                    WHERE r.resolution_type = 'BRACKET' AND s.session_date = ?
+                """, (session_date,))
+            else:
+                cursor.execute("SELECT * FROM v_bracket_stats")
+
+            row = cursor.fetchone()
+            if not row or row[0] == 0:
+                return {}
+
+            total = row[0]
+            target_hits = row[1] or 0
+            stop_hits = row[2] or 0
+            bracket_resolved = target_hits + stop_hits
+
+            result = {
+                'total_trades': total,
+                'target_hits': target_hits,
+                'stop_hits': stop_hits,
+                'trailing_exits': row[3] or 0,
+                'timeouts': row[4] or 0,
+                'scratches': row[5] or 0,
+                'bracket_win_rate': round(target_hits / bracket_resolved, 4) if bracket_resolved > 0 else None,
+                'profitable_rate': round(sum(1 for _ in [] if True) / total, 4) if total > 0 else None,
+                'avg_r': row[6],
+                'total_r': row[7],
+                'avg_mfe_r': row[8],
+                'avg_mae_r': row[9],
+                'avg_etd_r': row[10],
+                'avg_bars_held': row[11],
+                'avg_quality': row[12],
+            }
+
+            # Calculate profitable rate properly
+            cursor2 = self.conn.cursor()
+            if session_date:
+                cursor2.execute("""
+                    SELECT COUNT(*) FROM bracket_resolutions r
+                    JOIN bracket_signals s ON r.signal_id = s.signal_id
+                    WHERE r.resolution_type = 'BRACKET' AND r.r_multiple > 0
+                      AND s.session_date = ?
+                """, (session_date,))
+            else:
+                cursor2.execute("""
+                    SELECT COUNT(*) FROM bracket_resolutions
+                    WHERE resolution_type = 'BRACKET' AND r_multiple > 0
+                """)
+            profitable_count = cursor2.fetchone()[0] or 0
+            result['profitable_rate'] = round(profitable_count / total, 4) if total > 0 else None
+
+            # Get R-multiples for SQN
+            if session_date:
+                cursor2.execute("""
+                    SELECT r.r_multiple FROM bracket_resolutions r
+                    JOIN bracket_signals s ON r.signal_id = s.signal_id
+                    WHERE r.resolution_type = 'BRACKET' AND s.session_date = ?
+                """, (session_date,))
+            else:
+                cursor2.execute("""
+                    SELECT r_multiple FROM bracket_resolutions
+                    WHERE resolution_type = 'BRACKET'
+                """)
+            r_multiples = [row[0] for row in cursor2.fetchall() if row[0] is not None]
+            if len(r_multiples) >= 2:
+                result['sqn'] = round(calculate_sqn(r_multiples), 2)
+                result['expectancy'] = round(sum(r_multiples) / len(r_multiples), 4)
+            else:
+                result['sqn'] = None
+                result['expectancy'] = result['avg_r']
+
+            return result
+        except Exception as e:
+            logger.error(f"Error reading bracket stats: {e}")
+            return {}
+
+    def get_bracket_trades(self, session_date: str = None, limit: int = 50) -> list:
+        """Get recent bracket trade resolutions."""
+        try:
+            cursor = self.conn.cursor()
+            if session_date:
+                cursor.execute("""
+                    SELECT s.signal_id, s.symbol, s.direction, s.confluence_score,
+                           s.entry_price, s.entry_time,
+                           s.atr_at_entry, s.stop_price, s.target_price,
+                           s.initial_risk, s.reward_risk_ratio,
+                           r.outcome, r.exit_price, r.exit_time, r.bars_held,
+                           r.r_multiple, r.mfe_r, r.mae_r, r.etd_from_mfe_r,
+                           r.trailing_stop_state, r.quality_score
+                    FROM bracket_signals s
+                    JOIN bracket_resolutions r ON s.signal_id = r.signal_id
+                    WHERE r.resolution_type = 'BRACKET' AND s.session_date = ?
+                    ORDER BY s.entry_time DESC LIMIT ?
+                """, (session_date, limit))
+            else:
+                cursor.execute("""
+                    SELECT s.signal_id, s.symbol, s.direction, s.confluence_score,
+                           s.entry_price, s.entry_time,
+                           s.atr_at_entry, s.stop_price, s.target_price,
+                           s.initial_risk, s.reward_risk_ratio,
+                           r.outcome, r.exit_price, r.exit_time, r.bars_held,
+                           r.r_multiple, r.mfe_r, r.mae_r, r.etd_from_mfe_r,
+                           r.trailing_stop_state, r.quality_score
+                    FROM bracket_signals s
+                    JOIN bracket_resolutions r ON s.signal_id = r.signal_id
+                    WHERE r.resolution_type = 'BRACKET'
+                    ORDER BY s.entry_time DESC LIMIT ?
+                """, (limit,))
+
+            cols = [
+                'signal_id', 'symbol', 'direction', 'confluence_score',
+                'entry_price', 'entry_time',
+                'atr_at_entry', 'stop_price', 'target_price',
+                'initial_risk', 'reward_risk_ratio',
+                'outcome', 'exit_price', 'exit_time', 'bars_held',
+                'r_multiple', 'mfe_r', 'mae_r', 'etd_from_mfe_r',
+                'trailing_stop_state', 'quality_score',
+            ]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error reading bracket trades: {e}")
+            return []
+
+    def get_rolling_bracket_stats(self, window_days: int = 7) -> dict:
+        """Get rolling bracket stats for a time window."""
+        try:
+            cursor = self.conn.cursor()
+            cutoff = int(time.time()) - (window_days * 86400)
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN r.outcome = 'TARGET_HIT' THEN 1 ELSE 0 END) as target_hits,
+                    SUM(CASE WHEN r.outcome = 'STOP_HIT' THEN 1 ELSE 0 END) as stop_hits,
+                    SUM(CASE WHEN r.r_multiple > 0 THEN 1 ELSE 0 END) as profitable,
+                    ROUND(AVG(r.r_multiple), 4) as avg_r,
+                    ROUND(SUM(r.r_multiple), 2) as total_r,
+                    ROUND(AVG(r.mfe_r), 4) as avg_mfe_r,
+                    ROUND(AVG(r.mae_r), 4) as avg_mae_r,
+                    ROUND(AVG(r.quality_score), 1) as avg_quality
+                FROM bracket_signals s
+                JOIN bracket_resolutions r ON s.signal_id = r.signal_id
+                WHERE r.resolution_type = 'BRACKET' AND s.entry_time >= ?
+            """, (cutoff,))
+
+            row = cursor.fetchone()
+            if not row or row[0] == 0:
+                return {'window_days': window_days, 'total_trades': 0}
+
+            total = row[0]
+            target_hits = row[1] or 0
+            stop_hits = row[2] or 0
+            bracket_resolved = target_hits + stop_hits
+
+            return {
+                'window_days': window_days,
+                'total_trades': total,
+                'target_hits': target_hits,
+                'stop_hits': stop_hits,
+                'bracket_win_rate': round(target_hits / bracket_resolved, 4) if bracket_resolved > 0 else None,
+                'profitable_rate': round((row[3] or 0) / total, 4) if total > 0 else None,
+                'avg_r': row[4],
+                'total_r': row[5],
+                'avg_mfe_r': row[6],
+                'avg_mae_r': row[7],
+                'avg_quality': row[8],
+            }
+        except Exception as e:
+            logger.error(f"Error reading rolling bracket stats: {e}")
+            return {'window_days': window_days, 'total_trades': 0}
+
     # ── Lifecycle ──
 
     def flush(self):
@@ -1248,17 +1808,36 @@ class StatsManager:
 
     def process_trade_signal(self, symbol: str, bar_time: int, price: float,
                              action: str, confluence: float, atr: float,
-                             indicators: dict) -> Optional[List[dict]]:
+                             indicators: dict,
+                             bar_high: float = 0, bar_low: float = 0,
+                             bar_open: float = 0) -> Optional[List[dict]]:
         """Process a trade signal bar from the scalping engine."""
         tracker = self.get_tracker(symbol)
-        events = tracker.process_bar(bar_time, price, action, confluence, atr, indicators)
+        events = tracker.process_bar(
+            bar_time, price, action, confluence, atr, indicators,
+            bar_high=bar_high, bar_low=bar_low, bar_open=bar_open,
+        )
 
         if events:
             for event in events:
                 event['symbol'] = symbol
                 self.db.log_signal_event(event)
-                logger.info(f"[{symbol}] Trade signal event: {event['event_type']} "
-                           f"({event['direction']}, conf={event['confluence_score']:.2f})")
+
+                # Persist bracket signal to DB
+                if event.get('event_type') == 'BRACKET_SIGNAL_CREATED':
+                    sig_id = event['signal_id']
+                    bracket_sig = tracker.active_bracket_signals.get(sig_id)
+                    if bracket_sig:
+                        bracket_sig.symbol = symbol
+                        self.db.insert_bracket_signal(
+                            bracket_sig,
+                            session_date=get_trading_date(bar_time),
+                            session_type=get_session_type(bar_time),
+                        )
+
+                if event.get('event_type') in ('SIGNAL_CONFIRMED', 'BRACKET_SIGNAL_CREATED'):
+                    logger.info(f"[{symbol}] {event['event_type']}: "
+                               f"{event.get('direction')}, conf={event.get('confluence_score', 0):.2f}")
 
         return events
 
@@ -1294,14 +1873,112 @@ class StatsManager:
 
         return snapshot
 
+    # ── Outcome resolution (called on every new 1-min bar) ──
+
+    def update_pending_outcomes(self, symbol: str, bar_time: int, price: float,
+                               bar_open: float = 0, bar_high: float = 0,
+                               bar_low: float = 0):
+        """
+        Feed a new bar to all pending signals for this symbol.
+        Handles both legacy time-snapshot resolution and bracket resolution.
+        Called from on_bar_update in app.py on EVERY new bar.
+        """
+        tracker = self.get_tracker(symbol)
+
+        # Legacy time-snapshot resolution
+        if tracker.pending_outcomes:
+            events = tracker.update(bar_time=bar_time, price=price, atr=0)
+            for event in events:
+                self.db.log_signal_event(event)
+
+        # Bracket resolution (OHLC-based)
+        if tracker.active_bracket_signals:
+            o = bar_open if bar_open > 0 else price
+            h = bar_high if bar_high > 0 else price
+            l = bar_low if bar_low > 0 else price
+
+            resolved = tracker.update_brackets(bar_time, o, h, l, price)
+            for sig in resolved:
+                self.db.save_bracket_resolution(sig)
+                logger.info(
+                    f"[{symbol}] Bracket resolved: {sig.signal_id} -> "
+                    f"{sig.outcome.value} (R={sig.r_multiple:.2f})"
+                )
+
+    # ── Session close evaluation ──
+
+    def evaluate_closed_sessions(self, symbol: str, current_price: float):
+        """
+        Check if any active anchored sessions have ended and evaluate them.
+        Called every minute from the pattern match loop.
+
+        A session is considered closed when the current time's session type
+        no longer matches the session_type of the prediction.
+        e.g. if we tracked an 'overnight' prediction and now it's 'rth' time,
+        the overnight session is over — evaluate it.
+        """
+        now = int(time.time())
+        current_session = get_session_type(now)
+
+        for key, state in list(self.session_tracker._active_sessions.items()):
+            sess_date, sess_type, sym = key
+            if sym != symbol:
+                continue
+
+            # Session ended if we're in a different session type now
+            # (overnight -> rth means overnight ended, rth -> overnight means rth ended)
+            if sess_type != current_session and sess_type != 'maintenance':
+                total = state['total_votes']
+                bull = state['bullish_votes']
+                bear = state['bearish_votes']
+                majority_dir = 'bullish' if bull >= bear else 'bearish'
+
+                # Did the market move in the predicted direction?
+                anchor_price = state['anchor_price']
+                actual_move = current_price - anchor_price
+                predicted_bullish = majority_dir == 'bullish'
+                direction_correct = (actual_move > 0 and predicted_bullish) or \
+                                    (actual_move < 0 and not predicted_bullish)
+
+                # Compute avg projected prices
+                avg_eod = state['eod_proj_sum'] / total if total > 0 else 0
+                eod_error = abs(current_price - avg_eod) if avg_eod else None
+
+                # Update the DB row
+                try:
+                    cursor = self.db.conn.cursor()
+                    cursor.execute("""
+                        UPDATE session_predictions SET
+                            actual_close_price = ?,
+                            direction_correct = ?,
+                            eod_error_points = ?,
+                            is_closed = 1
+                        WHERE session_date = ? AND session_type = ? AND symbol = ?
+                    """, (current_price, 1 if direction_correct else 0,
+                          eod_error, sess_date, sess_type, sym))
+                    self.db.conn.commit()
+                    logger.info(f"[{sym}] Session prediction EVALUATED: {sess_type} {sess_date} "
+                               f"- predicted {majority_dir}, actual move {actual_move:+.1f}pts "
+                               f"-> {'CORRECT' if direction_correct else 'WRONG'}")
+                except Exception as e:
+                    logger.error(f"Error evaluating session prediction: {e}")
+
+                # Remove from active tracking
+                self.session_tracker.clear_session(sess_date, sess_type, sym)
+
     # ── Dashboard API ──
 
     def get_dashboard_stats(self) -> dict:
         """Get all stats for dashboard display."""
+        today = get_trading_date(int(time.time()))
         return {
             'today': self.db.get_today_stats(),
             'rolling_7d': self.db.get_rolling_stats(7),
             'rolling_30d': self.db.get_rolling_stats(30),
+            'bracket_today': self.db.get_bracket_stats(session_date=today),
+            'bracket_all': self.db.get_bracket_stats(),
+            'bracket_7d': self.db.get_rolling_bracket_stats(7),
+            'bracket_30d': self.db.get_rolling_bracket_stats(30),
         }
 
     def shutdown(self):
