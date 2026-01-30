@@ -402,22 +402,22 @@ def initialize_pattern_engines():
 
 async def pattern_match_loop():
     """
-    Background task: run daily pattern matching every 30 minutes, 24/7.
-    Runs immediately on first iteration, then every 30 min.
+    Background task: run pattern matching every 5 minutes, 24/7.
+    Runs immediately on first iteration, then every 5 min.
     """
     # Run immediately on startup
     await run_all_pattern_matches()
 
     while True:
         try:
-            await asyncio.sleep(1800)
+            await asyncio.sleep(300)  # 5 minutes
             await run_all_pattern_matches()
         except asyncio.CancelledError:
             logger.info("Pattern match loop cancelled")
             break
         except Exception as e:
             logger.error(f"Pattern match loop error: {e}")
-            await asyncio.sleep(120)
+            await asyncio.sleep(60)
 
 
 async def run_all_pattern_matches():
@@ -803,6 +803,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                 async def on_bar_update(bar_data: dict, is_new_bar: bool):
                     """Called on every bar update"""
                     logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
+
+                    # Keep preloaded_data up-to-date with new bars
+                    if is_new_bar and symbol in preloaded_data and '1min' in preloaded_data[symbol]:
+                        preloaded_data[symbol]['1min'].append(bar_data)
+
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
