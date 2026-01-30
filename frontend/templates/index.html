@@ -556,18 +556,6 @@
                 <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-on-signal">—</span></div>
             </div>
 
-            <!-- SIGNAL STATS -->
-            <div style="margin-top:10px;border-top:1px solid #333;padding-top:8px">
-                <div style="font-size:11px;font-weight:700;color:#B0BEC5;margin-bottom:4px">SIGNAL STATS (Today)</div>
-                <div class="dash-row"><span>Signals</span><span class="dash-val" id="dash-stat-signals">—</span></div>
-                <div class="dash-row"><span>Confirmed</span><span class="dash-val" id="dash-stat-confirmed">—</span></div>
-                <div class="dash-row"><span>Resolved</span><span class="dash-val" id="dash-stat-resolved">—</span></div>
-                <div class="dash-row"><span>Win 1m</span><span class="dash-val" id="dash-stat-wr1m">—</span></div>
-                <div class="dash-row"><span>Win 5m</span><span class="dash-val" id="dash-stat-wr5m">—</span></div>
-                <div class="dash-row"><span>Win 15m</span><span class="dash-val" id="dash-stat-wr15m">—</span></div>
-                <div class="dash-row"><span>Avg MFE</span><span class="dash-val" id="dash-stat-mfe">—</span></div>
-                <div class="dash-row"><span>Avg MAE</span><span class="dash-val" id="dash-stat-mae">—</span></div>
-            </div>
         </div>
     </div>
 
@@ -2081,28 +2069,6 @@
 
             // Connect to WebSocket
             connect(currentSymbol);
-
-            // Poll stats every 60 seconds
-            async function fetchStats() {
-                try {
-                    const resp = await fetch('/api/stats/today');
-                    const data = await resp.json();
-                    if (data && data.stats && data.stats.trade_signal) {
-                        const ts = data.stats.trade_signal;
-                        const el = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val; };
-                        el('dash-stat-signals', ts.total_events || 0);
-                        el('dash-stat-confirmed', ts.confirmed || 0);
-                        el('dash-stat-resolved', ts.resolved || 0);
-                        el('dash-stat-wr1m', ts.resolved > 0 ? (ts.win_rate_1m * 100).toFixed(0) + '%' : '—');
-                        el('dash-stat-wr5m', ts.resolved > 0 ? (ts.win_rate_5m * 100).toFixed(0) + '%' : '—');
-                        el('dash-stat-wr15m', ts.resolved > 0 ? (ts.win_rate_15m * 100).toFixed(0) + '%' : '—');
-                        el('dash-stat-mfe', ts.avg_mfe > 0 ? ts.avg_mfe.toFixed(1) + ' pts' : '—');
-                        el('dash-stat-mae', ts.avg_mae > 0 ? ts.avg_mae.toFixed(1) + ' pts' : '—');
-                    }
-                } catch (e) { console.debug('Stats fetch error:', e); }
-            }
-            fetchStats();
-            setInterval(fetchStats, 60000);
 
             console.log('Application initialized');
         });
