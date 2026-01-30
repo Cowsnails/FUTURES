@@ -767,23 +767,37 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
 
         # Helper function to send timeframe data from memory
         async def send_timeframe_data(tf: str):
-            """Send preloaded data for a timeframe - instant from memory"""
-            if symbol in preloaded_data and tf in preloaded_data[symbol]:
-                data_list = preloaded_data[symbol][tf]
-                if data_list:
-                    await connection_manager.send_to_client(websocket, {
-                        'type': 'historical',
-                        'data': data_list,
-                        'symbol': symbol,
-                        'timeframe': tf,
-                        'bar_count': len(data_list),
-                        'indicators': {}  # TODO: calculate indicators if needed
-                    })
-                    logger.info(f"[{symbol}] Sent {len(data_list)} bars for {tf} (from memory)")
-                else:
-                    logger.warning(f"[{symbol}] No preloaded data for {tf}")
+            """Send data for a timeframe - aggregated live from 1min data"""
+            if symbol not in preloaded_data:
+                logger.warning(f"[{symbol}] No preloaded data at all")
+                return
+
+            if tf == '1min':
+                data_list = preloaded_data[symbol].get('1min', [])
             else:
-                logger.warning(f"[{symbol}] Timeframe {tf} not in preloaded_data")
+                # Re-aggregate from live 1min data so higher timeframes
+                # include bars accumulated since startup
+                import pandas as pd
+                bars_1min = preloaded_data[symbol].get('1min', [])
+                if bars_1min and historical_fetcher:
+                    df = pd.DataFrame(bars_1min)
+                    agg_df = historical_fetcher.aggregate_bars(df, tf)
+                    data_list = agg_df.to_dict('records')
+                else:
+                    data_list = preloaded_data[symbol].get(tf, [])
+
+            if data_list:
+                await connection_manager.send_to_client(websocket, {
+                    'type': 'historical',
+                    'data': data_list,
+                    'symbol': symbol,
+                    'timeframe': tf,
+                    'bar_count': len(data_list),
+                    'indicators': {}
+                })
+                logger.info(f"[{symbol}] Sent {len(data_list)} bars for {tf}")
+            else:
+                logger.warning(f"[{symbol}] No data available for {tf}")
 
         # Step 1: Send initial data from memory (instant!)
         try:
