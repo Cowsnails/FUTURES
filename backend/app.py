@@ -480,6 +480,14 @@ async def run_all_pattern_matches():
         except Exception as e:
             logger.error(f"Overnight pattern match error for {symbol}: {e}")
 
+    # Evaluate any sessions that have ended (e.g. overnight -> rth transition)
+    if stats_manager:
+        for symbol in pattern_engines:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if bars_1min:
+                current_price = bars_1min[-1].get('close', 0)
+                stats_manager.evaluate_closed_sessions(symbol, current_price)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -966,6 +974,15 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         if is_new_bar:
                             preloaded_data[symbol]['1min'].append(bar_data)
                         _update_higher_timeframes(symbol, bar_data, is_new_bar)
+
+                    # Feed every bar to stats tracker so pending signals get resolved
+                    # (outcome tracking needs continuous price updates at +1m, +5m, +15m)
+                    if stats_manager and is_new_bar:
+                        stats_manager.update_pending_outcomes(
+                            symbol=symbol,
+                            bar_time=bar_data.get('time', 0),
+                            price=bar_data.get('close', 0),
+                        )
 
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',

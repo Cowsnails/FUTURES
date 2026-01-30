@@ -192,6 +192,22 @@ class TradeSignalTracker:
 
         return events if events else None
 
+    def update(self, bar_time: int, price: float, atr: float = 0) -> list:
+        """
+        Update pending outcomes with a new bar price WITHOUT processing a new signal.
+        Called from backend on every 1-min bar to resolve pending signals at +1m/+5m/+15m.
+        """
+        events = []
+        for sig in self.pending_outcomes:
+            sig.bars_since_entry += 1
+            self._update_outcomes(sig, bar_time, price, atr)
+
+        resolved = [s for s in self.pending_outcomes if s.resolved]
+        for s in resolved:
+            events.append(self._make_event(s, 'TRADE_RESOLVED'))
+        self.pending_outcomes = [s for s in self.pending_outcomes if not s.resolved]
+        return events
+
     def _update_outcomes(self, sig: ActiveSignal, bar_time: int, price: float, atr: float):
         """Track outcomes at each horizon and MAE/MFE."""
         minutes_elapsed = (bar_time - sig.entry_bar_time) / 60.0
@@ -1293,6 +1309,84 @@ class StatsManager:
                        f"({snapshot['consensus']})")
 
         return snapshot
+
+    # ── Outcome resolution (called on every new 1-min bar) ──
+
+    def update_pending_outcomes(self, symbol: str, bar_time: int, price: float):
+        """
+        Feed a new bar price to all pending signals for this symbol
+        so they can be resolved at +1m, +5m, +15m horizons.
+        Called from on_bar_update in app.py on EVERY new bar.
+        """
+        tracker = self.get_tracker(symbol)
+        if not tracker.pending_outcomes:
+            return
+
+        # Feed the bar to the tracker — triggers outcome checks and resolution
+        events = tracker.update(bar_time=bar_time, price=price, atr=0)
+        for event in events:
+            self.db.log_signal_event(event)
+
+    # ── Session close evaluation ──
+
+    def evaluate_closed_sessions(self, symbol: str, current_price: float):
+        """
+        Check if any active anchored sessions have ended and evaluate them.
+        Called every minute from the pattern match loop.
+
+        A session is considered closed when the current time's session type
+        no longer matches the session_type of the prediction.
+        e.g. if we tracked an 'overnight' prediction and now it's 'rth' time,
+        the overnight session is over — evaluate it.
+        """
+        now = int(time.time())
+        current_session = get_session_type(now)
+
+        for key, state in list(self.session_tracker._active_sessions.items()):
+            sess_date, sess_type, sym = key
+            if sym != symbol:
+                continue
+
+            # Session ended if we're in a different session type now
+            # (overnight -> rth means overnight ended, rth -> overnight means rth ended)
+            if sess_type != current_session and sess_type != 'maintenance':
+                total = state['total_votes']
+                bull = state['bullish_votes']
+                bear = state['bearish_votes']
+                majority_dir = 'bullish' if bull >= bear else 'bearish'
+
+                # Did the market move in the predicted direction?
+                anchor_price = state['anchor_price']
+                actual_move = current_price - anchor_price
+                predicted_bullish = majority_dir == 'bullish'
+                direction_correct = (actual_move > 0 and predicted_bullish) or \
+                                    (actual_move < 0 and not predicted_bullish)
+
+                # Compute avg projected prices
+                avg_eod = state['eod_proj_sum'] / total if total > 0 else 0
+                eod_error = abs(current_price - avg_eod) if avg_eod else None
+
+                # Update the DB row
+                try:
+                    cursor = self.db.conn.cursor()
+                    cursor.execute("""
+                        UPDATE session_predictions SET
+                            actual_close_price = ?,
+                            direction_correct = ?,
+                            eod_error_points = ?,
+                            is_closed = 1
+                        WHERE session_date = ? AND session_type = ? AND symbol = ?
+                    """, (current_price, 1 if direction_correct else 0,
+                          eod_error, sess_date, sess_type, sym))
+                    self.db.conn.commit()
+                    logger.info(f"[{sym}] Session prediction EVALUATED: {sess_type} {sess_date} "
+                               f"- predicted {majority_dir}, actual move {actual_move:+.1f}pts "
+                               f"-> {'CORRECT' if direction_correct else 'WRONG'}")
+                except Exception as e:
+                    logger.error(f"Error evaluating session prediction: {e}")
+
+                # Remove from active tracking
+                self.session_tracker.clear_session(sess_date, sess_type, sym)
 
     # ── Dashboard API ──
 
