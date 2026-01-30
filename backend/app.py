@@ -358,8 +358,13 @@ async def prefetch_all_tickers():
             try:
                 tf_data = cache.load(symbol, bar_size=tf, max_age_hours=None)
                 if tf_data is not None and len(tf_data) > 0:
-                    # Convert to list of dicts for fast JSON serialization
-                    preloaded_data[symbol][tf] = tf_data.to_dict('records')
+                    # Convert to list of dicts with native Python types
+                    # (parquet loads numpy types which can break JSON serialization)
+                    records = tf_data.to_dict('records')
+                    preloaded_data[symbol][tf] = [
+                        {k: (int(v) if k == 'time' else float(v)) for k, v in row.items()}
+                        for row in records
+                    ]
                     logger.info(f"  ✓ {symbol}/{tf}: {len(preloaded_data[symbol][tf])} bars in memory")
                 else:
                     preloaded_data[symbol][tf] = []
@@ -891,7 +896,18 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         if new_tf in TIMEFRAMES:
                             logger.info(f"[{symbol}] Switching timeframe: {current_timeframe} -> {new_tf}")
                             current_timeframe = new_tf
-                            await send_timeframe_data(new_tf)
+                            try:
+                                await send_timeframe_data(new_tf)
+                            except Exception as e:
+                                logger.error(f"[{symbol}] Error sending {new_tf} data: {e}", exc_info=True)
+                                await websocket.send_json({
+                                    'type': 'historical',
+                                    'data': [],
+                                    'symbol': symbol,
+                                    'timeframe': new_tf,
+                                    'bar_count': 0,
+                                    'indicators': {}
+                                })
                         else:
                             logger.warning(f"[{symbol}] Invalid timeframe requested: {new_tf}")
 
