@@ -284,6 +284,8 @@
             right: 10px;
             z-index: 100;
             width: 240px;
+            max-height: calc(100vh - 70px);
+            overflow-y: auto;
             background: rgba(19, 23, 34, 0.92);
             border: 1px solid #2a2e39;
             border-radius: 8px;
@@ -334,6 +336,60 @@
             overflow: hidden;
         }
         .dash-confidence-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+
+        .mtf-card {
+            background: #131722;
+            border: 1px solid #1e222d;
+            border-radius: 5px;
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+        .mtf-card.buy { border-left: 3px solid #26a69a; }
+        .mtf-card.sell { border-left: 3px solid #ef5350; }
+        .mtf-card.no-trade { border-left: 3px solid #333; opacity: 0.6; }
+        .mtf-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3px;
+        }
+        .mtf-tf-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
+            background: #1e222d;
+            color: #B0BEC5;
+        }
+        .mtf-action {
+            font-weight: 700;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }
+        .mtf-action.buy { color: #26a69a; }
+        .mtf-action.sell { color: #ef5350; }
+        .mtf-action.no-trade { color: #555; }
+        .mtf-details {
+            display: flex;
+            gap: 8px;
+            color: #888;
+            font-size: 10px;
+        }
+        .mtf-details span { white-space: nowrap; }
+        .mtf-confluence-bar {
+            height: 3px;
+            background: #1e222d;
+            border-radius: 2px;
+            margin-top: 3px;
+            overflow: hidden;
+        }
+        .mtf-confluence-fill {
             height: 100%;
             border-radius: 2px;
             transition: width 0.3s;
@@ -424,6 +480,8 @@
                     <option value="4H">4h</option>
                 </select>
             </div>
+            <!-- Stats Page Link -->
+            <a href="/stats" target="_blank" style="background:#1a1a2e; color:#7b8cff; border:1px solid #333; padding:4px 12px; border-radius:5px; text-decoration:none; font-size:12px; cursor:pointer; margin-right:4px;">Stats</a>
             <!-- Data Grabber -->
             <div class="data-grabber" id="data-grabber">
                 <button class="data-grabber-btn" id="dg-btn">Data Grabber</button>
@@ -468,18 +526,10 @@
         <!-- Scalping Dashboard -->
         <div class="scalping-dashboard visible" id="scalping-dashboard">
             <div class="dash-section">
-                <div class="dash-label">Action</div>
-                <div class="dash-action no-trade" id="dash-action">—</div>
-                <div class="dash-bias" id="dash-bias"></div>
-                <div class="dash-confidence-bar"><div class="dash-confidence-fill" id="dash-confidence" style="width:0;background:#758696"></div></div>
-                <div class="dash-reason" id="dash-reason"></div>
-            </div>
-            <div class="dash-section">
-                <div class="dash-label">Trade Details</div>
-                <div class="dash-row"><span>Size</span><span class="dash-val" id="dash-size">—</span></div>
-                <div class="dash-row"><span>Entry</span><span class="dash-val" id="dash-entry-type">—</span></div>
-                <div class="dash-row"><span>Stop</span><span class="dash-val" id="dash-stop">—</span></div>
-                <div class="dash-row"><span>Target</span><span class="dash-val" id="dash-target">—</span></div>
+                <div class="dash-label">Trade Actions (All Timeframes)</div>
+                <div id="mtf-signal-list" style="max-height:220px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#333 transparent;">
+                    <div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>
+                </div>
             </div>
             <div class="dash-section">
                 <div class="dash-label">Regime</div>
@@ -535,9 +585,23 @@
                 <div class="dash-row"><span>Mean Move</span><span class="dash-val" id="dash-pm-move">—</span></div>
                 <div class="dash-row"><span>Phase</span><span class="dash-val" id="dash-pm-phase">—</span></div>
                 <div class="dash-row"><span>EOD Proj</span><span class="dash-val" id="dash-pm-eod">—</span></div>
+                <div class="dash-row"><span>Peak Move</span><span class="dash-val" id="dash-pm-peak">—</span></div>
                 <div class="dash-row"><span>Matches</span><span class="dash-val" id="dash-pm-count">—</span></div>
                 <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-pm-signal">—</span></div>
             </div>
+            <div class="dash-section">
+                <div class="dash-label">Overnight Pattern</div>
+                <div class="dash-row"><span>Status</span><span class="dash-val" id="dash-on-status" style="color:#758696">waiting</span></div>
+                <div class="dash-row"><span>Direction</span><span class="dash-val" id="dash-on-dir">—</span></div>
+                <div class="dash-row"><span>Consensus</span><span class="dash-val" id="dash-on-consensus">—</span></div>
+                <div class="dash-row"><span>Avg Corr</span><span class="dash-val" id="dash-on-corr">—</span></div>
+                <div class="dash-row"><span>Mean Move</span><span class="dash-val" id="dash-on-move">—</span></div>
+                <div class="dash-row"><span>EOS Proj</span><span class="dash-val" id="dash-on-eos">—</span></div>
+                <div class="dash-row"><span>Peak Move</span><span class="dash-val" id="dash-on-peak">—</span></div>
+                <div class="dash-row"><span>Matches</span><span class="dash-val" id="dash-on-count">—</span></div>
+                <div class="dash-row" style="margin-top:3px;font-weight:700"><span>Signal</span><span class="dash-val" id="dash-on-signal">—</span></div>
+            </div>
+
         </div>
     </div>
 
@@ -584,9 +648,22 @@
         let currentOpenPrice = null;  // Current open price for candle coloring
         let supertrendIndicator = null;  // Supertrend Multi-Timeframe indicator
         let historicalBars = [];  // Store bars for indicator calculations
-        let scalpingEngine = new ScalpingEngine();  // Scalping decision engine
+        let scalpingEngine = new ScalpingEngine();  // Scalping decision engine (1m - primary)
         let engineThrottleTime = 0;  // Throttle engine updates
         const ENGINE_THROTTLE_MS = 1000;
+
+        // Multi-timeframe scalping engines
+        const MTF_TIMEFRAMES = ['1min', '5min', '15min'];
+        const MTF_LABELS = { '1min': '1m', '5min': '5m', '15min': '15m' };
+        const mtfEngines = {
+            '1min': scalpingEngine,  // reuse primary engine
+            '5min': new ScalpingEngine(),
+            '15min': new ScalpingEngine(),
+        };
+        const mtfBars = { '1min': null, '5min': [], '15min': [] };  // 1min uses historicalBars
+        const mtfStates = { '1min': null, '5min': null, '15min': null };
+        let mtfLastFetch = 0;
+        const MTF_FETCH_INTERVAL = 60000;  // re-fetch higher TF bars every 60s
 
         // Scalping engine chart series (VWAP, EMA, levels)
         let engineSeries = {};
@@ -844,6 +921,15 @@
                 console.log(`WebSocket connected to ${symbol}`);
                 updateStatus('connected', `${symbol} Connected`);
                 reconnectAttempts = 0;
+                // Fetch cached pattern match results
+                fetch(`/api/pattern/${symbol}`)
+                    .then(r => r.json())
+                    .then(data => { if (data && data.match_count) handlePatternUpdate(data); })
+                    .catch(() => {});
+                fetch(`/api/pattern/${symbol}/overnight`)
+                    .then(r => r.json())
+                    .then(data => { if (data && data.match_count) handleOvernightPatternUpdate(data); })
+                    .catch(() => {});
             };
 
             ws.onmessage = (event) => {
@@ -903,6 +989,10 @@
 
                 case 'pattern_update':
                     handlePatternUpdate(msg);
+                    break;
+
+                case 'overnight_pattern_update':
+                    handleOvernightPatternUpdate(msg);
                     break;
 
                 case 'ping':
@@ -1377,8 +1467,37 @@
                 // New bar: full compute + overlays
                 const state = scalpingEngine.compute(bars, true, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
+                mtfStates['1min'] = state;
                 updateDashboard(state);
                 renderEngineOverlays(bars, state);
+                renderMtfSignalList();
+
+                // Send trade signal to backend for stats tracking
+                if (ws && ws.readyState === WebSocket.OPEN && state.decision) {
+                    const lastBar = bars[bars.length - 1];
+                    ws.send(JSON.stringify({
+                        type: 'trade_signal',
+                        bar_time: lastBar.time,
+                        price: lastBar.close,
+                        action: state.decision.action || 'NO_TRADE',
+                        confluence: state.confluence?.total || 0,
+                        atr: state.indicators?.atr10 || 0,
+                        indicators: {
+                            vwap_score: state.scores?.vwap || 0,
+                            ema_score: state.scores?.ema || 0,
+                            rsi_score: state.scores?.rsi || 0,
+                            adx_score: state.scores?.adx || 0,
+                            volume_score: state.scores?.volume || 0,
+                            rsi_val: state.indicators?.rsi7 || 0,
+                            adx_val: state.indicators?.adx10 || 0,
+                            atr_val: state.indicators?.atr10 || 0,
+                            chop_val: state.indicators?.chop14 || 0,
+                        },
+                    }));
+                }
+
+                // Refresh higher TF engines on new 1m bar
+                refreshMtfEngines();
             } else {
                 // Tick update: throttle, compute without overlays
                 const now = Date.now();
@@ -1386,8 +1505,162 @@
                 engineThrottleTime = now;
                 const state = scalpingEngine.compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
+                mtfStates['1min'] = state;
                 updateDashboard(state);
+                renderMtfSignalList();
+
+                // Also send tick-level BUY/SELL to backend for stats
+                // (signals are fleeting — seconds to 1 min max — must catch on ticks too)
+                if (ws && ws.readyState === WebSocket.OPEN && state.decision &&
+                    (state.decision.action === 'BUY' || state.decision.action === 'SELL')) {
+                    const lastBar = bars[bars.length - 1];
+                    ws.send(JSON.stringify({
+                        type: 'trade_signal',
+                        bar_time: lastBar.time,
+                        price: lastBar.close,
+                        action: state.decision.action,
+                        confluence: state.confluence?.total || 0,
+                        atr: state.indicators?.atr10 || 0,
+                        indicators: {
+                            vwap_score: state.scores?.vwap || 0,
+                            ema_score: state.scores?.ema || 0,
+                            rsi_score: state.scores?.rsi || 0,
+                            adx_score: state.scores?.adx || 0,
+                            volume_score: state.scores?.volume || 0,
+                            rsi_val: state.indicators?.rsi7 || 0,
+                            adx_val: state.indicators?.adx10 || 0,
+                            atr_val: state.indicators?.atr10 || 0,
+                            chop_val: state.indicators?.chop14 || 0,
+                        },
+                    }));
+                }
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // MULTI-TIMEFRAME SIGNAL SYSTEM
+        // ═══════════════════════════════════════════════════════════
+
+        async function fetchMtfBars(tf) {
+            try {
+                const resp = await fetch(`/api/bars/${currentSymbol}/${tf}?limit=500`);
+                const data = await resp.json();
+                if (data.bars && data.bars.length > 0) {
+                    mtfBars[tf] = data.bars;
+                }
+            } catch (e) {
+                console.debug(`MTF fetch error (${tf}):`, e);
+            }
+        }
+
+        async function refreshMtfEngines() {
+            const now = Date.now();
+            // Re-fetch higher TF bars periodically (they update server-side via _update_higher_timeframes)
+            if (now - mtfLastFetch > MTF_FETCH_INTERVAL) {
+                mtfLastFetch = now;
+                await Promise.all([fetchMtfBars('5min'), fetchMtfBars('15min')]);
+            }
+
+            // Run engines on higher TF bars
+            for (const tf of ['5min', '15min']) {
+                const bars = mtfBars[tf];
+                if (!bars || bars.length < 30) continue;
+                try {
+                    const state = mtfEngines[tf].compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
+                    if (state) {
+                        mtfStates[tf] = state;
+                    }
+                } catch (e) {
+                    console.debug(`MTF engine error (${tf}):`, e);
+                }
+            }
+            renderMtfSignalList();
+        }
+
+        // Signal dedup: track last action per TF to avoid rapid-fire duplicates
+        const mtfLastAction = { '1min': null, '5min': null, '15min': null };
+        const mtfSignalLog = [];  // Recent unique signals (max 20)
+        const MTF_SIGNAL_LOG_MAX = 20;
+
+        function renderMtfSignalList() {
+            const container = document.getElementById('mtf-signal-list');
+            if (!container) return;
+
+            const now = Date.now();
+
+            // Build current state cards + detect new signals
+            let currentHtml = '';
+            for (const tf of MTF_TIMEFRAMES) {
+                const state = mtfStates[tf];
+                if (!state || !state.decision) continue;
+
+                const d = state.decision;
+                const ind = state.indicators || {};
+                const action = d.action || 'NO_TRADE';
+                const actionClass = action === 'BUY' ? 'buy' : action === 'SELL' ? 'sell' : 'no-trade';
+                const confPct = Math.round((state.confluence?.total || 0) * 100);
+                const confColor = action === 'BUY' ? '#26a69a' : action === 'SELL' ? '#ef5350' : '#555';
+                const atr = ind.atr10 || 0;
+                const stopPts = atr ? (d.stopATR * atr).toFixed(1) : '—';
+                const targetPts = atr ? (d.targetATR * atr).toFixed(1) : '—';
+
+                // Dedup: only log to signal history if action changed
+                if (action !== 'NO_TRADE' && action !== mtfLastAction[tf]) {
+                    mtfSignalLog.unshift({
+                        tf, action, confPct, stopPts, targetPts, atr,
+                        bias: d.bias || '',
+                        time: now,
+                    });
+                    if (mtfSignalLog.length > MTF_SIGNAL_LOG_MAX) mtfSignalLog.pop();
+                }
+                mtfLastAction[tf] = action;
+
+                currentHtml += `
+                    <div class="mtf-card ${actionClass}">
+                        <div class="mtf-card-header">
+                            <span class="mtf-tf-badge">${MTF_LABELS[tf]}</span>
+                            <span class="mtf-action ${actionClass}">${action}</span>
+                            <span style="color:#666;font-size:10px">${confPct}%</span>
+                        </div>
+                        ${action !== 'NO_TRADE' ? `
+                        <div class="mtf-details">
+                            <span>SL: ${stopPts}</span>
+                            <span>TP: ${targetPts}</span>
+                            <span>ATR: ${atr ? atr.toFixed(1) : '—'}</span>
+                            <span>${d.bias || ''}</span>
+                        </div>` : `
+                        <div class="mtf-details">
+                            <span>${d.reason || ''}</span>
+                        </div>`}
+                        <div class="mtf-confluence-bar">
+                            <div class="mtf-confluence-fill" style="width:${confPct}%;background:${confColor}"></div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Build signal history (recent unique BUY/SELL triggers)
+            let histHtml = '';
+            if (mtfSignalLog.length > 0) {
+                histHtml = '<div style="margin-top:6px;border-top:1px solid #1e222d;padding-top:4px">';
+                histHtml += '<div style="font-size:10px;color:#555;margin-bottom:3px">Recent Signals</div>';
+                for (const sig of mtfSignalLog) {
+                    const ago = Math.round((now - sig.time) / 1000);
+                    const agoStr = ago < 60 ? `${ago}s ago` : `${Math.floor(ago / 60)}m ago`;
+                    const cls = sig.action === 'BUY' ? 'buy' : 'sell';
+                    histHtml += `
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:10px;opacity:0.7">
+                            <span><span class="mtf-tf-badge" style="font-size:9px">${MTF_LABELS[sig.tf]}</span>
+                            <span class="mtf-action ${cls}" style="font-size:10px">${sig.action}</span></span>
+                            <span style="color:#555">${sig.confPct}% | SL:${sig.stopPts} TP:${sig.targetPts}</span>
+                            <span style="color:#444">${agoStr}</span>
+                        </div>
+                    `;
+                }
+                histHtml += '</div>';
+            }
+
+            container.innerHTML = (currentHtml + histHtml) || '<div style="color:#555;font-size:11px;padding:8px;text-align:center">Waiting for signals...</div>';
         }
 
         function updateDashboard(state) {
@@ -1395,42 +1668,7 @@
             const s = state.scores;
             const ind = state.indicators;
 
-            // Action
-            const actionEl = document.getElementById('dash-action');
-            actionEl.textContent = d.action;
-            actionEl.className = 'dash-action ' + (d.action === 'BUY' ? 'buy' : d.action === 'SELL' ? 'sell' : 'no-trade');
-
-            // Bias
-            document.getElementById('dash-bias').textContent = d.bias;
-
-            // Confidence bar
-            const confEl = document.getElementById('dash-confidence');
-            const confPct = Math.round(d.confidence * 100);
-            confEl.style.width = confPct + '%';
-            confEl.style.background = d.action === 'BUY' ? '#26a69a' : d.action === 'SELL' ? '#ef5350' : '#758696';
-
-            // Reason
-            document.getElementById('dash-reason').textContent = d.reason;
-
-            // Trade details (position size, entry type, stop/target)
-            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
-            if (d.action !== 'NO_TRADE') {
-                document.getElementById('dash-size').textContent = (d.positionSize * 100).toFixed(0) + '%';
-                document.getElementById('dash-entry-type').textContent = d.entryType.replace(/_/g, ' ');
-                const atr = ind.atr10;
-                if (atr !== null) {
-                    document.getElementById('dash-stop').textContent = fmt(d.stopATR * atr) + ' (' + d.stopATR + 'x ATR)';
-                    document.getElementById('dash-target').textContent = fmt(d.targetATR * atr) + ' (' + d.targetATR + 'x ATR)';
-                } else {
-                    document.getElementById('dash-stop').textContent = d.stopATR + 'x ATR';
-                    document.getElementById('dash-target').textContent = d.targetATR + 'x ATR';
-                }
-            } else {
-                document.getElementById('dash-size').textContent = '—';
-                document.getElementById('dash-entry-type').textContent = '—';
-                document.getElementById('dash-stop').textContent = '—';
-                document.getElementById('dash-target').textContent = '—';
-            }
+            // (Action + Trade Details moved to multi-TF signal list — rendered by renderMtfSignalList)
 
             // Regime
             const regEl = document.getElementById('dash-regime');
@@ -1626,6 +1864,8 @@
         let confUpperSeries = null;     // 68% confidence upper band
         let confLowerSeries = null;     // 68% confidence lower band
         let latestPatternData = null;
+        let dailyProjectionLine = null;    // Horizontal price line for daily projected move
+        let overnightProjectionLine = null; // Horizontal price line for overnight projected move
 
         function handlePatternUpdate(msg) {
             latestPatternData = msg;
@@ -1674,6 +1914,36 @@
                     eodEl.textContent = proj.end_of_day_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
                     eodEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
                 }
+
+                // Peak move display
+                const peakEl = document.getElementById('dash-pm-peak');
+                if (proj.peak_move_price) {
+                    const peakRet = proj.peak_move_return || 0;
+                    peakEl.textContent = proj.peak_move_price.toFixed(2) + ' (' + (peakRet > 0 ? '+' : '') + peakRet.toFixed(2) + '%)';
+                    peakEl.className = 'dash-val ' + (peakRet > 0 ? 'pos' : peakRet < 0 ? 'neg' : 'neutral');
+                }
+            }
+
+            // Draw projected move price line on chart (peak move, not just EOD average)
+            const peakPrice = proj ? (proj.peak_move_price || proj.end_of_day_price) : null;
+            if (peakPrice && candleSeries) {
+                const targetPrice = peakPrice;
+                const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
+                const arrow = pts >= 0 ? '↑' : '↓';
+                const label = `RTH Peak ${arrow}${Math.abs(pts)} pts`;
+                const color = pts >= 0 ? '#26a69a' : '#ef5350';
+
+                if (dailyProjectionLine) {
+                    try { candleSeries.removePriceLine(dailyProjectionLine); } catch (e) {}
+                }
+                dailyProjectionLine = candleSeries.createPriceLine({
+                    price: targetPrice,
+                    color: color,
+                    lineWidth: 1,
+                    lineStyle: 2, // dashed
+                    axisLabelVisible: true,
+                    title: label,
+                });
             }
 
             // Render chart overlays
@@ -1778,6 +2048,81 @@
         }
 
         // ═══════════════════════════════════════════════════════════
+        // OVERNIGHT PATTERN HANDLER
+        // ═══════════════════════════════════════════════════════════
+        function handleOvernightPatternUpdate(msg) {
+            const f = msg.forecast;
+            const proj = msg.projection;
+            if (f) {
+                const dirEl = document.getElementById('dash-on-dir');
+                if (f.direction_signal > 0.1) {
+                    dirEl.textContent = '↑ Bullish';
+                    dirEl.className = 'dash-val pos';
+                } else if (f.direction_signal < -0.1) {
+                    dirEl.textContent = '↓ Bearish';
+                    dirEl.className = 'dash-val neg';
+                } else {
+                    dirEl.textContent = '— Neutral';
+                    dirEl.className = 'dash-val neutral';
+                }
+                document.getElementById('dash-on-consensus').textContent = f.consensus;
+                document.getElementById('dash-on-corr').textContent = (f.avg_correlation * 100).toFixed(0) + '%';
+                const moveEl = document.getElementById('dash-on-move');
+                moveEl.textContent = (f.mean_move > 0 ? '+' : '') + f.mean_move.toFixed(2) + '%';
+                moveEl.className = 'dash-val ' + (f.mean_move > 0 ? 'pos' : f.mean_move < 0 ? 'neg' : 'neutral');
+                document.getElementById('dash-on-count').textContent = `${f.sample_size}/${msg.filtered_count}`;
+
+                const sigEl = document.getElementById('dash-on-signal');
+                sigEl.textContent = f.direction_signal.toFixed(3);
+                sigEl.className = 'dash-val ' + (f.direction_signal > 0.05 ? 'pos' : f.direction_signal < -0.05 ? 'neg' : 'neutral');
+
+                document.getElementById('dash-on-status').textContent = 'active';
+                document.getElementById('dash-on-status').style.color = '#26a69a';
+            } else {
+                document.getElementById('dash-on-status').textContent = 'no match';
+                document.getElementById('dash-on-status').style.color = '#ef5350';
+            }
+
+            // EOS projection
+            if (proj && proj.end_of_session_price) {
+                const eosEl = document.getElementById('dash-on-eos');
+                const ret = proj.end_of_session_return || 0;
+                eosEl.textContent = proj.end_of_session_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
+                eosEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
+
+                // Peak move display
+                const peakEl = document.getElementById('dash-on-peak');
+                if (proj.peak_move_price) {
+                    const peakRet = proj.peak_move_return || 0;
+                    peakEl.textContent = proj.peak_move_price.toFixed(2) + ' (' + (peakRet > 0 ? '+' : '') + peakRet.toFixed(2) + '%)';
+                    peakEl.className = 'dash-val ' + (peakRet > 0 ? 'pos' : peakRet < 0 ? 'neg' : 'neutral');
+                }
+
+                // Draw overnight projected move price line (peak move, not just EOS average)
+                const onPeakPrice = proj.peak_move_price || proj.end_of_session_price;
+                if (candleSeries && onPeakPrice) {
+                    const targetPrice = onPeakPrice;
+                    const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
+                    const arrow = pts >= 0 ? '↑' : '↓';
+                    const label = `ON Peak ${arrow}${Math.abs(pts)} pts`;
+                    const color = pts >= 0 ? '#42A5F5' : '#FF7043'; // blue bullish, orange bearish
+
+                    if (overnightProjectionLine) {
+                        try { candleSeries.removePriceLine(overnightProjectionLine); } catch (e) {}
+                    }
+                    overnightProjectionLine = candleSeries.createPriceLine({
+                        price: targetPrice,
+                        color: color,
+                        lineWidth: 1,
+                        lineStyle: 2, // dashed
+                        axisLabelVisible: true,
+                        title: label,
+                    });
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
         // EVENT HANDLERS
         // ═══════════════════════════════════════════════════════════
         document.getElementById('symbol-select').addEventListener('change', (e) => {
@@ -1805,6 +2150,14 @@
             }
             removeEngineSeries();
             historicalBars = [];
+
+            // Clear MTF state on symbol switch
+            mtfBars['5min'] = [];
+            mtfBars['15min'] = [];
+            mtfStates['1min'] = null;
+            mtfStates['5min'] = null;
+            mtfStates['15min'] = null;
+            mtfLastFetch = 0;
 
             // Reconnect with new symbol
             connect(newSymbol);

@@ -3,6 +3,7 @@ Data Grabber - Backward historical data fetcher with terminal confirmation.
 
 Fetches 60 days of 1-min data per batch, going backwards up to 500 days.
 Asks y/n in terminal between batches, with 3-minute pauses.
+Uses specific expired contracts for each date range to avoid ContFuture limitations.
 """
 
 import asyncio
@@ -12,10 +13,11 @@ import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Callable
 import pytz
+from ib_insync import Future
 
 from .historical_data import HistoricalDataFetcher
 from .cache import DataCache
-from .contracts import get_current_contract
+from .contracts import CONTRACT_SPECS
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,38 @@ _grabber_state: Dict = {
 _grabber_task: Optional[asyncio.Task] = None
 _confirm_event: Optional[asyncio.Event] = None
 _confirm_answer: bool = False
+
+
+# CME quarterly months: H=March, M=June, U=September, Z=December
+QUARTERLY_MONTHS = [3, 6, 9, 12]
+
+
+def _get_front_month_expiry(date: datetime, symbol: str) -> str:
+    """
+    Get the front-month contract expiry (YYYYMM) for a given date.
+    CME E-mini/Micro futures: quarterly (H/M/U/Z) with rollover ~8 days before expiry.
+    Gold (MGC): also quarterly on CME/COMEX.
+    Returns the YYYYMM string for the contract that was front-month on that date.
+    """
+    year = date.year
+    month = date.month
+
+    # Find the next quarterly month (the contract that would be trading)
+    for qm in QUARTERLY_MONTHS:
+        if qm >= month:
+            # Check if we're past rollover (3rd Friday - 8 days)
+            # Approximate: if we're in the expiry month and past the 8th, use next quarter
+            if qm == month and date.day > 8:
+                # Already rolled to next quarter
+                idx = QUARTERLY_MONTHS.index(qm)
+                if idx + 1 < len(QUARTERLY_MONTHS):
+                    return f"{year}{QUARTERLY_MONTHS[idx + 1]:02d}"
+                else:
+                    return f"{year + 1}{QUARTERLY_MONTHS[0]:02d}"
+            return f"{year}{qm:02d}"
+
+    # Past December, wrap to next year March
+    return f"{year + 1}{QUARTERLY_MONTHS[0]:02d}"
 
 
 def get_grabber_status() -> dict:
@@ -136,6 +170,26 @@ async def stop_grab():
     _grabber_task = None
 
 
+async def _create_historical_contract(ib, symbol: str, target_date: datetime) -> Future:
+    """Create and qualify a specific futures contract for a historical date."""
+    spec = CONTRACT_SPECS[symbol]
+    expiry = _get_front_month_expiry(target_date, symbol)
+
+    contract = Future(
+        symbol=symbol,
+        exchange=spec['exchange'],
+        currency=spec['currency'],
+        lastTradeDateOrContractMonth=expiry,
+        includeExpired=True
+    )
+    qualified = await ib.qualifyContractsAsync(contract)
+    if qualified:
+        logger.info(f"[DataGrab] Contract for {target_date.strftime('%Y-%m-%d')}: {contract.localSymbol} ({expiry})")
+    else:
+        logger.warning(f"[DataGrab] Could not qualify contract {symbol} {expiry} for {target_date.strftime('%Y-%m-%d')}")
+    return contract
+
+
 async def _grab_loop(
     symbol: str,
     ib,
@@ -143,7 +197,6 @@ async def _grab_loop(
     on_complete: Optional[Callable] = None
 ):
     """Main grab loop: fetch 60-day batches backwards with terminal y/n."""
-    from .pacing import PacingManager
 
     _grabber_state['active'] = True
     _grabber_state['symbol'] = symbol
@@ -158,9 +211,6 @@ async def _grab_loop(
     _grabber_state['batch_number'] = 0
 
     try:
-        contract = get_current_contract(symbol)
-        await ib.qualifyContractsAsync(contract)
-
         # Find earliest date in existing cache
         existing = cache.load(symbol, bar_size='1min', max_age_hours=None)
         if existing is not None and len(existing) > 0:
@@ -199,9 +249,14 @@ async def _grab_loop(
             # Fetch this batch
             _grabber_state['status'] = 'fetching'
             _grabber_state['message'] = f'Fetching batch {batch_num}/{total_batches} ({batch_size} days)...'
-            logger.info(f"[DataGrab] Fetching batch {batch_num}: {batch_size} days ending {current_end.strftime('%Y-%m-%d')}")
 
             start_date = current_end - timedelta(days=batch_size)
+
+            # Determine which contract(s) cover this date range
+            # Use the contract that was front-month at the END of the batch period
+            contract = await _create_historical_contract(ib, symbol, current_end)
+
+            logger.info(f"[DataGrab] Fetching batch {batch_num}: {start_date.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')} using {contract.localSymbol}")
 
             new_data = await fetcher._fetch_year_chunked(
                 contract,

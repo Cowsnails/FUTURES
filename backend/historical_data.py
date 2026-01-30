@@ -694,7 +694,7 @@ class HistoricalDataFetcher:
         # Resample to target timeframe
         # label='left' means bar is labeled with start time
         # closed='left' means interval is closed on left side [09:30, 09:35)
-        aggregated = df_copy.resample(f'{minutes}T', label='left', closed='left').agg({
+        aggregated = df_copy.resample(f'{minutes}min', label='left', closed='left').agg({
             'open': 'first',
             'high': 'max',
             'low': 'min',

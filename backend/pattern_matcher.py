@@ -29,6 +29,12 @@ RTH_HOURLY_SLOTS = 7
 RTH_START_HOUR = 9   # 9:30
 RTH_END_HOUR = 16    # 16:00
 
+# Overnight session: 18:00 (6PM) to 09:29 (9:29 AM) = 15 hourly slots
+# Slot mapping: 18,19,20,21,22,23,0,1,2,3,4,5,6,7,8 = 15 slots
+ON_HOURLY_SLOTS = 15
+ON_START_HOUR = 18   # 6:00 PM ET
+ON_END_HOUR = 9      # 9:00 AM ET (before RTH 9:30)
+
 MIN_CORRELATION = 0.75       # Minimum for a valid match
 MIN_STRONG_CORRELATION = 0.80
 MIN_MATCHES_REQUIRED = 3
@@ -242,6 +248,16 @@ def generate_projection(matches: list, n_hours_so_far: int,
     # Projected prices
     projected_prices = [current_price * (1 + r / 100.0) for r in avg_path]
 
+    # Peak projected move — most extreme point along the avg path
+    if avg_path:
+        abs_moves = [abs(r) for r in avg_path]
+        peak_idx = int(np.argmax(abs_moves))
+        peak_price = round(projected_prices[peak_idx], 2)
+        peak_return = round(avg_path[peak_idx], 3)
+    else:
+        peak_price = None
+        peak_return = None
+
     # Inflection points (local max/min in avg path)
     inflections = []
     for i in range(1, len(avg_path) - 1):
@@ -285,6 +301,8 @@ def generate_projection(matches: list, n_hours_so_far: int,
         'current_phase': current_phase,
         'end_of_day_price': round(projected_prices[-1], 2) if projected_prices else None,
         'end_of_day_return': round(avg_path[-1], 3) if avg_path else None,
+        'peak_move_price': peak_price,
+        'peak_move_return': peak_return,
         'confidence_upper': [round(v, 2) for v in upper],
         'confidence_lower': [round(v, 2) for v in lower],
         'individual_paths': [
@@ -514,28 +532,44 @@ class DailyPatternEngine:
         """
         from datetime import datetime as dt
 
+        logger.info(f"run_match_from_1min: num_days={self.num_days}, bars_count={len(bars_1min) if bars_1min else 0}")
+
         if self.num_days < 20:
+            logger.warning(f"Pattern matcher: not enough days ({self.num_days} < 20)")
             return None
 
-        # Find today's date (from latest bar)
+        # Find the most recent trading day with RTH bars.
+        # Timestamps are ET-as-UTC, so utcfromtimestamp gives ET values.
         if not bars_1min:
+            logger.warning("Pattern matcher: no bars_1min provided")
             return None
-        latest_time = max(b['time'] for b in bars_1min)
-        today_dt = dt.utcfromtimestamp(latest_time)
-        today_str = today_dt.strftime('%Y-%m-%d')
 
-        # Extract today's RTH bars
-        today_bars = []
+        # Collect all RTH bars grouped by date, find the latest date with enough bars
+        from collections import defaultdict
+        rth_by_date = defaultdict(list)
         for b in bars_1min:
             d = dt.utcfromtimestamp(b['time'])
-            if d.strftime('%Y-%m-%d') != today_str:
-                continue
             minutes = d.hour * 60 + d.minute
             if 570 <= minutes < 960:
-                today_bars.append(b)
-        today_bars.sort(key=lambda x: x['time'])
+                rth_by_date[d.strftime('%Y-%m-%d')].append(b)
 
-        if len(today_bars) < 15:  # Need at least ~15 min
+        logger.info(f"Pattern matcher: {len(rth_by_date)} dates with RTH bars, top dates: {sorted(rth_by_date.keys(), reverse=True)[:5]}")
+
+        # Find most recent date with >= 15 RTH bars
+        today_str = None
+        today_bars = []
+        for date_str in sorted(rth_by_date.keys(), reverse=True):
+            count = len(rth_by_date[date_str])
+            if count >= 15:
+                today_str = date_str
+                today_bars = sorted(rth_by_date[date_str], key=lambda x: x['time'])
+                logger.info(f"Pattern matcher: using {date_str} with {count} RTH bars")
+                break
+            else:
+                logger.info(f"Pattern matcher: skipping {date_str} ({count} RTH bars)")
+
+        if not today_bars:
+            logger.warning("Pattern matcher: no trading day found with >= 15 RTH bars")
             return None
 
         # Aggregate today's bars into hourly slots
@@ -569,17 +603,24 @@ class DailyPatternEngine:
                 yesterday = day
                 break
         if not yesterday:
+            logger.warning(f"Pattern matcher: no yesterday found before {today_str} (days range: {self.days[0].date_str} to {self.days[-1].date_str})")
             return None
+
+        logger.info(f"Pattern matcher: yesterday={yesterday.date_str}, today_str={today_str}")
 
         today_open = today_bars[0]['open']
         today_gap = (today_open - yesterday.day_close) / yesterday.day_close if yesterday.day_close else 0.0
         today_atr = yesterday.atr_10  # Use yesterday's ATR as proxy
         today_trend = yesterday.trend_context
 
+        logger.info(f"Pattern matcher: gap={today_gap:.4f}, atr={today_atr:.2f}, trend={today_trend}")
+
         # ── Layer 1: Regime filter ──
         filtered = self._filter_by_regime(today_gap, today_atr, today_trend)
         if not filtered:
+            logger.warning(f"Pattern matcher: regime filter returned no matches")
             return None
+        logger.info(f"Pattern matcher: regime filter passed {len(filtered)} candidates")
 
         # ── Layer 2: Hourly similarity ──
         today_norm = normalize_returns(today_hourly)
@@ -593,11 +634,14 @@ class DailyPatternEngine:
                 hist_portions.append(portion)
                 filtered_indices.append(idx)
 
+        logger.info(f"Pattern matcher: {len(hist_portions)} candidates with enough hourly data (need {MIN_MATCHES_REQUIRED})")
         if len(hist_portions) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: not enough hist_portions ({len(hist_portions)} < {MIN_MATCHES_REQUIRED})")
             return None
 
         hist_matrix = np.array(hist_portions, dtype=np.float64)
         correlations = batch_pearson(today_norm, hist_matrix)
+        logger.info(f"Pattern matcher: correlations range [{correlations.min():.4f}, {correlations.max():.4f}], mean={correlations.mean():.4f}")
 
         # Apply recency weighting (more recent days get higher weight)
         days_ago = np.array([
@@ -612,13 +656,30 @@ class DailyPatternEngine:
         for li in sorted_local[:TOP_N_MATCHES]:
             corr = float(correlations[li])
             if corr < MIN_CORRELATION:
+                logger.debug(f"Pattern matcher: skipping match corr={corr:.4f} < {MIN_CORRELATION}")
                 continue
             day = self.days[filtered_indices[li]]
             if day.is_half_day or day.is_extreme:
                 continue
             top_matches.append((day, corr))
 
+        logger.info(f"Pattern matcher: {len(top_matches)} top matches after correlation filter (need {MIN_MATCHES_REQUIRED}, min_corr={MIN_CORRELATION})")
         if len(top_matches) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: not enough matches ({len(top_matches)} < {MIN_MATCHES_REQUIRED}), lowering threshold")
+            # Retry with lower correlation threshold
+            top_matches = []
+            for li in sorted_local[:TOP_N_MATCHES]:
+                corr = float(correlations[li])
+                if corr < 0.3:  # Much more lenient fallback
+                    continue
+                day = self.days[filtered_indices[li]]
+                if day.is_half_day or day.is_extreme:
+                    continue
+                top_matches.append((day, corr))
+            logger.info(f"Pattern matcher: {len(top_matches)} matches with lowered threshold (0.3)")
+
+        if len(top_matches) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Pattern matcher: still not enough matches even with lowered threshold")
             return None
 
         # ── Forecast ──
@@ -713,3 +774,500 @@ class DailyPatternEngine:
         # All valid days
         return [i for i, d in enumerate(self.days)
                 if not d.is_half_day and not d.is_extreme]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OVERNIGHT PATTERN ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OvernightRecord:
+    """One historical overnight session (6PM → 9:29AM next day)."""
+    date_str: str           # Date of the session START (e.g. '2026-01-29' = Wed 6PM)
+    session_index: int
+    session_open: float
+    session_high: float
+    session_low: float
+    session_close: float    # Last bar before 9:30 AM
+    session_volume: int
+    session_return_pct: float
+    gap_pct: float          # Gap from prior RTH close to this session open
+    gap_type: str
+    atr_10: float
+    trend_context: str
+    is_extreme: bool
+    # Hourly bars (up to 15 slots: 18,19,...,23,0,1,...,8)
+    hourly_closes: np.ndarray
+    hourly_opens: np.ndarray
+    hourly_highs: np.ndarray
+    hourly_lows: np.ndarray
+    hourly_volumes: np.ndarray
+    hourly_returns: np.ndarray  # % returns from session open
+    # Rest-of-session return (from hour 3 onward through 9:29 AM)
+    rest_of_session_return: float
+
+
+def _on_slot_index(hour: int) -> int:
+    """Map an hour (0-23) to overnight slot index (0-14). Returns -1 if outside overnight."""
+    if 18 <= hour <= 23:
+        return hour - 18       # 18→0, 19→1, ..., 23→5
+    elif 0 <= hour <= 8:
+        return hour + 6        # 0→6, 1→7, ..., 8→14
+    return -1
+
+
+def _is_overnight_minute(hour: int, minute: int) -> bool:
+    """Check if a given ET hour:minute falls in overnight session (18:00 - 9:29)."""
+    total = hour * 60 + minute
+    # 18:00 (1080) to 23:59 (1439) or 00:00 (0) to 09:29 (569)
+    return total >= 1080 or total < 570
+
+
+class OvernightPatternEngine:
+    """
+    Pattern matcher for overnight futures sessions (6PM - 9:29AM ET).
+    Same approach as DailyPatternEngine but for the overnight window.
+    """
+
+    def __init__(self):
+        self.sessions: list[OvernightRecord] = []
+        self.num_sessions: int = 0
+        self.norm_hourly: Optional[np.ndarray] = None
+        self.latest_result: Optional[dict] = None
+
+    def load_from_1min_bars(self, bars_1min: list):
+        """
+        Build overnight session records from 1-min bars.
+        An overnight session starts at 6PM ET and ends at 9:29 AM ET next day.
+        """
+        from datetime import datetime as dt
+
+        # Group bars into overnight sessions.
+        # Session key = date of the 6PM start (bars from 18:00 onward belong to that date's session,
+        # bars from 00:00-09:29 belong to the PREVIOUS date's session).
+        sessions_map = {}  # date_str -> list of bars
+
+        for b in bars_1min:
+            d = dt.utcfromtimestamp(b['time'])  # ET-as-UTC
+            hour = d.hour
+            minute = d.minute
+
+            if not _is_overnight_minute(hour, minute):
+                continue
+
+            # Determine session date: bars 18:00-23:59 → same calendar date
+            # bars 00:00-09:29 → previous calendar date
+            if hour >= 18:
+                session_date = d.strftime('%Y-%m-%d')
+            else:
+                prev_day = d - __import__('datetime').timedelta(days=1)
+                session_date = prev_day.strftime('%Y-%m-%d')
+
+            if session_date not in sessions_map:
+                sessions_map[session_date] = []
+            sessions_map[session_date].append(b)
+
+        sorted_dates = sorted(sessions_map.keys())
+        if not sorted_dates:
+            logger.warning("No overnight bars found for pattern matcher")
+            return
+
+        all_session_closes = []
+        records = []
+
+        for si, date_key in enumerate(sorted_dates):
+            session_bars = sorted(sessions_map[date_key], key=lambda x: x['time'])
+            if len(session_bars) < 30:
+                continue
+
+            s_open = session_bars[0]['open']
+            s_close = session_bars[-1]['close']
+            s_high = max(b['high'] for b in session_bars)
+            s_low = min(b['low'] for b in session_bars)
+            s_vol = sum(b['volume'] for b in session_bars)
+
+            # Aggregate to hourly slots
+            hourly_slots = {}
+            for b in session_bars:
+                d = dt.utcfromtimestamp(b['time'])
+                slot_hour = d.hour
+                slot_idx = _on_slot_index(slot_hour)
+                if slot_idx < 0:
+                    continue
+                if slot_idx not in hourly_slots:
+                    hourly_slots[slot_idx] = []
+                hourly_slots[slot_idx].append(b)
+
+            slot_keys = sorted(hourly_slots.keys())
+            h_opens, h_highs, h_lows, h_closes, h_vols = [], [], [], [], []
+            for sk in slot_keys:
+                slot_bars = hourly_slots[sk]
+                h_opens.append(slot_bars[0]['open'])
+                h_closes.append(slot_bars[-1]['close'])
+                h_highs.append(max(b['high'] for b in slot_bars))
+                h_lows.append(min(b['low'] for b in slot_bars))
+                h_vols.append(sum(b['volume'] for b in slot_bars))
+
+            if not h_closes:
+                continue
+
+            h_closes_arr = np.array(h_closes, dtype=np.float64)
+            h_returns = ((h_closes_arr / s_open) - 1.0) * 100.0 if s_open else np.zeros(len(h_closes))
+
+            # Gap from prior RTH close
+            prior_close = all_session_closes[-1] if all_session_closes else s_open
+            gap_pct = (s_open - prior_close) / prior_close if prior_close else 0.0
+
+            all_session_closes.append(s_close)
+
+            # ATR (simplified: use session ranges)
+            atr_10 = s_high - s_low  # Single session range as proxy
+
+            # Trend from last few session closes
+            if len(all_session_closes) >= 10:
+                recent = all_session_closes[-10:]
+                trend = classify_trend(recent, 9)
+            else:
+                trend = 'sideways'
+
+            session_return = (s_close - s_open) / s_open * 100.0 if s_open else 0.0
+            is_extreme = abs(session_return) > 2.0
+
+            # Rest-of-session return (from 3 hours in to end)
+            rest_return = 0.0
+            if len(h_closes) > 3:
+                anchor = h_closes[2]
+                rest_return = (s_close - anchor) / anchor * 100.0 if anchor else 0.0
+
+            rec = OvernightRecord(
+                date_str=date_key,
+                session_index=si,
+                session_open=s_open,
+                session_high=s_high,
+                session_low=s_low,
+                session_close=s_close,
+                session_volume=s_vol,
+                session_return_pct=round(session_return, 4),
+                gap_pct=round(gap_pct, 6),
+                gap_type=classify_gap(gap_pct),
+                atr_10=atr_10,
+                trend_context=trend,
+                is_extreme=is_extreme,
+                hourly_closes=h_closes_arr,
+                hourly_opens=np.array(h_opens, dtype=np.float64),
+                hourly_highs=np.array(h_highs, dtype=np.float64),
+                hourly_lows=np.array(h_lows, dtype=np.float64),
+                hourly_volumes=np.array(h_vols, dtype=np.float64),
+                hourly_returns=h_returns,
+                rest_of_session_return=round(rest_return, 4),
+            )
+            records.append(rec)
+
+        self.sessions = records
+        self.num_sessions = len(records)
+
+        if self.num_sessions > 0:
+            self.norm_hourly = np.zeros((self.num_sessions, ON_HOURLY_SLOTS), dtype=np.float64)
+            for i, s in enumerate(records):
+                n = min(len(s.hourly_closes), ON_HOURLY_SLOTS)
+                normed = normalize_returns(s.hourly_closes[:n])
+                self.norm_hourly[i, :n] = normed
+
+        logger.info(f"Loaded {self.num_sessions} overnight records for pattern matching")
+
+    def run_match_from_1min(self, bars_1min: list) -> Optional[dict]:
+        """Run overnight pattern match against current session."""
+        from datetime import datetime as dt
+        from collections import defaultdict
+
+        if self.num_sessions < 10:
+            logger.warning(f"Overnight pattern: not enough sessions ({self.num_sessions} < 10)")
+            return None
+
+        if not bars_1min:
+            return None
+
+        # Group bars by overnight session, find the most recent one with enough data
+        sessions_map = defaultdict(list)
+        for b in bars_1min:
+            d = dt.utcfromtimestamp(b['time'])
+            if not _is_overnight_minute(d.hour, d.minute):
+                continue
+            if d.hour >= 18:
+                session_date = d.strftime('%Y-%m-%d')
+            else:
+                prev_day = d - __import__('datetime').timedelta(days=1)
+                session_date = prev_day.strftime('%Y-%m-%d')
+            sessions_map[session_date].append(b)
+
+        # Find most recent session with >= 15 bars
+        current_date = None
+        current_bars = []
+        for date_str in sorted(sessions_map.keys(), reverse=True):
+            if len(sessions_map[date_str]) >= 15:
+                current_date = date_str
+                current_bars = sorted(sessions_map[date_str], key=lambda x: x['time'])
+                break
+
+        if not current_bars:
+            logger.warning("Overnight pattern: no session with >= 15 bars")
+            return None
+
+        logger.info(f"Overnight pattern: using session {current_date} with {len(current_bars)} bars")
+
+        # Aggregate to hourly slots
+        hourly_slots = {}
+        for b in current_bars:
+            d = dt.utcfromtimestamp(b['time'])
+            slot_idx = _on_slot_index(d.hour)
+            if slot_idx < 0:
+                continue
+            if slot_idx not in hourly_slots:
+                hourly_slots[slot_idx] = []
+            hourly_slots[slot_idx].append(b)
+
+        slot_keys = sorted(hourly_slots.keys())
+        today_hourly_closes = []
+        for sk in slot_keys:
+            sbs = hourly_slots[sk]
+            today_hourly_closes.append(sbs[-1]['close'])
+
+        if len(today_hourly_closes) < 1:
+            return None
+
+        today_hourly = np.array(today_hourly_closes, dtype=np.float64)
+        n_hours = len(today_hourly)
+        current_price = today_hourly[-1]
+
+        # Session open
+        session_open = current_bars[0]['open']
+
+        # Find yesterday's session for gap calc
+        yesterday = None
+        for s in reversed(self.sessions):
+            if s.date_str < current_date:
+                yesterday = s
+                break
+
+        if not yesterday:
+            logger.warning(f"Overnight pattern: no prior session before {current_date}")
+            return None
+
+        today_gap = (session_open - yesterday.session_close) / yesterday.session_close if yesterday.session_close else 0.0
+        today_atr = yesterday.atr_10
+        today_trend = yesterday.trend_context
+
+        logger.info(f"Overnight pattern: gap={today_gap:.4f}, atr={today_atr:.2f}, trend={today_trend}")
+
+        # ── Regime filter (reuse same progressive approach) ──
+        filtered = self._filter_by_regime(today_gap, today_atr, today_trend)
+        if not filtered:
+            logger.warning("Overnight pattern: regime filter returned no matches")
+            return None
+        logger.info(f"Overnight pattern: regime filter passed {len(filtered)} candidates")
+
+        # ── Hourly similarity ──
+        today_norm = normalize_returns(today_hourly)
+        filtered_indices = []
+        hist_portions = []
+        for idx in filtered:
+            s = self.sessions[idx]
+            if len(s.hourly_closes) >= n_hours:
+                portion = normalize_returns(s.hourly_closes[:n_hours])
+                hist_portions.append(portion)
+                filtered_indices.append(idx)
+
+        if len(hist_portions) < MIN_MATCHES_REQUIRED:
+            logger.warning(f"Overnight pattern: not enough comparable sessions ({len(hist_portions)})")
+            return None
+
+        hist_matrix = np.array(hist_portions, dtype=np.float64)
+        correlations = batch_pearson(today_norm, hist_matrix)
+        logger.info(f"Overnight pattern: correlations [{correlations.min():.4f}, {correlations.max():.4f}]")
+
+        # Recency weighting
+        sessions_ago = np.array([
+            self.num_sessions - self.sessions[idx].session_index
+            for idx in filtered_indices
+        ], dtype=np.float64)
+        weighted_corrs = correlations * (RECENCY_DECAY ** sessions_ago)
+
+        # Top matches
+        sorted_local = np.argsort(weighted_corrs)[::-1]
+        top_matches = []
+        for li in sorted_local[:TOP_N_MATCHES]:
+            corr = float(correlations[li])
+            if corr < MIN_CORRELATION:
+                continue
+            s = self.sessions[filtered_indices[li]]
+            if s.is_extreme:
+                continue
+            top_matches.append((s, corr))
+
+        # Fallback to lower threshold
+        if len(top_matches) < MIN_MATCHES_REQUIRED:
+            top_matches = []
+            for li in sorted_local[:TOP_N_MATCHES]:
+                corr = float(correlations[li])
+                if corr < 0.3:
+                    continue
+                s = self.sessions[filtered_indices[li]]
+                if s.is_extreme:
+                    continue
+                top_matches.append((s, corr))
+
+        if len(top_matches) < MIN_MATCHES_REQUIRED:
+            logger.warning("Overnight pattern: not enough matches")
+            return None
+
+        logger.info(f"Overnight pattern: {len(top_matches)} matches found")
+
+        # ── Projection ──
+        projection = self._generate_projection(top_matches, n_hours, current_price)
+
+        # Direction stats
+        outcomes = [s.rest_of_session_return for s, _ in top_matches]
+        bullish = sum(1 for o in outcomes if o > 0)
+
+        result = {
+            'type': 'overnight_pattern_update',
+            'timestamp': datetime.utcnow().isoformat(),
+            'session_type': 'overnight',
+            'session_date': current_date,
+            'bars_matched': n_hours,
+            'filtered_count': len(filtered),
+            'total_sessions': self.num_sessions,
+            'matches': [
+                {
+                    'date': s.date_str,
+                    'correlation': round(c, 4),
+                    'session_return': round(s.session_return_pct, 2),
+                    'rest_return': round(s.rest_of_session_return, 3),
+                }
+                for s, c in top_matches
+            ],
+            'forecast': {
+                'direction_probability': round(bullish / len(top_matches), 3),
+                'direction_signal': round((bullish / len(top_matches) - 0.5) * 2.0, 3),
+                'mean_move': round(float(np.mean(outcomes)), 3),
+                'median_move': round(float(np.median(outcomes)), 3),
+                'std_dev': round(float(np.std(outcomes)), 3),
+                'sample_size': len(top_matches),
+                'consensus': f"{bullish}/{len(top_matches)} bullish",
+                'avg_correlation': round(float(np.mean([c for _, c in top_matches])), 4),
+            },
+            'projection': projection,
+            'match_count': len(top_matches),
+        }
+
+        self.latest_result = result
+        return result
+
+    def _generate_projection(self, matches, n_hours, current_price):
+        """Build rest-of-session projection from matched overnight sessions."""
+        if not matches:
+            return {}
+
+        future_paths = []
+        for s, corr in matches:
+            if len(s.hourly_closes) <= n_hours:
+                continue
+            remaining = s.hourly_closes[n_hours:]
+            anchor = s.hourly_closes[n_hours - 1] if n_hours > 0 else s.session_open
+            if anchor <= 0:
+                continue
+            returns = ((remaining / anchor) - 1.0) * 100.0
+            future_paths.append({'returns': returns.tolist(), 'weight': corr, 'date': s.date_str})
+
+        if not future_paths:
+            return {}
+
+        max_len = max(len(p['returns']) for p in future_paths)
+        weighted_sum = np.zeros(max_len)
+        weight_sum = np.zeros(max_len)
+
+        for p in future_paths:
+            r = np.array(p['returns'])
+            w = p['weight']
+            weighted_sum[:len(r)] += r * w
+            weight_sum[:len(r)] += w
+
+        avg_path = np.where(weight_sum > 0, weighted_sum / weight_sum, 0).tolist()
+        projected_prices = [current_price * (1 + r / 100.0) for r in avg_path]
+
+        # Confidence bands (16th and 84th percentile)
+        upper = []
+        lower = []
+        for step in range(max_len):
+            vals = [p['returns'][step] for p in future_paths if len(p['returns']) > step]
+            if vals:
+                upper.append(current_price * (1 + float(np.percentile(vals, 84)) / 100))
+                lower.append(current_price * (1 + float(np.percentile(vals, 16)) / 100))
+
+        # Peak projected move — the most extreme point along the avg path
+        if avg_path:
+            abs_moves = [abs(r) for r in avg_path]
+            peak_idx = int(np.argmax(abs_moves))
+            peak_price = projected_prices[peak_idx]
+            peak_return = avg_path[peak_idx]
+        else:
+            peak_price = None
+            peak_return = None
+
+        return {
+            'avg_path': avg_path,
+            'projected_prices': projected_prices,
+            'hours_remaining': max_len,
+            'end_of_session_price': projected_prices[-1] if projected_prices else None,
+            'end_of_session_return': avg_path[-1] if avg_path else None,
+            'peak_move_price': round(peak_price, 2) if peak_price else None,
+            'peak_move_return': round(peak_return, 3) if peak_return else None,
+            'confidence_upper': [round(v, 2) for v in upper],
+            'confidence_lower': [round(v, 2) for v in lower],
+            'individual_paths': [
+                {'date': p['date'], 'returns': p['returns'][:max_len]}
+                for p in future_paths[:5]
+            ],
+        }
+
+    def _filter_by_regime(self, today_gap, today_atr, today_trend) -> list[int]:
+        """Progressive regime filter for overnight sessions."""
+        today_gap_type = classify_gap(today_gap)
+
+        # Strict: ATR + gap + trend
+        strict = []
+        for i, s in enumerate(self.sessions):
+            if s.is_extreme:
+                continue
+            atr_ok = abs(s.atr_10 - today_atr) / (today_atr + 1e-8) <= ATR_TOLERANCE
+            gap_ok = s.gap_type == today_gap_type
+            trend_ok = s.trend_context == today_trend
+            if atr_ok and gap_ok and trend_ok:
+                strict.append(i)
+        if len(strict) >= 10:
+            return strict
+
+        # Relaxed: ATR + gap
+        relaxed = []
+        for i, s in enumerate(self.sessions):
+            if s.is_extreme:
+                continue
+            atr_ok = abs(s.atr_10 - today_atr) / (today_atr + 1e-8) <= 0.25
+            gap_ok = s.gap_type == today_gap_type
+            if atr_ok and gap_ok:
+                relaxed.append(i)
+        if len(relaxed) >= 10:
+            return relaxed
+
+        # ATR only
+        atr_only = []
+        for i, s in enumerate(self.sessions):
+            if s.is_extreme:
+                continue
+            if abs(s.atr_10 - today_atr) / (today_atr + 1e-8) <= 0.30:
+                atr_only.append(i)
+        if len(atr_only) >= 10:
+            return atr_only
+
+        # All valid sessions
+        return [i for i, s in enumerate(self.sessions) if not s.is_extreme]

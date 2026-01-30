@@ -91,7 +91,8 @@ from .security import (
     validate_bar_size,
     validate_indicator_params
 )
-from .pattern_matcher import DailyPatternEngine
+from .pattern_matcher import DailyPatternEngine, OvernightPatternEngine
+from .stats_tracker import StatsManager
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
@@ -122,7 +123,9 @@ TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
 
 # Daily pattern matching engines per symbol
 pattern_engines: Dict[str, DailyPatternEngine] = {}
+overnight_engines: Dict[str, OvernightPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
+stats_manager: Optional[StatsManager] = None
 
 
 class ConnectionManager:
@@ -357,8 +360,13 @@ async def prefetch_all_tickers():
             try:
                 tf_data = cache.load(symbol, bar_size=tf, max_age_hours=None)
                 if tf_data is not None and len(tf_data) > 0:
-                    # Convert to list of dicts for fast JSON serialization
-                    preloaded_data[symbol][tf] = tf_data.to_dict('records')
+                    # Convert to list of dicts with native Python types
+                    # (parquet loads numpy types which can break JSON serialization)
+                    records = tf_data.to_dict('records')
+                    preloaded_data[symbol][tf] = [
+                        {k: (int(v) if k == 'time' else float(v)) for k, v in row.items()}
+                        for row in records
+                    ]
                     logger.info(f"  ✓ {symbol}/{tf}: {len(preloaded_data[symbol][tf])} bars in memory")
                 else:
                     preloaded_data[symbol][tf] = []
@@ -393,34 +401,30 @@ def initialize_pattern_engines():
         pattern_engines[symbol] = engine
         logger.info(f"✓ Daily pattern matcher for {symbol}: {engine.num_days} days loaded")
 
+        on_engine = OvernightPatternEngine()
+        on_engine.load_from_1min_bars(bars)
+        overnight_engines[symbol] = on_engine
+        logger.info(f"✓ Overnight pattern matcher for {symbol}: {on_engine.num_sessions} sessions loaded")
+
 
 async def pattern_match_loop():
     """
-    Background task: run daily pattern matching every 30 minutes during RTH.
-    Schedule: 9:30 AM initial, then every 30 min until 2:00 PM ET.
+    Background task: run pattern matching every 1 minute, 24/7.
+    Runs immediately on first iteration, then every 60s.
     """
-    import pytz
-    from datetime import datetime as dt
-
-    eastern = pytz.timezone('US/Eastern')
+    # Run immediately on startup
+    await run_all_pattern_matches()
 
     while True:
         try:
-            now_et = dt.now(eastern)
-            if now_et.weekday() < 5:
-                current_minutes = now_et.hour * 60 + now_et.minute
-                # 9:30 AM (570) to 2:00 PM (840)
-                if 570 <= current_minutes < 840:
-                    await run_all_pattern_matches()
-
-            # Sleep 30 minutes (1800 seconds)
-            await asyncio.sleep(1800)
+            await asyncio.sleep(60)  # 1 minute
+            await run_all_pattern_matches()
         except asyncio.CancelledError:
             logger.info("Pattern match loop cancelled")
             break
         except Exception as e:
             logger.error(f"Pattern match loop error: {e}")
-            await asyncio.sleep(120)
+            await asyncio.sleep(60)
 
 
 async def run_all_pattern_matches():
@@ -440,6 +444,10 @@ async def run_all_pattern_matches():
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
+                # Track pattern snapshot + prediction log
+                if stats_manager:
+                    current_price = bars_1min[-1].get('close', 0) if bars_1min else 0
+                    stats_manager.process_pattern_update(symbol, result, 'rth', current_price)
                 logger.info(
                     f"Daily pattern {symbol}: {result['match_count']} matches, "
                     f"phase={result.get('projection', {}).get('current_phase', 'n/a')}, "
@@ -447,6 +455,30 @@ async def run_all_pattern_matches():
                 )
         except Exception as e:
             logger.error(f"Daily pattern match error for {symbol}: {e}")
+
+    # Overnight pattern matching
+    for symbol, engine in overnight_engines.items():
+        try:
+            bars_1min = preloaded_data.get(symbol, {}).get('1min', [])
+            if not bars_1min:
+                continue
+
+            result = engine.run_match_from_1min(bars_1min)
+            if result:
+                result['symbol'] = symbol
+                await connection_manager.broadcast(
+                    symbol, result, immediate=True
+                )
+                # Track pattern snapshot + prediction log
+                if stats_manager:
+                    current_price = bars_1min[-1].get('close', 0) if bars_1min else 0
+                    stats_manager.process_pattern_update(symbol, result, 'overnight', current_price)
+                logger.info(
+                    f"Overnight pattern {symbol}: {result['match_count']} matches, "
+                    f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
+                )
+        except Exception as e:
+            logger.error(f"Overnight pattern match error for {symbol}: {e}")
 
 
 @asynccontextmanager
@@ -497,6 +529,11 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing pattern matching engines...")
         initialize_pattern_engines()
 
+        # Initialize stats tracking system
+        global stats_manager
+        stats_manager = StatsManager()
+        logger.info("✓ Stats tracking system initialized")
+
         # Start pattern matching background loop
         global pattern_task
         pattern_task = asyncio.create_task(pattern_match_loop())
@@ -517,6 +554,9 @@ async def lifespan(app: FastAPI):
 
     if realtime_manager:
         realtime_manager.stop_all_streams()
+
+    if stats_manager:
+        stats_manager.shutdown()
 
     if ib_manager:
         ib_manager.disconnect()
@@ -666,6 +706,91 @@ async def trigger_pattern_match(symbol: str):
     return {"status": "no_results", "message": "Not enough data for matching"}
 
 
+@app.get("/api/pattern/{symbol}/overnight")
+async def get_overnight_pattern(symbol: str):
+    """Get latest overnight pattern match results for a symbol."""
+    if symbol not in overnight_engines:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No overnight engine for {symbol}"}
+        )
+    engine = overnight_engines[symbol]
+    if engine.latest_result is None:
+        return {"status": "no_results", "message": "Overnight matching hasn't run yet"}
+    return engine.latest_result
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Get trading statistics for dashboard."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.get_dashboard_stats()
+
+
+@app.get("/api/stats/today")
+async def get_stats_today():
+    """Get today's stats."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_today_stats()
+
+
+@app.get("/api/stats/patterns")
+async def get_pattern_stats():
+    """Get pattern accuracy stats."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_pattern_accuracy()
+
+
+@app.get("/api/stats/full")
+async def get_full_stats():
+    """Get comprehensive stats for the stats page."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_all_stats_summary()
+
+
+@app.get("/api/stats/predictions")
+async def get_predictions(session_type: str = None, symbol: str = None, limit: int = 200):
+    """Get prediction history."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_prediction_history(session_type, symbol, limit)
+
+
+@app.get("/api/stats/sessions")
+async def get_session_predictions(symbol: str = None):
+    """Get anchored session-level predictions."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return {
+        'active': stats_manager.session_tracker.get_active_sessions(),
+        'history': stats_manager.db.get_session_predictions(symbol=symbol, limit=30),
+    }
+
+
+@app.get("/stats")
+async def stats_page():
+    """Serve the stats dashboard page."""
+    html_path = Path(__file__).parent.parent / 'frontend' / 'templates' / 'stats.html'
+    if html_path.exists():
+        return FileResponse(html_path)
+    return {"error": "Stats page not found"}
+
+
+@app.get("/api/bars/{symbol}/{timeframe}")
+async def get_bars(symbol: str, timeframe: str, limit: int = 500):
+    """Get preloaded bar data for a symbol and timeframe (from memory)."""
+    if symbol not in preloaded_data:
+        return {"bars": [], "count": 0}
+    bars = preloaded_data[symbol].get(timeframe, [])
+    # Return last N bars
+    result = bars[-limit:] if len(bars) > limit else bars
+    return {"bars": result, "count": len(result), "symbol": symbol, "timeframe": timeframe}
+
+
 @app.get("/api/cache/{symbol}")
 async def get_cache_info(symbol: str):
     """Get cache information for a symbol"""
@@ -678,6 +803,40 @@ async def get_cache_info(symbol: str):
         return metadata
     else:
         raise HTTPException(status_code=404, detail=f"No cache found for {symbol}")
+
+
+_TF_SECONDS = {
+    '5min': 300, '15min': 900, '30min': 1800,
+    '1H': 3600, '2H': 7200, '4H': 14400
+}
+
+def _update_higher_timeframes(symbol: str, bar_data: dict, is_new_bar: bool):
+    """Aggregate a 1-min bar into all higher timeframe preloaded data."""
+    t = bar_data.get('time', 0)
+    if not t:
+        return
+    for tf, secs in _TF_SECONDS.items():
+        tf_list = preloaded_data.get(symbol, {}).get(tf)
+        if tf_list is None:
+            continue
+        bar_start = (t // secs) * secs
+        if tf_list and tf_list[-1]['time'] == bar_start:
+            # Update existing bar
+            last = tf_list[-1]
+            last['high'] = max(last['high'], bar_data['high'])
+            last['low'] = min(last['low'], bar_data['low'])
+            last['close'] = bar_data['close']
+            last['volume'] = last['volume'] + bar_data.get('volume', 0)
+        else:
+            # New bar for this timeframe
+            tf_list.append({
+                'time': bar_start,
+                'open': bar_data['open'],
+                'high': bar_data['high'],
+                'low': bar_data['low'],
+                'close': bar_data['close'],
+                'volume': bar_data.get('volume', 0),
+            })
 
 
 @app.websocket("/ws/{symbol}/{timeframe}")
@@ -737,22 +896,51 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
         # Helper function to send timeframe data from memory
         async def send_timeframe_data(tf: str):
             """Send preloaded data for a timeframe - instant from memory"""
-            if symbol in preloaded_data and tf in preloaded_data[symbol]:
-                data_list = preloaded_data[symbol][tf]
-                if data_list:
-                    await connection_manager.send_to_client(websocket, {
-                        'type': 'historical',
-                        'data': data_list,
-                        'symbol': symbol,
-                        'timeframe': tf,
-                        'bar_count': len(data_list),
-                        'indicators': {}  # TODO: calculate indicators if needed
-                    })
-                    logger.info(f"[{symbol}] Sent {len(data_list)} bars for {tf} (from memory)")
-                else:
-                    logger.warning(f"[{symbol}] No preloaded data for {tf}")
-            else:
-                logger.warning(f"[{symbol}] Timeframe {tf} not in preloaded_data")
+            import json as _json
+
+            if symbol not in preloaded_data:
+                logger.warning(f"[{symbol}] No preloaded data at all")
+                return
+
+            data_list = preloaded_data[symbol].get(tf, [])
+            logger.info(f"[{symbol}] send_timeframe_data({tf}): {len(data_list)} bars available")
+
+            if not data_list:
+                logger.warning(f"[{symbol}] No data available for {tf}")
+                return
+
+            # Debug: log first and last bar
+            logger.info(f"[{symbol}] First bar: {data_list[0]}")
+            logger.info(f"[{symbol}] Last bar: {data_list[-1]}")
+
+            payload = {
+                'type': 'historical',
+                'data': data_list,
+                'symbol': symbol,
+                'timeframe': tf,
+                'bar_count': len(data_list),
+                'indicators': {}
+            }
+
+            # Test JSON serialization before sending
+            try:
+                serialized = _json.dumps(payload)
+                logger.info(f"[{symbol}] JSON serialized OK: {len(serialized)} bytes")
+            except Exception as e:
+                logger.error(f"[{symbol}] JSON serialization FAILED for {tf}: {e}")
+                # Fix types and retry
+                fixed_list = [
+                    {k: (int(v) if k == 'time' else float(v))
+                     for k, v in row.items()
+                     if k in ('time', 'open', 'high', 'low', 'close', 'volume')}
+                    for row in data_list
+                ]
+                payload['data'] = fixed_list
+                payload['bar_count'] = len(fixed_list)
+                logger.info(f"[{symbol}] Fixed types, retrying...")
+
+            await websocket.send_json(payload)
+            logger.info(f"[{symbol}] ✓ Sent {len(data_list)} bars for {tf}")
 
         # Step 1: Send initial data from memory (instant!)
         try:
@@ -772,6 +960,13 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                 async def on_bar_update(bar_data: dict, is_new_bar: bool):
                     """Called on every bar update"""
                     logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
+
+                    # Keep ALL timeframes in preloaded_data up-to-date
+                    if symbol in preloaded_data and '1min' in preloaded_data[symbol]:
+                        if is_new_bar:
+                            preloaded_data[symbol]['1min'].append(bar_data)
+                        _update_higher_timeframes(symbol, bar_data, is_new_bar)
+
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
@@ -818,13 +1013,41 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         if new_tf in TIMEFRAMES:
                             logger.info(f"[{symbol}] Switching timeframe: {current_timeframe} -> {new_tf}")
                             current_timeframe = new_tf
-                            await send_timeframe_data(new_tf)
+                            try:
+                                await send_timeframe_data(new_tf)
+                            except Exception as e:
+                                logger.error(f"[{symbol}] Error sending {new_tf} data: {e}", exc_info=True)
+                                await websocket.send_json({
+                                    'type': 'historical',
+                                    'data': [],
+                                    'symbol': symbol,
+                                    'timeframe': new_tf,
+                                    'bar_count': 0,
+                                    'indicators': {}
+                                })
                         else:
                             logger.warning(f"[{symbol}] Invalid timeframe requested: {new_tf}")
 
                     elif msg_type == 'ping':
                         # Client ping - respond with pong
                         await websocket.send_json({'type': 'pong'})
+
+                    elif msg_type == 'trade_signal' and stats_manager:
+                        # Trade signal from scalping engine (frontend)
+                        events = stats_manager.process_trade_signal(
+                            symbol=symbol,
+                            bar_time=msg.get('bar_time', 0),
+                            price=msg.get('price', 0),
+                            action=msg.get('action', 'NO_TRADE'),
+                            confluence=msg.get('confluence', 0),
+                            atr=msg.get('atr', 0),
+                            indicators=msg.get('indicators', {}),
+                        )
+                        if events:
+                            await websocket.send_json({
+                                'type': 'signal_events',
+                                'events': events,
+                            })
 
                     else:
                         logger.debug(f"[{symbol}] Received message: {msg_type}")
