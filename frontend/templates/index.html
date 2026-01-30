@@ -1704,13 +1704,13 @@
                 }
             }
 
-            // Draw projected move price line on chart
-            if (proj && proj.end_of_day_price && candleSeries) {
-                const targetPrice = proj.end_of_day_price;
-                const ret = proj.end_of_day_return || 0;
+            // Draw projected move price line on chart (peak move, not just EOD average)
+            const peakPrice = proj ? (proj.peak_move_price || proj.end_of_day_price) : null;
+            if (peakPrice && candleSeries) {
+                const targetPrice = peakPrice;
                 const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
                 const arrow = pts >= 0 ? '↑' : '↓';
-                const label = `RTH Proj ${arrow}${Math.abs(pts)} pts`;
+                const label = `RTH Peak ${arrow}${Math.abs(pts)} pts`;
                 const color = pts >= 0 ? '#26a69a' : '#ef5350';
 
                 if (dailyProjectionLine) {
@@ -1870,12 +1870,13 @@
                 eosEl.textContent = proj.end_of_session_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
                 eosEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
 
-                // Draw overnight projected move price line on chart
-                if (candleSeries) {
-                    const targetPrice = proj.end_of_session_price;
+                // Draw overnight projected move price line (peak move, not just EOS average)
+                const onPeakPrice = proj.peak_move_price || proj.end_of_session_price;
+                if (candleSeries && onPeakPrice) {
+                    const targetPrice = onPeakPrice;
                     const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
                     const arrow = pts >= 0 ? '↑' : '↓';
-                    const label = `ON Proj ${arrow}${Math.abs(pts)} pts`;
+                    const label = `ON Peak ${arrow}${Math.abs(pts)} pts`;
                     const color = pts >= 0 ? '#42A5F5' : '#FF7043'; // blue bullish, orange bearish
 
                     if (overnightProjectionLine) {

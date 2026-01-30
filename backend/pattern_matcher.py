@@ -248,6 +248,16 @@ def generate_projection(matches: list, n_hours_so_far: int,
     # Projected prices
     projected_prices = [current_price * (1 + r / 100.0) for r in avg_path]
 
+    # Peak projected move — most extreme point along the avg path
+    if avg_path:
+        abs_moves = [abs(r) for r in avg_path]
+        peak_idx = int(np.argmax(abs_moves))
+        peak_price = round(projected_prices[peak_idx], 2)
+        peak_return = round(avg_path[peak_idx], 3)
+    else:
+        peak_price = None
+        peak_return = None
+
     # Inflection points (local max/min in avg path)
     inflections = []
     for i in range(1, len(avg_path) - 1):
@@ -291,6 +301,8 @@ def generate_projection(matches: list, n_hours_so_far: int,
         'current_phase': current_phase,
         'end_of_day_price': round(projected_prices[-1], 2) if projected_prices else None,
         'end_of_day_return': round(avg_path[-1], 3) if avg_path else None,
+        'peak_move_price': peak_price,
+        'peak_move_return': peak_return,
         'confidence_upper': [round(v, 2) for v in upper],
         'confidence_lower': [round(v, 2) for v in lower],
         'individual_paths': [
@@ -1183,12 +1195,35 @@ class OvernightPatternEngine:
         avg_path = np.where(weight_sum > 0, weighted_sum / weight_sum, 0).tolist()
         projected_prices = [current_price * (1 + r / 100.0) for r in avg_path]
 
+        # Confidence bands (16th and 84th percentile)
+        upper = []
+        lower = []
+        for step in range(max_len):
+            vals = [p['returns'][step] for p in future_paths if len(p['returns']) > step]
+            if vals:
+                upper.append(current_price * (1 + float(np.percentile(vals, 84)) / 100))
+                lower.append(current_price * (1 + float(np.percentile(vals, 16)) / 100))
+
+        # Peak projected move — the most extreme point along the avg path
+        if avg_path:
+            abs_moves = [abs(r) for r in avg_path]
+            peak_idx = int(np.argmax(abs_moves))
+            peak_price = projected_prices[peak_idx]
+            peak_return = avg_path[peak_idx]
+        else:
+            peak_price = None
+            peak_return = None
+
         return {
             'avg_path': avg_path,
             'projected_prices': projected_prices,
             'hours_remaining': max_len,
             'end_of_session_price': projected_prices[-1] if projected_prices else None,
             'end_of_session_return': avg_path[-1] if avg_path else None,
+            'peak_move_price': round(peak_price, 2) if peak_price else None,
+            'peak_move_return': round(peak_return, 3) if peak_return else None,
+            'confidence_upper': [round(v, 2) for v in upper],
+            'confidence_lower': [round(v, 2) for v in lower],
             'individual_paths': [
                 {'date': p['date'], 'returns': p['returns'][:max_len]}
                 for p in future_paths[:5]
