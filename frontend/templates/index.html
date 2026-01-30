@@ -1670,6 +1670,8 @@
 
             // (Action + Trade Details moved to multi-TF signal list — rendered by renderMtfSignalList)
 
+            const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
+
             // Regime
             const regEl = document.getElementById('dash-regime');
             regEl.textContent = state.regime;
