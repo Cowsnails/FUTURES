@@ -650,7 +650,7 @@
         let historicalBars = [];  // Store bars for indicator calculations
         let scalpingEngine = new ScalpingEngine();  // Scalping decision engine (1m - primary)
         let engineThrottleTime = 0;  // Throttle engine updates
-        const ENGINE_THROTTLE_MS = 2000;
+        const ENGINE_THROTTLE_MS = 5000;
 
         // Cached DOM elements for dashboard (avoid 30+ getElementById per tick)
         const dashEls = {};
@@ -779,7 +779,7 @@
                     close: bar.close,
                     volume: bar.volume
                 };
-                console.log(`BarAggregator initialized with bar at ${new Date(barStartTime * 1000).toLocaleString()}`);
+                console.debug('BarAggregator initialized');
             }
 
             /**
@@ -1055,7 +1055,7 @@
         }
 
         function handleHistoricalData(msg) {
-            console.log(`Received ${msg.data.length} historical bars for timeframe ${currentTimeframe}`);
+            console.debug(`Received ${msg.data.length} historical bars`);
 
             // Resume accepting bar updates now that we have fresh historical data
             waitingForHistorical = false;
@@ -1066,33 +1066,9 @@
             // Sort data by time to ensure proper ordering (safety check)
             const sortedData = [...msg.data].sort((a, b) => a.time - b.time);
 
-            // Debug: Check first and last bar timestamps and verify spacing
             if (sortedData.length > 0) {
-                const firstBar = sortedData[0];
                 const lastBar = sortedData[sortedData.length - 1];
-                const expectedInterval = TIMEFRAME_SECONDS[currentTimeframe];
-
-                console.log('=== HISTORICAL DATA ===');
-                console.log(`Timeframe: ${currentTimeframe} (${expectedInterval}s intervals)`);
-                console.log(`First bar: ${new Date(firstBar.time * 1000).toLocaleString()} (ts: ${firstBar.time})`);
-                console.log(`Last bar: ${new Date(lastBar.time * 1000).toLocaleString()} (ts: ${lastBar.time})`);
-
-                // Check for gaps in last 5 bars
-                if (sortedData.length >= 2) {
-                    console.log('Last 5 bar intervals:');
-                    const start = Math.max(0, sortedData.length - 5);
-                    for (let i = start + 1; i < sortedData.length; i++) {
-                        const gap = sortedData[i].time - sortedData[i-1].time;
-                        const gapBars = gap / expectedInterval;
-                        if (gapBars !== 1) {
-                            console.log(`  Bar ${i}: ${new Date(sortedData[i].time * 1000).toLocaleTimeString()} - gap: ${gap}s (${gapBars.toFixed(1)} bars)`);
-                        }
-                    }
-                }
-                console.log('=======================');
-
                 // Initialize bar aggregator with the last historical bar
-                // This ensures real-time bars connect properly without gaps
                 barAggregator.initializeWithBar(lastBar);
             }
 
@@ -1125,7 +1101,7 @@
 
             // Render indicators if present
             if (msg.indicators && Object.keys(msg.indicators).length > 0) {
-                console.log(`Rendering ${Object.keys(msg.indicators).length} indicators`);
+                console.debug(`Rendering ${Object.keys(msg.indicators).length} indicators`);
                 for (const [indicatorId, indicatorData] of Object.entries(msg.indicators)) {
                     try {
                         indicatorRenderer.addIndicator(
@@ -1145,7 +1121,6 @@
             // Generate future time markers (extend chart to end of day)
             if (sortedData.length > 0) {
                 const latestBar = sortedData[sortedData.length - 1];
-                console.log(`Latest bar time from backend: ${latestBar.time}, which is ${new Date(latestBar.time * 1000).toLocaleString()}`);
                 // Use closing price of last bar for invisible markers
                 const avgPrice = latestBar.close;
                 generateFutureTimeMarkers(latestBar.time, avgPrice);
@@ -1166,8 +1141,10 @@
                 updatePriceLine(latestBar.close, latestBar.open, getCountdownText());
             }
 
-            console.log('Historical data loaded successfully');
+            console.debug('Historical data loaded');
         }
+
+        let lastTickPrice = null;  // Track last price to skip redundant updates
 
         function handleBarUpdate(msg) {
             // Skip bar updates while waiting for historical data (timeframe/symbol switch)
@@ -1179,41 +1156,37 @@
             if (currentTimeframe === '1min') {
                 const isNewBar = msg.is_new_bar;
 
-                // Update candlestick
-                candleSeries.update(incomingBar);
+                // On ticks (not new bars), skip if price hasn't changed
+                if (!isNewBar && incomingBar.close === lastTickPrice) {
+                    latestBarTime = incomingBar.time;
+                    return;
+                }
+                lastTickPrice = incomingBar.close;
 
-                // Update volume
+                // Update candlestick + volume
+                candleSeries.update(incomingBar);
                 volumeSeries.update({
                     time: incomingBar.time,
                     value: incomingBar.volume,
                     color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                 });
 
-                // Update price line with current bar prices
-                updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
-
-                // Update bar count if new bar
+                // Update price line only on new bars (countdown handles it otherwise)
                 if (isNewBar) {
+                    updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
                     barCount++;
                     updateBarCount(barCount);
-
-                    // Reset countdown for new bar
                     startCountdown(incomingBar.time);
-
-                    // Update future markers with new latest bar
                     generateFutureTimeMarkers(incomingBar.time, incomingBar.close);
                 } else {
-                    // Just update the latest bar time for countdown calculation
                     latestBarTime = incomingBar.time;
                 }
 
-                // Update Supertrend indicator with new/updated bar
-                if (supertrendIndicator) {
+                // Update Supertrend indicator only on new bars
+                if (supertrendIndicator && isNewBar) {
                     try {
-                        supertrendIndicator.addBar(incomingBar, isNewBar);
-                    } catch (e) {
-                        console.warn('Error updating Supertrend:', e);
-                    }
+                        supertrendIndicator.addBar(incomingBar, true);
+                    } catch (e) {}
                 }
 
                 // Update scalping engine
@@ -1230,18 +1203,20 @@
 
                 // Update the partial bar in real-time (shows the bar building)
                 if (result.partialBar) {
-                    candleSeries.update(result.partialBar);
+                    // Skip if price hasn't changed on partial updates
+                    if (!result.isNewBar && result.partialBar.close === lastTickPrice) {
+                        latestBarTime = result.partialBar.time;
+                        return;
+                    }
+                    lastTickPrice = result.partialBar.close;
 
+                    candleSeries.update(result.partialBar);
                     volumeSeries.update({
                         time: result.partialBar.time,
                         value: result.partialBar.volume,
                         color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                     });
 
-                    // Update price line with current bar prices
-                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
-
-                    // Update latest bar time for countdown
                     latestBarTime = result.partialBar.time;
                 }
 
@@ -1249,26 +1224,18 @@
                 if (result.isNewBar && result.completedBar) {
                     barCount++;
                     updateBarCount(barCount);
-
-                    console.log(`Aggregated bar completed: ${new Date(result.completedBar.time * 1000).toLocaleString()}`);
+                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
+                    generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
                 }
 
-                // Start or update countdown with the current aggregated bar time
                 if (result.partialBar) {
                     startCountdown(result.partialBar.time);
 
-                    // Update future markers with latest aggregated bar
-                    if (result.isNewBar) {
-                        generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
-                    }
-
-                    // Update Supertrend indicator with aggregated bar
-                    if (supertrendIndicator) {
+                    // Update Supertrend only on completed bars
+                    if (supertrendIndicator && result.isNewBar) {
                         try {
-                            supertrendIndicator.addBar(result.partialBar, result.isNewBar);
-                        } catch (e) {
-                            console.warn('Error updating Supertrend:', e);
-                        }
+                            supertrendIndicator.addBar(result.partialBar, true);
+                        } catch (e) {}
                     }
 
                     // Update scalping engine with aggregated bar
@@ -1369,29 +1336,27 @@
             const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
 
             // Calculate next bar time based on current time alignment
-            // This ensures countdown works even if last bar is old
             const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
             const nextBarTime = currentBarStart + barSizeSeconds;
             const remaining = nextBarTime - now;
 
+            let display;
             if (remaining <= 0 || remaining > barSizeSeconds) {
-                // Something's wrong, recalculate
-                document.getElementById('timer-value').textContent = '0:00';
-                // Also update price line with 0:00
-                if (currentPrice !== null) {
-                    updatePriceLine(currentPrice, currentOpenPrice, '0:00');
-                }
-                return;
+                display = '0:00';
+            } else {
+                const minutes = Math.floor(remaining / 60);
+                const seconds = remaining % 60;
+                display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
             }
 
-            const minutes = Math.floor(remaining / 60);
-            const seconds = remaining % 60;
-            const display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            // Only update DOM if text actually changed
+            const timerEl = getDashEl('timer-value');
+            if (timerEl && timerEl.textContent !== display) {
+                timerEl.textContent = display;
+            }
 
-            document.getElementById('timer-value').textContent = display;
-
-            // Update price line with new countdown
-            if (currentPrice !== null) {
+            // Update price line title only every 5 seconds (not every second)
+            if (currentPrice !== null && remaining % 5 === 0) {
                 updatePriceLine(currentPrice, currentOpenPrice, display);
             }
         }
@@ -1400,18 +1365,13 @@
             latestBarTime = barTime;
 
             // Show countdown timer
-            document.getElementById('countdown-timer').style.display = 'flex';
+            getDashEl('countdown-timer').style.display = 'flex';
 
-            // Clear existing interval
-            if (countdownInterval) {
-                clearInterval(countdownInterval);
+            // Start interval only once (not every new bar)
+            if (!countdownInterval) {
+                updateCountdown();
+                countdownInterval = setInterval(updateCountdown, 1000);
             }
-
-            // Update immediately
-            updateCountdown();
-
-            // Update every second
-            countdownInterval = setInterval(updateCountdown, 1000);
         }
 
         function stopCountdown() {
@@ -1480,14 +1440,15 @@
                 renderEngineOverlays(bars, state);
                 renderMtfSignalList();
 
-                // Send trade signal to backend for stats tracking
-                if (ws && ws.readyState === WebSocket.OPEN && state.decision) {
+                // Send trade signal to backend only on actual BUY/SELL
+                if (ws && ws.readyState === WebSocket.OPEN && state.decision &&
+                    (state.decision.action === 'BUY' || state.decision.action === 'SELL')) {
                     const lastBar = bars[bars.length - 1];
                     ws.send(JSON.stringify({
                         type: 'trade_signal',
                         bar_time: lastBar.time,
                         price: lastBar.close,
-                        action: state.decision.action || 'NO_TRADE',
+                        action: state.decision.action,
                         confluence: state.confluence?.total || 0,
                         atr: state.indicators?.atr10 || 0,
                         indicators: {

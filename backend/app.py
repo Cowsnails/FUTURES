@@ -994,10 +994,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
         if realtime_manager:
             try:
                 # Callback for bar updates
+                _last_tick_price = {}  # Track last sent price per symbol
+                _last_tick_time = {}  # Throttle tick broadcasts
+
                 async def on_bar_update(bar_data: dict, is_new_bar: bool):
                     """Called on every bar update"""
-                    logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
-
                     # Keep ALL timeframes in preloaded_data up-to-date
                     if symbol in preloaded_data and '1min' in preloaded_data[symbol]:
                         if is_new_bar:
@@ -1005,8 +1006,6 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         _update_higher_timeframes(symbol, bar_data, is_new_bar)
 
                     # Feed every bar to stats tracker so pending signals get resolved
-                    # (outcome tracking needs continuous price updates at +1m, +5m, +15m)
-                    # Now passes OHLC for bracket resolution
                     if stats_manager and is_new_bar:
                         stats_manager.update_pending_outcomes(
                             symbol=symbol,
@@ -1017,12 +1016,33 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             bar_low=bar_data.get('low', 0),
                         )
 
+                    # New bars always sent immediately
+                    if is_new_bar:
+                        _last_tick_price[symbol] = None
+                        await connection_manager.broadcast(symbol, {
+                            'type': 'bar_update',
+                            'data': bar_data,
+                            'is_new_bar': True,
+                            'symbol': symbol
+                        }, immediate=True)
+                        return
+
+                    # Tick updates: skip if price unchanged, throttle to max 1/sec
+                    cur_price = bar_data.get('close')
+                    if cur_price == _last_tick_price.get(symbol):
+                        return
+                    now = time.monotonic()
+                    if now - _last_tick_time.get(symbol, 0) < 1.0:
+                        return
+                    _last_tick_price[symbol] = cur_price
+                    _last_tick_time[symbol] = now
+
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
-                        'is_new_bar': is_new_bar,
+                        'is_new_bar': False,
                         'symbol': symbol
-                    }, immediate=True)  # Send immediately, no batching for real-time price updates
+                    }, immediate=True)
 
                 # Start streaming
                 logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")
