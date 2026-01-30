@@ -186,6 +186,12 @@
             <div class="no-data">Loading bracket trades...</div>
         </div>
 
+        <!-- Setup Leaderboard -->
+        <div class="section-title">Setup Leaderboard (Multi-Strategy Testing)</div>
+        <div class="card" id="setupLeaderboardCard">
+            <div class="no-data">Loading setup leaderboard...</div>
+        </div>
+
         <!-- Legacy Signal Stats Cards (deprecated - kept for backward compat) -->
         <details style="margin-bottom:16px">
             <summary class="section-title" style="cursor:pointer;user-select:none">Legacy Time-Snapshot Performance (Today) <span style="color:#555;font-size:12px">[click to expand]</span></summary>
@@ -666,11 +672,80 @@
             container.innerHTML = html;
         }
 
+        function renderSetupLeaderboard(data) {
+            const container = document.getElementById('setupLeaderboardCard');
+            const leaderboard = data.leaderboard || [];
+            const detectors = data.detectors || [];
+
+            if (leaderboard.length === 0 && detectors.length === 0) {
+                container.innerHTML = '<div class="no-data">No setup detectors registered yet. Phase 1 detectors coming soon.</div>';
+                return;
+            }
+
+            let html = '';
+
+            // Active detectors summary
+            if (detectors.length > 0) {
+                html += `<div style="margin-bottom:12px;color:#888;font-size:12px">${detectors.length} detector(s) registered | ${detectors.filter(d=>d.enabled).length} enabled | ${detectors.reduce((s,d)=>s+d.signal_count,0)} total signals emitted</div>`;
+            }
+
+            if (leaderboard.length === 0) {
+                html += '<div class="no-data">No resolved setup trades yet. Waiting for signals...</div>';
+                container.innerHTML = html;
+                return;
+            }
+
+            html += `<table class="predictions-table">
+                <thead><tr>
+                    <th>Setup</th>
+                    <th>Trades</th>
+                    <th>Win Rate</th>
+                    <th>Avg R</th>
+                    <th>Total R</th>
+                    <th>SQN</th>
+                    <th>MFE(R)</th>
+                    <th>MAE(R)</th>
+                    <th>ETD(R)</th>
+                    <th>Avg Bars</th>
+                    <th>Targets</th>
+                    <th>Stops</th>
+                    <th>Timeouts</th>
+                </tr></thead><tbody>`;
+
+            for (const s of leaderboard) {
+                const wr = s.bracket_win_rate;
+                const wrColor = winColor(wr);
+                const avgRColor = s.avg_r > 0 ? '#26a69a' : s.avg_r < 0 ? '#ef5350' : '#888';
+                const totalRColor = s.total_r > 0 ? '#26a69a' : s.total_r < 0 ? '#ef5350' : '#888';
+                const sqnColor = s.sqn >= 2 ? '#26a69a' : s.sqn >= 1 ? '#ffca28' : '#ef5350';
+
+                html += `<tr>
+                    <td style="font-weight:600;color:#ccc">${s.setup_name}</td>
+                    <td>${s.total_trades}</td>
+                    <td style="color:${wrColor};font-weight:600">${wr !== null ? (wr * 100).toFixed(1) + '%' : '-'}</td>
+                    <td style="color:${avgRColor};font-weight:600">${s.avg_r !== null ? s.avg_r.toFixed(3) + 'R' : '-'}</td>
+                    <td style="color:${totalRColor};font-weight:600">${s.total_r !== null ? s.total_r.toFixed(2) + 'R' : '-'}</td>
+                    <td style="color:${sqnColor}">${s.sqn !== null ? s.sqn.toFixed(2) : '-'}</td>
+                    <td class="green">${s.avg_mfe_r ? s.avg_mfe_r.toFixed(2) : '-'}</td>
+                    <td class="red">${s.avg_mae_r ? s.avg_mae_r.toFixed(2) : '-'}</td>
+                    <td>${s.avg_etd_r ? s.avg_etd_r.toFixed(2) : '-'}</td>
+                    <td>${s.avg_bars_held ? s.avg_bars_held.toFixed(1) : '-'}</td>
+                    <td class="green">${s.target_hits}</td>
+                    <td class="red">${s.stop_hits}</td>
+                    <td style="color:#ffca28">${s.timeouts}</td>
+                </tr>`;
+            }
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
         async function loadAllStats() {
             try {
-                const [resp, sessResp] = await Promise.all([
+                const [resp, sessResp, setupResp] = await Promise.all([
                     fetch('/api/stats/full'),
                     fetch('/api/stats/sessions'),
+                    fetch('/api/stats/setups'),
                 ]);
                 if (!resp.ok) {
                     const errText = await resp.text();
@@ -684,6 +759,10 @@
 
                 renderBracketCards(data.bracket_today, data.bracket_all, data.bracket_7d, data.bracket_30d);
                 renderBracketTrades(data.bracket_trades);
+                if (setupResp.ok) {
+                    const setupData = await setupResp.json();
+                    renderSetupLeaderboard(setupData);
+                }
                 renderSignalCards(data.signal_stats);
                 renderPatternCards(data.pattern_accuracy, data.prediction_counts);
                 renderSessionCards(sessData);
