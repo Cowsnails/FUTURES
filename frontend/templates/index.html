@@ -1144,8 +1144,6 @@
             console.debug('Historical data loaded');
         }
 
-        let lastTickPrice = null;  // Track last price to skip redundant updates
-
         function handleBarUpdate(msg) {
             // Skip bar updates while waiting for historical data (timeframe/symbol switch)
             if (waitingForHistorical) return;
@@ -1156,14 +1154,7 @@
             if (currentTimeframe === '1min') {
                 const isNewBar = msg.is_new_bar;
 
-                // On ticks (not new bars), skip if price hasn't changed
-                if (!isNewBar && incomingBar.close === lastTickPrice) {
-                    latestBarTime = incomingBar.time;
-                    return;
-                }
-                lastTickPrice = incomingBar.close;
-
-                // Update candlestick + volume
+                // Update candlestick + volume on every tick
                 candleSeries.update(incomingBar);
                 volumeSeries.update({
                     time: incomingBar.time,
@@ -1171,9 +1162,10 @@
                     color: incomingBar.close >= incomingBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                 });
 
-                // Update price line only on new bars (countdown handles it otherwise)
+                // Update price line on every tick (shows live price on axis)
+                updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
+
                 if (isNewBar) {
-                    updatePriceLine(incomingBar.close, incomingBar.open, getCountdownText());
                     barCount++;
                     updateBarCount(barCount);
                     startCountdown(incomingBar.time);
@@ -1203,13 +1195,6 @@
 
                 // Update the partial bar in real-time (shows the bar building)
                 if (result.partialBar) {
-                    // Skip if price hasn't changed on partial updates
-                    if (!result.isNewBar && result.partialBar.close === lastTickPrice) {
-                        latestBarTime = result.partialBar.time;
-                        return;
-                    }
-                    lastTickPrice = result.partialBar.close;
-
                     candleSeries.update(result.partialBar);
                     volumeSeries.update({
                         time: result.partialBar.time,
@@ -1217,6 +1202,8 @@
                         color: result.partialBar.close >= result.partialBar.open ? COLORS.VOLUME_UP : COLORS.VOLUME_DOWN
                     });
 
+                    // Update price line on every tick (shows live price)
+                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
                     latestBarTime = result.partialBar.time;
                 }
 
@@ -1224,7 +1211,6 @@
                 if (result.isNewBar && result.completedBar) {
                     barCount++;
                     updateBarCount(barCount);
-                    updatePriceLine(result.partialBar.close, result.partialBar.open, getCountdownText());
                     generateFutureTimeMarkers(result.partialBar.time, result.partialBar.close);
                 }
 
@@ -1335,7 +1321,6 @@
             const now = Math.floor(Date.now() / 1000);
             const barSizeSeconds = TIMEFRAME_SECONDS[currentTimeframe];
 
-            // Calculate next bar time based on current time alignment
             const currentBarStart = Math.floor(now / barSizeSeconds) * barSizeSeconds;
             const nextBarTime = currentBarStart + barSizeSeconds;
             const remaining = nextBarTime - now;
@@ -1349,14 +1334,12 @@
                 display = `${minutes}:${seconds.toString().padStart(2, '0')}`;
             }
 
-            // Only update DOM if text actually changed
+            // Update timer display
             const timerEl = getDashEl('timer-value');
-            if (timerEl && timerEl.textContent !== display) {
-                timerEl.textContent = display;
-            }
+            if (timerEl) timerEl.textContent = display;
 
-            // Update price line title only every 5 seconds (not every second)
-            if (currentPrice !== null && remaining % 5 === 0) {
+            // Update price line title with countdown (shows on chart axis)
+            if (currentPrice !== null) {
                 updatePriceLine(currentPrice, currentOpenPrice, display);
             }
         }
