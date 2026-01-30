@@ -174,8 +174,20 @@
             <span style="margin-left:auto; color:#555; font-size:12px;">Auto-refreshes every 30s</span>
         </div>
 
-        <!-- Signal Stats Cards -->
-        <div class="section-title">Trade Signal Performance (Today)</div>
+        <!-- Bracket Resolution Stats -->
+        <div class="section-title">Bracket Resolution (Primary Metric)</div>
+        <div class="stats-grid" id="bracketCards">
+            <div class="card"><div class="no-data">Loading bracket stats...</div></div>
+        </div>
+
+        <!-- Bracket Trade Log -->
+        <div class="section-title">Recent Bracket Trades</div>
+        <div class="card" id="bracketTradesCard">
+            <div class="no-data">Loading bracket trades...</div>
+        </div>
+
+        <!-- Legacy Signal Stats Cards -->
+        <div class="section-title">Legacy Time-Snapshot Performance (Today)</div>
         <div class="stats-grid" id="signalCards">
             <div class="card"><div class="no-data">Loading signal stats...</div></div>
         </div>
@@ -491,6 +503,166 @@
             container.innerHTML = html;
         }
 
+        function outcomeColor(outcome) {
+            if (outcome === 'TARGET_HIT') return '#26a69a';
+            if (outcome === 'STOP_HIT') return '#ef5350';
+            if (outcome === 'TRAILING_STOP' || outcome === 'BREAKEVEN_STOP') return '#ffca28';
+            if (outcome === 'TIMEOUT_PROFIT') return '#66bb6a';
+            if (outcome === 'TIMEOUT_LOSS') return '#ff7043';
+            if (outcome === 'TIMEOUT_SCRATCH') return '#888';
+            return '#555';
+        }
+
+        function rColor(r) {
+            if (r === null || r === undefined) return '#555';
+            if (r >= 1.0) return '#26a69a';
+            if (r > 0) return '#66bb6a';
+            if (r > -0.5) return '#ffca28';
+            return '#ef5350';
+        }
+
+        function renderBracketCards(bracketToday, bracketAll, bracket7d, bracket30d) {
+            const container = document.getElementById('bracketCards');
+
+            const sections = [
+                { label: 'Today', data: bracketToday },
+                { label: 'All Time', data: bracketAll },
+                { label: '7-Day Rolling', data: bracket7d },
+                { label: '30-Day Rolling', data: bracket30d },
+            ];
+
+            let html = '';
+            for (const { label, data } of sections) {
+                if (!data || !data.total_trades) {
+                    html += `<div class="card"><h2>${label}</h2><div class="no-data">No bracket data</div></div>`;
+                    continue;
+                }
+                const s = data;
+                const wr = s.bracket_win_rate;
+                const wrPct = wr !== null && wr !== undefined ? (wr * 100).toFixed(1) + '%' : 'N/A';
+                const wrC = winColor(wr);
+                const pr = s.profitable_rate;
+                const prPct = pr !== null && pr !== undefined ? (pr * 100).toFixed(1) + '%' : 'N/A';
+
+                html += `
+                    <div class="card">
+                        <h2>${label}</h2>
+                        <div class="big-number" style="color:${wrC}">${wrPct}</div>
+                        <div class="big-label">Bracket Win Rate (Target / (Target+Stop))</div>
+
+                        <div class="stat-row">
+                            <span class="stat-label">Total Trades</span>
+                            <span class="stat-value blue">${s.total_trades}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Target Hits / Stop Hits</span>
+                            <span class="stat-value"><span class="green">${s.target_hits || 0}</span> / <span class="red">${s.stop_hits || 0}</span></span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Trailing/BE Exits</span>
+                            <span class="stat-value yellow">${s.trailing_exits || 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Timeouts / Scratches</span>
+                            <span class="stat-value">${s.timeouts || 0} / ${s.scratches || 0}</span>
+                        </div>
+
+                        <div class="stat-row">
+                            <span class="stat-label">Avg R-Multiple</span>
+                            <span class="stat-value" style="color:${rColor(s.avg_r)}">${s.avg_r !== null ? s.avg_r.toFixed(3) + 'R' : 'N/A'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Total R</span>
+                            <span class="stat-value" style="color:${rColor(s.total_r)}">${s.total_r !== null ? s.total_r.toFixed(2) + 'R' : 'N/A'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Expectancy</span>
+                            <span class="stat-value" style="color:${rColor(s.expectancy)}">${s.expectancy ? s.expectancy.toFixed(3) + 'R' : (s.avg_r ? s.avg_r.toFixed(3) + 'R' : 'N/A')}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">SQN</span>
+                            <span class="stat-value" style="color:${s.sqn && s.sqn > 2 ? '#26a69a' : s.sqn && s.sqn > 1 ? '#ffca28' : '#ef5350'}">${s.sqn ? s.sqn.toFixed(2) : 'N/A'}</span>
+                        </div>
+
+                        <div class="stat-row">
+                            <span class="stat-label">Profitable Rate</span>
+                            <span class="stat-value" style="color:${winColor(pr)}">${prPct}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg MFE / MAE (R)</span>
+                            <span class="stat-value"><span class="green">${s.avg_mfe_r ? s.avg_mfe_r.toFixed(2) : '-'}</span> / <span class="red">${s.avg_mae_r ? s.avg_mae_r.toFixed(2) : '-'}</span></span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg ETD from MFE (R)</span>
+                            <span class="stat-value">${s.avg_etd_r ? s.avg_etd_r.toFixed(2) : '-'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg Bars Held</span>
+                            <span class="stat-value">${s.avg_bars_held ? s.avg_bars_held.toFixed(1) : '-'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg Quality Score</span>
+                            <span class="stat-value">${s.avg_quality ? s.avg_quality.toFixed(1) + '/100' : '-'}</span>
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html || '<div class="card"><div class="no-data">No bracket resolution data yet. Requires ATR > 0 in trade signals.</div></div>';
+        }
+
+        function renderBracketTrades(trades) {
+            const container = document.getElementById('bracketTradesCard');
+            if (!trades || trades.length === 0) {
+                container.innerHTML = '<div class="no-data">No bracket trades resolved yet.</div>';
+                return;
+            }
+
+            let html = `<table class="predictions-table">
+                <thead><tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Dir</th>
+                    <th>Entry</th>
+                    <th>Stop</th>
+                    <th>Target</th>
+                    <th>Exit</th>
+                    <th>Outcome</th>
+                    <th>R-Mult</th>
+                    <th>MFE(R)</th>
+                    <th>MAE(R)</th>
+                    <th>ETD(R)</th>
+                    <th>Bars</th>
+                    <th>Trail</th>
+                    <th>Quality</th>
+                </tr></thead><tbody>`;
+
+            for (const t of trades) {
+                const dirClass = t.direction === 'LONG' ? 'bullish' : 'bearish';
+                const oc = outcomeColor(t.outcome);
+                const rc = rColor(t.r_multiple);
+                html += `<tr>
+                    <td>${formatTime(t.entry_time)}</td>
+                    <td>${t.symbol || ''}</td>
+                    <td><span class="badge ${dirClass}">${t.direction}</span></td>
+                    <td>${t.entry_price ? t.entry_price.toFixed(1) : '-'}</td>
+                    <td style="color:#ef5350">${t.stop_price ? t.stop_price.toFixed(1) : '-'}</td>
+                    <td style="color:#26a69a">${t.target_price ? t.target_price.toFixed(1) : '-'}</td>
+                    <td>${t.exit_price ? t.exit_price.toFixed(1) : '-'}</td>
+                    <td style="color:${oc};font-weight:600">${t.outcome || '-'}</td>
+                    <td style="color:${rc};font-weight:600">${t.r_multiple !== null ? t.r_multiple.toFixed(2) + 'R' : '-'}</td>
+                    <td class="green">${t.mfe_r ? t.mfe_r.toFixed(2) : '-'}</td>
+                    <td class="red">${t.mae_r ? t.mae_r.toFixed(2) : '-'}</td>
+                    <td>${t.etd_from_mfe_r ? t.etd_from_mfe_r.toFixed(2) : '-'}</td>
+                    <td>${t.bars_held || '-'}</td>
+                    <td>${t.trailing_stop_state || '-'}</td>
+                    <td>${t.quality_score ? t.quality_score.toFixed(0) : '-'}</td>
+                </tr>`;
+            }
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
         async function loadAllStats() {
             try {
                 const [resp, sessResp] = await Promise.all([
@@ -500,6 +672,8 @@
                 const data = await resp.json();
                 const sessData = await sessResp.json();
 
+                renderBracketCards(data.bracket_today, data.bracket_all, data.bracket_7d, data.bracket_30d);
+                renderBracketTrades(data.bracket_trades);
                 renderSignalCards(data.signal_stats);
                 renderPatternCards(data.pattern_accuracy, data.prediction_counts);
                 renderSessionCards(sessData);
