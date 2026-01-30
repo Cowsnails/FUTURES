@@ -92,6 +92,7 @@ from .security import (
     validate_indicator_params
 )
 from .pattern_matcher import DailyPatternEngine, OvernightPatternEngine
+from .stats_tracker import StatsManager
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
@@ -124,6 +125,7 @@ TIMEFRAMES = ['1min', '5min', '15min', '30min', '1H', '2H', '4H']
 pattern_engines: Dict[str, DailyPatternEngine] = {}
 overnight_engines: Dict[str, OvernightPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
+stats_manager: Optional[StatsManager] = None
 
 
 class ConnectionManager:
@@ -442,6 +444,9 @@ async def run_all_pattern_matches():
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
+                # Track pattern snapshot
+                if stats_manager:
+                    stats_manager.process_pattern_update(symbol, result, 'rth')
                 logger.info(
                     f"Daily pattern {symbol}: {result['match_count']} matches, "
                     f"phase={result.get('projection', {}).get('current_phase', 'n/a')}, "
@@ -463,6 +468,9 @@ async def run_all_pattern_matches():
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
+                # Track pattern snapshot
+                if stats_manager:
+                    stats_manager.process_pattern_update(symbol, result, 'overnight')
                 logger.info(
                     f"Overnight pattern {symbol}: {result['match_count']} matches, "
                     f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
@@ -519,6 +527,11 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing pattern matching engines...")
         initialize_pattern_engines()
 
+        # Initialize stats tracking system
+        global stats_manager
+        stats_manager = StatsManager()
+        logger.info("✓ Stats tracking system initialized")
+
         # Start pattern matching background loop
         global pattern_task
         pattern_task = asyncio.create_task(pattern_match_loop())
@@ -539,6 +552,9 @@ async def lifespan(app: FastAPI):
 
     if realtime_manager:
         realtime_manager.stop_all_streams()
+
+    if stats_manager:
+        stats_manager.shutdown()
 
     if ib_manager:
         ib_manager.disconnect()
@@ -700,6 +716,30 @@ async def get_overnight_pattern(symbol: str):
     if engine.latest_result is None:
         return {"status": "no_results", "message": "Overnight matching hasn't run yet"}
     return engine.latest_result
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Get trading statistics for dashboard."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.get_dashboard_stats()
+
+
+@app.get("/api/stats/today")
+async def get_stats_today():
+    """Get today's stats."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_today_stats()
+
+
+@app.get("/api/stats/patterns")
+async def get_pattern_stats():
+    """Get pattern accuracy stats."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_pattern_accuracy()
 
 
 @app.get("/api/cache/{symbol}")
@@ -942,6 +982,23 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                     elif msg_type == 'ping':
                         # Client ping - respond with pong
                         await websocket.send_json({'type': 'pong'})
+
+                    elif msg_type == 'trade_signal' and stats_manager:
+                        # Trade signal from scalping engine (frontend)
+                        events = stats_manager.process_trade_signal(
+                            symbol=symbol,
+                            bar_time=msg.get('bar_time', 0),
+                            price=msg.get('price', 0),
+                            action=msg.get('action', 'NO_TRADE'),
+                            confluence=msg.get('confluence', 0),
+                            atr=msg.get('atr', 0),
+                            indicators=msg.get('indicators', {}),
+                        )
+                        if events:
+                            await websocket.send_json({
+                                'type': 'signal_events',
+                                'events': events,
+                            })
 
                     else:
                         logger.debug(f"[{symbol}] Received message: {msg_type}")
