@@ -257,12 +257,16 @@ class PatternSnapshotManager:
         self._snapshot_counter += 1
         return f"PAT-{self.session_type[:3].upper()}-{int(time.time())}-{self._snapshot_counter}"
 
-    def process_update(self, pattern_result: dict, bar_time: int) -> Optional[dict]:
+    def process_update(self, pattern_result: dict, bar_time: int,
+                       current_price: float = 0) -> Optional[dict]:
         """
-        Process a pattern update. Returns a snapshot dict if one should be saved.
+        Process a pattern update.
+        Always returns a prediction_log entry.
+        Also returns a snapshot dict if meaningful change detected.
+        Returns tuple: (prediction_entry, snapshot_or_None)
         """
         if not pattern_result or not pattern_result.get('forecast'):
-            return None
+            return None, None
 
         forecast = pattern_result['forecast']
         projection = pattern_result.get('projection', {})
@@ -283,22 +287,31 @@ class PatternSnapshotManager:
             'signal_strength': forecast.get('confluence_score', 0),
         }
 
-        should_snap, trigger = self._should_snapshot(current)
-        if not should_snap:
-            return None
-
-        snapshot = {
-            'snapshot_id': self._next_id(),
-            'source': f'{self.session_type}_pattern',
+        # Always log the prediction
+        prediction = {
             'timestamp': bar_time,
             'session_date': get_trading_date(bar_time),
             'session_type': self.session_type,
-            'trigger': trigger,
+            'current_price': current_price,
             **current,
         }
 
-        self.last_snapshot = current
-        return snapshot
+        # Snapshot only on meaningful changes
+        should_snap, trigger = self._should_snapshot(current)
+        snapshot = None
+        if should_snap:
+            snapshot = {
+                'snapshot_id': self._next_id(),
+                'source': f'{self.session_type}_pattern',
+                'timestamp': bar_time,
+                'session_date': get_trading_date(bar_time),
+                'session_type': self.session_type,
+                'trigger': trigger,
+                **current,
+            }
+            self.last_snapshot = current
+
+        return prediction, snapshot
 
     def _should_snapshot(self, current: dict) -> tuple:
         if self.last_snapshot is None:
@@ -381,6 +394,28 @@ CREATE TABLE IF NOT EXISTS pattern_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_pattern_session ON pattern_snapshots(session_date, session_type);
 CREATE INDEX IF NOT EXISTS idx_pattern_timestamp ON pattern_snapshots(timestamp_utc);
+
+-- Every pattern prediction (logged every cycle for accuracy tracking)
+CREATE TABLE IF NOT EXISTS prediction_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc INTEGER NOT NULL,
+    session_date TEXT NOT NULL,
+    session_type TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT,
+    consensus TEXT,
+    avg_correlation REAL,
+    current_price REAL,
+    eod_projected_price REAL,
+    peak_projected_price REAL,
+    mean_move REAL,
+    match_count INTEGER,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_session ON prediction_log(session_date, session_type);
+CREATE INDEX IF NOT EXISTS idx_prediction_timestamp ON prediction_log(timestamp_utc);
+CREATE INDEX IF NOT EXISTS idx_prediction_symbol ON prediction_log(symbol);
 
 -- Daily aggregated stats
 CREATE TABLE IF NOT EXISTS daily_stats (
@@ -509,6 +544,28 @@ class TradingStatsDB:
             if len(self._buffer) >= BUFFER_SIZE:
                 self._flush_now()
 
+    def log_prediction(self, prediction: dict, symbol: str):
+        """Buffer a prediction entry (every pattern cycle)."""
+        row = {
+            'timestamp_utc': prediction.get('timestamp', int(time.time())),
+            'session_date': prediction.get('session_date', ''),
+            'session_type': prediction.get('session_type', ''),
+            'symbol': symbol,
+            'direction': prediction.get('direction', ''),
+            'consensus': prediction.get('consensus', ''),
+            'avg_correlation': prediction.get('avg_correlation', 0),
+            'current_price': prediction.get('current_price', 0),
+            'eod_projected_price': prediction.get('eod_projected_price', 0),
+            'peak_projected_price': prediction.get('peak_projected_price', 0),
+            'mean_move': prediction.get('mean_move', 0),
+            'match_count': prediction.get('match_count', 0),
+        }
+
+        with self._buffer_lock:
+            self._buffer.append(('prediction', row))
+            if len(self._buffer) >= BUFFER_SIZE:
+                self._flush_now()
+
     def _background_flush(self):
         while self._running:
             time.sleep(1.0)
@@ -527,6 +584,7 @@ class TradingStatsDB:
 
         signal_rows = [row for typ, row in items if typ == 'signal']
         pattern_rows = [row for typ, row in items if typ == 'pattern']
+        prediction_rows = [row for typ, row in items if typ == 'prediction']
 
         try:
             cursor = self.conn.cursor()
@@ -564,8 +622,23 @@ class TradingStatsDB:
                     )
                 """, pattern_rows)
 
+            if prediction_rows:
+                cursor.executemany("""
+                    INSERT INTO prediction_log (
+                        timestamp_utc, session_date, session_type, symbol,
+                        direction, consensus, avg_correlation, current_price,
+                        eod_projected_price, peak_projected_price, mean_move,
+                        match_count
+                    ) VALUES (
+                        :timestamp_utc, :session_date, :session_type, :symbol,
+                        :direction, :consensus, :avg_correlation, :current_price,
+                        :eod_projected_price, :peak_projected_price, :mean_move,
+                        :match_count
+                    )
+                """, prediction_rows)
+
             self.conn.commit()
-            logger.debug(f"Stats flush: {len(signal_rows)} signals, {len(pattern_rows)} patterns")
+            logger.debug(f"Stats flush: {len(signal_rows)} signals, {len(pattern_rows)} patterns, {len(prediction_rows)} predictions")
         except Exception as e:
             try:
                 self.conn.rollback()
@@ -729,6 +802,86 @@ class TradingStatsDB:
             logger.error(f"Error reading pattern accuracy: {e}")
             return {}
 
+    def get_prediction_history(self, session_type: str = None, symbol: str = None,
+                               limit: int = 200) -> list:
+        """Get recent prediction log entries."""
+        try:
+            cursor = self.conn.cursor()
+            where_parts = []
+            params = []
+            if session_type:
+                where_parts.append("session_type = ?")
+                params.append(session_type)
+            if symbol:
+                where_parts.append("symbol = ?")
+                params.append(symbol)
+            where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+            cursor.execute(f"""
+                SELECT timestamp_utc, session_date, session_type, symbol,
+                       direction, consensus, avg_correlation, current_price,
+                       eod_projected_price, peak_projected_price, mean_move, match_count
+                FROM prediction_log {where}
+                ORDER BY timestamp_utc DESC LIMIT ?
+            """, params + [limit])
+            cols = ['timestamp', 'session_date', 'session_type', 'symbol',
+                    'direction', 'consensus', 'avg_correlation', 'current_price',
+                    'eod_projected_price', 'peak_projected_price', 'mean_move', 'match_count']
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error reading prediction history: {e}")
+            return []
+
+    def get_all_stats_summary(self) -> dict:
+        """Get comprehensive stats summary for the stats page."""
+        try:
+            today = get_trading_date(int(time.time()))
+            cursor = self.conn.cursor()
+
+            # Signal stats by source (today)
+            signal_stats = self.get_today_stats()
+
+            # Prediction counts
+            cursor.execute("""
+                SELECT session_type, COUNT(*) as cnt,
+                       COUNT(DISTINCT session_date) as days
+                FROM prediction_log GROUP BY session_type
+            """)
+            prediction_counts = {row[0]: {'total_predictions': row[1], 'days_tracked': row[2]}
+                                for row in cursor.fetchall()}
+
+            # Recent predictions (last 50)
+            recent_predictions = self.get_prediction_history(limit=50)
+
+            # Pattern snapshots summary
+            cursor.execute("""
+                SELECT session_type, COUNT(*) as snapshots,
+                       SUM(CASE WHEN direction_correct = 1 THEN 1 ELSE 0 END) as correct,
+                       SUM(CASE WHEN direction_correct IS NOT NULL THEN 1 ELSE 0 END) as evaluated
+                FROM pattern_snapshots GROUP BY session_type
+            """)
+            pattern_accuracy = {}
+            for row in cursor.fetchall():
+                evaluated = row[3] or 0
+                pattern_accuracy[row[0]] = {
+                    'snapshots': row[1],
+                    'evaluated': evaluated,
+                    'correct': row[2] or 0,
+                    'accuracy': round((row[2] or 0) / evaluated, 3) if evaluated > 0 else None,
+                }
+
+            return {
+                'session_date': today,
+                'signal_stats': signal_stats,
+                'prediction_counts': prediction_counts,
+                'recent_predictions': recent_predictions,
+                'pattern_accuracy': pattern_accuracy,
+                'rolling_7d': self.get_rolling_stats(7),
+                'rolling_30d': self.get_rolling_stats(30),
+            }
+        except Exception as e:
+            logger.error(f"Error building stats summary: {e}")
+            return {}
+
     # ── Lifecycle ──
 
     def flush(self):
@@ -807,15 +960,20 @@ class StatsManager:
     # ── Called from backend pattern loop ──
 
     def process_pattern_update(self, symbol: str, pattern_result: dict,
-                               session_type: str = 'rth') -> Optional[dict]:
-        """Process a pattern matcher update. Snapshots on meaningful changes."""
+                               session_type: str = 'rth',
+                               current_price: float = 0) -> Optional[dict]:
+        """Process a pattern matcher update. Logs every prediction and snapshots on meaningful changes."""
         if session_type == 'rth':
             mgr = self.get_rth_snapshot_mgr(symbol)
         else:
             mgr = self.get_overnight_snapshot_mgr(symbol)
 
         bar_time = int(time.time())
-        snapshot = mgr.process_update(pattern_result, bar_time)
+        prediction, snapshot = mgr.process_update(pattern_result, bar_time, current_price)
+
+        # Log every prediction cycle
+        if prediction:
+            self.db.log_prediction(prediction, symbol)
 
         if snapshot:
             snapshot['symbol'] = symbol

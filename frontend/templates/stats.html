@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Stats Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0f;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            background: #111118;
+            border-bottom: 1px solid #222;
+        }
+        .header h1 { font-size: 20px; color: #fff; }
+        .back-btn {
+            background: #1a1a2e;
+            color: #7b8cff;
+            border: 1px solid #333;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            text-decoration: none;
+        }
+        .back-btn:hover { background: #252545; }
+        .container { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: #111118;
+            border: 1px solid #1e1e2e;
+            border-radius: 10px;
+            padding: 16px;
+        }
+        .card h2 {
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 12px;
+            border-bottom: 1px solid #1e1e2e;
+            padding-bottom: 8px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid #0d0d14;
+        }
+        .stat-label { color: #999; font-size: 13px; }
+        .stat-value { font-weight: 600; font-size: 13px; }
+        .stat-value.green { color: #26a69a; }
+        .stat-value.red { color: #ef5350; }
+        .stat-value.yellow { color: #ffca28; }
+        .stat-value.blue { color: #42a5f5; }
+
+        .big-number {
+            font-size: 32px;
+            font-weight: 700;
+            text-align: center;
+            padding: 12px 0;
+        }
+        .big-label {
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+            margin-top: -8px;
+            margin-bottom: 8px;
+        }
+
+        .winrate-bar {
+            height: 8px;
+            background: #1a1a2e;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 4px 0 8px;
+        }
+        .winrate-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+
+        .predictions-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .predictions-table th {
+            text-align: left;
+            padding: 8px 6px;
+            color: #666;
+            border-bottom: 1px solid #222;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 11px;
+        }
+        .predictions-table td {
+            padding: 6px;
+            border-bottom: 1px solid #0d0d14;
+        }
+        .predictions-table tr:hover { background: #151520; }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge.bullish { background: rgba(38,166,154,0.2); color: #26a69a; }
+        .badge.bearish { background: rgba(239,83,80,0.2); color: #ef5350; }
+        .badge.rth { background: rgba(66,165,245,0.15); color: #42a5f5; }
+        .badge.overnight { background: rgba(171,130,255,0.15); color: #ab82ff; }
+
+        .refresh-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .refresh-btn {
+            background: #1a1a2e;
+            color: #7b8cff;
+            border: 1px solid #333;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .refresh-btn:hover { background: #252545; }
+        .last-update { color: #555; font-size: 12px; }
+
+        .section-title {
+            font-size: 16px;
+            color: #ccc;
+            margin: 24px 0 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #1e1e2e;
+        }
+
+        .no-data {
+            color: #555;
+            text-align: center;
+            padding: 40px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Trading Statistics Dashboard</h1>
+        <a href="/" class="back-btn">Back to Chart</a>
+    </div>
+
+    <div class="container">
+        <div class="refresh-bar">
+            <button class="refresh-btn" onclick="loadAllStats()">Refresh</button>
+            <span class="last-update" id="lastUpdate">Loading...</span>
+            <span style="margin-left:auto; color:#555; font-size:12px;">Auto-refreshes every 30s</span>
+        </div>
+
+        <!-- Signal Stats Cards -->
+        <div class="section-title">Trade Signal Performance (Today)</div>
+        <div class="stats-grid" id="signalCards">
+            <div class="card"><div class="no-data">Loading signal stats...</div></div>
+        </div>
+
+        <!-- Pattern Accuracy -->
+        <div class="section-title">Pattern Prediction Accuracy</div>
+        <div class="stats-grid" id="patternCards">
+            <div class="card"><div class="no-data">Loading pattern stats...</div></div>
+        </div>
+
+        <!-- Rolling Stats -->
+        <div class="section-title">Rolling Performance (7-Day / 30-Day)</div>
+        <div class="stats-grid" id="rollingCards">
+            <div class="card"><div class="no-data">Loading rolling stats...</div></div>
+        </div>
+
+        <!-- Recent Predictions Table -->
+        <div class="section-title">Recent Pattern Predictions</div>
+        <div class="card" id="predictionsCard">
+            <div class="no-data">Loading predictions...</div>
+        </div>
+    </div>
+
+    <script>
+        function formatTime(ts) {
+            if (!ts) return '-';
+            const d = new Date(ts * 1000);
+            return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function pct(n, d) {
+            if (!d || d === 0) return '-';
+            return (n / d * 100).toFixed(1) + '%';
+        }
+
+        function winColor(rate) {
+            if (rate === null || rate === undefined) return '#555';
+            if (rate >= 0.6) return '#26a69a';
+            if (rate >= 0.45) return '#ffca28';
+            return '#ef5350';
+        }
+
+        function makeWinrateBar(rate, label) {
+            const pctVal = rate != null ? (rate * 100).toFixed(1) : 0;
+            const color = winColor(rate);
+            return `
+                <div class="stat-row">
+                    <span class="stat-label">${label}</span>
+                    <span class="stat-value" style="color:${color}">${rate != null ? pctVal + '%' : 'N/A'}</span>
+                </div>
+                <div class="winrate-bar">
+                    <div class="winrate-fill" style="width:${pctVal}%; background:${color}"></div>
+                </div>
+            `;
+        }
+
+        function renderSignalCards(todayStats) {
+            const container = document.getElementById('signalCards');
+            if (!todayStats || !todayStats.stats || Object.keys(todayStats.stats).length === 0) {
+                container.innerHTML = '<div class="card"><div class="no-data">No signal data yet. Signals will appear as the scalping engine generates BUY/SELL decisions.</div></div>';
+                return;
+            }
+
+            const sourceLabels = {
+                'trade_signal': 'Scalping Engine',
+                'rth_pattern': 'Daily Pattern',
+                'overnight_pattern': 'Overnight Pattern'
+            };
+
+            let html = '';
+            for (const [src, s] of Object.entries(todayStats.stats)) {
+                const label = sourceLabels[src] || src;
+                html += `
+                    <div class="card">
+                        <h2>${label}</h2>
+                        <div class="stat-row">
+                            <span class="stat-label">Confirmed Signals</span>
+                            <span class="stat-value blue">${s.confirmed || 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Resolved</span>
+                            <span class="stat-value">${s.resolved || 0}</span>
+                        </div>
+                        ${makeWinrateBar(s.win_rate_1m, 'Win Rate (1m)')}
+                        ${makeWinrateBar(s.win_rate_5m, 'Win Rate (5m)')}
+                        ${makeWinrateBar(s.win_rate_15m, 'Win Rate (15m)')}
+                        <div class="stat-row">
+                            <span class="stat-label">Avg MFE (pts)</span>
+                            <span class="stat-value green">${s.avg_mfe || 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg MAE (pts)</span>
+                            <span class="stat-value red">${s.avg_mae || 0}</span>
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+
+        function renderPatternCards(patternAccuracy, predictionCounts) {
+            const container = document.getElementById('patternCards');
+            const sessions = ['rth', 'overnight'];
+            const labels = { rth: 'Daily (RTH) Pattern', overnight: 'Overnight Pattern' };
+
+            let html = '';
+            for (const st of sessions) {
+                const acc = (patternAccuracy || {})[st];
+                const pred = (predictionCounts || {})[st];
+                html += `
+                    <div class="card">
+                        <h2>${labels[st]}</h2>
+                        <div class="stat-row">
+                            <span class="stat-label">Total Predictions Logged</span>
+                            <span class="stat-value blue">${pred ? pred.total_predictions : 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Days Tracked</span>
+                            <span class="stat-value">${pred ? pred.days_tracked : 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Snapshots (meaningful changes)</span>
+                            <span class="stat-value">${acc ? acc.snapshots : 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Evaluated (with actual close)</span>
+                            <span class="stat-value">${acc ? acc.evaluated : 0}</span>
+                        </div>
+                        ${acc && acc.accuracy != null ? makeWinrateBar(acc.accuracy, 'Direction Accuracy') : `
+                        <div class="stat-row">
+                            <span class="stat-label">Direction Accuracy</span>
+                            <span class="stat-value" style="color:#555">Pending evaluation</span>
+                        </div>`}
+                    </div>
+                `;
+            }
+            container.innerHTML = html || '<div class="card"><div class="no-data">No pattern data yet.</div></div>';
+        }
+
+        function renderRollingCards(rolling7d, rolling30d) {
+            const container = document.getElementById('rollingCards');
+            const sourceLabels = {
+                'trade_signal': 'Scalping Engine',
+                'rth_pattern': 'Daily Pattern',
+                'overnight_pattern': 'Overnight Pattern'
+            };
+
+            let html = '';
+            for (const src of ['trade_signal', 'rth_pattern', 'overnight_pattern']) {
+                const s7 = (rolling7d || {})[src] || {};
+                const s30 = (rolling30d || {})[src] || {};
+                html += `
+                    <div class="card">
+                        <h2>${sourceLabels[src]}</h2>
+                        <div class="stat-row">
+                            <span class="stat-label">Resolved (7d / 30d)</span>
+                            <span class="stat-value">${s7.total_resolved || 0} / ${s30.total_resolved || 0}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Win Rate 1m (7d)</span>
+                            <span class="stat-value" style="color:${winColor(s7.win_rate_1m)}">${s7.win_rate_1m ? (s7.win_rate_1m*100).toFixed(1)+'%' : 'N/A'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Win Rate 1m (30d)</span>
+                            <span class="stat-value" style="color:${winColor(s30.win_rate_1m)}">${s30.win_rate_1m ? (s30.win_rate_1m*100).toFixed(1)+'%' : 'N/A'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Win Rate 5m (7d)</span>
+                            <span class="stat-value" style="color:${winColor(s7.win_rate_5m)}">${s7.win_rate_5m ? (s7.win_rate_5m*100).toFixed(1)+'%' : 'N/A'}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Avg MFE / MAE (7d)</span>
+                            <span class="stat-value"><span class="green">${s7.avg_mfe || 0}</span> / <span class="red">${s7.avg_mae || 0}</span></span>
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html || '<div class="card"><div class="no-data">No rolling data yet.</div></div>';
+        }
+
+        function renderPredictions(predictions) {
+            const container = document.getElementById('predictionsCard');
+            if (!predictions || predictions.length === 0) {
+                container.innerHTML = '<div class="no-data">No predictions logged yet. Predictions are logged every 60 seconds when pattern engines run.</div>';
+                return;
+            }
+
+            let html = `<table class="predictions-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Session</th>
+                        <th>Symbol</th>
+                        <th>Direction</th>
+                        <th>Consensus</th>
+                        <th>Correlation</th>
+                        <th>Price</th>
+                        <th>EOS Proj</th>
+                        <th>Peak Proj</th>
+                        <th>Mean Move</th>
+                        <th>Matches</th>
+                    </tr>
+                </thead><tbody>`;
+
+            for (const p of predictions) {
+                const dirClass = p.direction === 'bullish' ? 'bullish' : 'bearish';
+                const sessClass = p.session_type === 'rth' ? 'rth' : 'overnight';
+                html += `<tr>
+                    <td>${formatTime(p.timestamp)}</td>
+                    <td><span class="badge ${sessClass}">${p.session_type}</span></td>
+                    <td>${p.symbol || ''}</td>
+                    <td><span class="badge ${dirClass}">${p.direction || ''}</span></td>
+                    <td>${p.consensus || ''}</td>
+                    <td>${p.avg_correlation ? p.avg_correlation.toFixed(3) : '-'}</td>
+                    <td>${p.current_price ? p.current_price.toFixed(1) : '-'}</td>
+                    <td>${p.eod_projected_price ? p.eod_projected_price.toFixed(1) : '-'}</td>
+                    <td>${p.peak_projected_price ? p.peak_projected_price.toFixed(1) : '-'}</td>
+                    <td>${p.mean_move ? p.mean_move.toFixed(2) + '%' : '-'}</td>
+                    <td>${p.match_count || 0}</td>
+                </tr>`;
+            }
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        async function loadAllStats() {
+            try {
+                const resp = await fetch('/api/stats/full');
+                const data = await resp.json();
+
+                renderSignalCards(data.signal_stats);
+                renderPatternCards(data.pattern_accuracy, data.prediction_counts);
+                renderRollingCards(data.rolling_7d, data.rolling_30d);
+                renderPredictions(data.recent_predictions);
+
+                document.getElementById('lastUpdate').textContent =
+                    'Last updated: ' + new Date().toLocaleTimeString();
+            } catch (err) {
+                console.error('Failed to load stats:', err);
+                document.getElementById('lastUpdate').textContent = 'Error loading stats';
+            }
+        }
+
+        // Load on page open
+        loadAllStats();
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadAllStats, 30000);
+    </script>
+</body>
+</html>

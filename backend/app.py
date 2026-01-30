@@ -444,9 +444,10 @@ async def run_all_pattern_matches():
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
-                # Track pattern snapshot
+                # Track pattern snapshot + prediction log
                 if stats_manager:
-                    stats_manager.process_pattern_update(symbol, result, 'rth')
+                    current_price = bars_1min[-1].get('close', 0) if bars_1min else 0
+                    stats_manager.process_pattern_update(symbol, result, 'rth', current_price)
                 logger.info(
                     f"Daily pattern {symbol}: {result['match_count']} matches, "
                     f"phase={result.get('projection', {}).get('current_phase', 'n/a')}, "
@@ -468,9 +469,10 @@ async def run_all_pattern_matches():
                 await connection_manager.broadcast(
                     symbol, result, immediate=True
                 )
-                # Track pattern snapshot
+                # Track pattern snapshot + prediction log
                 if stats_manager:
-                    stats_manager.process_pattern_update(symbol, result, 'overnight')
+                    current_price = bars_1min[-1].get('close', 0) if bars_1min else 0
+                    stats_manager.process_pattern_update(symbol, result, 'overnight', current_price)
                 logger.info(
                     f"Overnight pattern {symbol}: {result['match_count']} matches, "
                     f"forecast={result['forecast']['consensus'] if result.get('forecast') else 'none'}"
@@ -740,6 +742,31 @@ async def get_pattern_stats():
     if not stats_manager:
         return {"error": "Stats not initialized"}
     return stats_manager.db.get_pattern_accuracy()
+
+
+@app.get("/api/stats/full")
+async def get_full_stats():
+    """Get comprehensive stats for the stats page."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_all_stats_summary()
+
+
+@app.get("/api/stats/predictions")
+async def get_predictions(session_type: str = None, symbol: str = None, limit: int = 200):
+    """Get prediction history."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    return stats_manager.db.get_prediction_history(session_type, symbol, limit)
+
+
+@app.get("/stats")
+async def stats_page():
+    """Serve the stats dashboard page."""
+    html_path = Path(__file__).parent.parent / 'frontend' / 'templates' / 'stats.html'
+    if html_path.exists():
+        return FileResponse(html_path)
+    return {"error": "Stats page not found"}
 
 
 @app.get("/api/cache/{symbol}")
