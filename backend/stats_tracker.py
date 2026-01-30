@@ -33,10 +33,8 @@ STATS_DIR = Path(__file__).parent.parent / "trading_stats"
 DB_PATH = STATS_DIR / "live" / "signals.db"
 
 # Signal state machine
-CONFIRMATION_BARS = 1          # Instant confirmation — signals are fleeting (seconds)
-ENTRY_THRESHOLD = 0.30         # |confluence| to trigger detection
-EXIT_THRESHOLD = 0.15          # |confluence| to cancel (hysteresis)
-DETECTION_TIMEOUT_BARS = 3     # Max updates in DETECTED before expiring
+# BUY/SELL only appear when confluence >= 0.50 (ranging) or 0.60 (trending)
+# so no additional threshold needed — if action is BUY/SELL, it's valid.
 MIN_SIGNAL_GAP_SECONDS = 60    # Minimum gap between confirmed signals (cooldown)
 
 # Outcome measurement horizons (minutes)
@@ -165,7 +163,7 @@ class TradeSignalTracker:
         # Signals last seconds to 1 min max, so we confirm immediately
         # on first BUY/SELL with sufficient confluence. Cooldown prevents
         # duplicate fires within MIN_SIGNAL_GAP_SECONDS.
-        if has_signal and abs(confluence) >= ENTRY_THRESHOLD:
+        if has_signal:
             # Check cooldown
             if (bar_time - self._last_confirmed_time) >= MIN_SIGNAL_GAP_SECONDS:
                 sig = ActiveSignal(
