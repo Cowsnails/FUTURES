@@ -672,8 +672,15 @@
                     fetch('/api/stats/full'),
                     fetch('/api/stats/sessions'),
                 ]);
+                if (!resp.ok) {
+                    const errText = await resp.text();
+                    console.error('Stats API error:', resp.status, errText);
+                    document.getElementById('lastUpdate').textContent =
+                        'Stats API error: ' + resp.status;
+                    return;
+                }
                 const data = await resp.json();
-                const sessData = await sessResp.json();
+                const sessData = sessResp.ok ? await sessResp.json() : [];
 
                 renderBracketCards(data.bracket_today, data.bracket_all, data.bracket_7d, data.bracket_30d);
                 renderBracketTrades(data.bracket_trades);

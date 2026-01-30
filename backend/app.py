@@ -92,7 +92,7 @@ from .security import (
     validate_indicator_params
 )
 from .pattern_matcher import DailyPatternEngine, OvernightPatternEngine
-from .stats_tracker import StatsManager
+from .stats_tracker import StatsManager, get_trading_date
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
@@ -757,16 +757,19 @@ async def get_full_stats():
     """Get comprehensive stats for the stats page."""
     if not stats_manager:
         return {"error": "Stats not initialized"}
-    summary = stats_manager.db.get_all_stats_summary()
-    # Add bracket stats
-    from .stats_tracker import get_trading_date
-    today = get_trading_date(int(time.time()))
-    summary['bracket_today'] = stats_manager.db.get_bracket_stats(session_date=today)
-    summary['bracket_all'] = stats_manager.db.get_bracket_stats()
-    summary['bracket_trades'] = stats_manager.db.get_bracket_trades(limit=20)
-    summary['bracket_7d'] = stats_manager.db.get_rolling_bracket_stats(7)
-    summary['bracket_30d'] = stats_manager.db.get_rolling_bracket_stats(30)
-    return summary
+    try:
+        summary = stats_manager.db.get_all_stats_summary()
+        # Add bracket stats
+        today = get_trading_date(int(time.time()))
+        summary['bracket_today'] = stats_manager.db.get_bracket_stats(session_date=today)
+        summary['bracket_all'] = stats_manager.db.get_bracket_stats()
+        summary['bracket_trades'] = stats_manager.db.get_bracket_trades(limit=20)
+        summary['bracket_7d'] = stats_manager.db.get_rolling_bracket_stats(7)
+        summary['bracket_30d'] = stats_manager.db.get_rolling_bracket_stats(30)
+        return summary
+    except Exception as e:
+        logger.error(f"Error in /api/stats/full: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/api/stats/predictions")

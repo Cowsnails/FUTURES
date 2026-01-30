@@ -650,7 +650,22 @@
         let historicalBars = [];  // Store bars for indicator calculations
         let scalpingEngine = new ScalpingEngine();  // Scalping decision engine (1m - primary)
         let engineThrottleTime = 0;  // Throttle engine updates
-        const ENGINE_THROTTLE_MS = 1000;
+        const ENGINE_THROTTLE_MS = 2000;
+
+        // Cached DOM elements for dashboard (avoid 30+ getElementById per tick)
+        const dashEls = {};
+        function getDashEl(id) {
+            if (!dashEls[id]) dashEls[id] = document.getElementById(id);
+            return dashEls[id];
+        }
+
+        // Throttle for renderMtfSignalList
+        let mtfSignalThrottleTime = 0;
+        const MTF_SIGNAL_THROTTLE_MS = 3000;
+
+        // Pending dashboard RAF
+        let dashboardRafPending = false;
+        let pendingDashState = null;
 
         // Multi-timeframe scalping engines
         const MTF_TIMEFRAMES = ['1min', '5min', '15min'];
@@ -1023,9 +1038,8 @@
             const SECONDS_TO_EXTEND = HOURS_TO_EXTEND * 3600;
             const targetEndTime = lastBarTime + SECONDS_TO_EXTEND;
 
-            // Generate marker every 1 minute for detailed gridlines
-            const MINUTES_INTERVAL = 1;
-            const SECONDS_INTERVAL = MINUTES_INTERVAL * 60;
+            // Generate marker every 10 minutes (72 points instead of 720)
+            const SECONDS_INTERVAL = 600;
 
             let currentTime = lastBarTime + SECONDS_INTERVAL;
             while (currentTime <= targetEndTime) {
@@ -1036,14 +1050,8 @@
                 currentTime += SECONDS_INTERVAL;
             }
 
-            console.log(`Generating ${futureMarkers.length} future time markers (${HOURS_TO_EXTEND}h ahead)`);
-            console.log(`Last bar: ${new Date(lastBarTime * 1000).toLocaleString()}`);
-            console.log(`Extending to: ${new Date(targetEndTime * 1000).toLocaleString()}`);
-
             // Set future markers (this extends the time scale)
             futureMarkersSeries.setData(futureMarkers);
-
-            console.log('✓ Future markers set successfully');
         }
 
         function handleHistoricalData(msg) {
@@ -1507,7 +1515,13 @@
                 if (!state) return;
                 mtfStates['1min'] = state;
                 updateDashboard(state);
-                renderMtfSignalList();
+
+                // Throttle signal list rebuild on ticks (expensive innerHTML)
+                const mtfNow = Date.now();
+                if (mtfNow - mtfSignalThrottleTime >= MTF_SIGNAL_THROTTLE_MS) {
+                    mtfSignalThrottleTime = mtfNow;
+                    renderMtfSignalList();
+                }
 
                 // Also send tick-level BUY/SELL to backend for stats
                 // (signals are fleeting — seconds to 1 min max — must catch on ticks too)
@@ -1664,47 +1678,58 @@
         }
 
         function updateDashboard(state) {
-            const d = state.decision;
+            // Batch dashboard DOM updates into a single rAF to avoid layout thrashing
+            pendingDashState = state;
+            if (!dashboardRafPending) {
+                dashboardRafPending = true;
+                requestAnimationFrame(_flushDashboard);
+            }
+        }
+
+        function _flushDashboard() {
+            dashboardRafPending = false;
+            const state = pendingDashState;
+            if (!state) return;
+
             const s = state.scores;
             const ind = state.indicators;
-
-            // (Action + Trade Details moved to multi-TF signal list — rendered by renderMtfSignalList)
 
             const fmt = (v, dec = 2) => v !== null && v !== undefined ? v.toFixed(dec) : '—';
 
             // Regime
-            const regEl = document.getElementById('dash-regime');
+            const regEl = getDashEl('dash-regime');
             regEl.textContent = state.regime;
             regEl.className = 'dash-regime ' + state.regime;
 
             // Session
-            document.getElementById('dash-session').textContent = state.session.session.replace(/_/g, ' ');
+            getDashEl('dash-session').textContent = state.session.session.replace(/_/g, ' ');
 
             // Edge cases
-            const volEventEl = document.getElementById('dash-vol-event');
+            const volEventEl = getDashEl('dash-vol-event');
             volEventEl.textContent = state.volatilityEvent;
             volEventEl.className = 'dash-val ' + (state.volatilityEvent === 'NORMAL' ? 'neutral' : state.volatilityEvent === 'ELEVATED' ? 'neutral' : 'neg');
 
-            const divEl = document.getElementById('dash-divergence');
+            const divEl = getDashEl('dash-divergence');
             divEl.textContent = state.divergence.replace(/_/g, ' ');
             divEl.className = 'dash-val ' + (state.divergence === 'BULLISH_DIVERGENCE' ? 'pos' : state.divergence === 'BEARISH_DIVERGENCE' ? 'neg' : 'neutral');
 
-            document.getElementById('dash-choppy').textContent = state.choppy ? 'YES' : 'No';
-            document.getElementById('dash-choppy').className = 'dash-val ' + (state.choppy ? 'neg' : 'neutral');
+            const choppyEl = getDashEl('dash-choppy');
+            choppyEl.textContent = state.choppy ? 'YES' : 'No';
+            choppyEl.className = 'dash-val ' + (state.choppy ? 'neg' : 'neutral');
 
-            document.getElementById('dash-atr-pct').textContent = ind.atrPercentile !== null ? ind.atrPercentile.toFixed(0) + '%' : '—';
-            document.getElementById('dash-chop').textContent = ind.chop14 !== null ? ind.chop14.toFixed(1) : '—';
+            getDashEl('dash-atr-pct').textContent = ind.atrPercentile !== null ? ind.atrPercentile.toFixed(0) + '%' : '—';
+            getDashEl('dash-chop').textContent = ind.chop14 !== null ? ind.chop14.toFixed(1) : '—';
 
             // Indicator values
-            document.getElementById('dash-vwap').textContent = fmt(ind.vwap);
-            document.getElementById('dash-ema').textContent = fmt(ind.ema9);
-            document.getElementById('dash-rsi').textContent = fmt(ind.rsi7, 1);
-            document.getElementById('dash-adx').textContent = fmt(ind.adx10, 1);
-            document.getElementById('dash-atr').textContent = fmt(ind.atr10);
+            getDashEl('dash-vwap').textContent = fmt(ind.vwap);
+            getDashEl('dash-ema').textContent = fmt(ind.ema9);
+            getDashEl('dash-rsi').textContent = fmt(ind.rsi7, 1);
+            getDashEl('dash-adx').textContent = fmt(ind.adx10, 1);
+            getDashEl('dash-atr').textContent = fmt(ind.atr10);
             const volRatio = ind.volSMA20 ? (ind.volume / ind.volSMA20).toFixed(1) + 'x' : '—';
-            document.getElementById('dash-vol').textContent = volRatio;
+            getDashEl('dash-vol').textContent = volRatio;
 
-            // Scores (now from confluence.raw)
+            // Scores
             const fmtScore = (v) => {
                 if (v === null || v === undefined) return '—';
                 const el = v.toFixed(2);
@@ -1712,7 +1737,7 @@
             };
             const scoreClass = (v) => v > 0.1 ? 'pos' : v < -0.1 ? 'neg' : 'neutral';
             const setScore = (id, val) => {
-                const el = document.getElementById(id);
+                const el = getDashEl(id);
                 el.textContent = fmtScore(val);
                 el.className = 'dash-val ' + scoreClass(val);
             };
@@ -1725,13 +1750,13 @@
 
             // Levels
             const fmtLvl = (v) => v !== null && v !== undefined ? v.toFixed(2) : '—';
-            document.getElementById('dash-pdh').textContent = fmtLvl(state.levels.pdh);
-            document.getElementById('dash-pdl').textContent = fmtLvl(state.levels.pdl);
-            document.getElementById('dash-pdc').textContent = fmtLvl(state.levels.pdc);
-            document.getElementById('dash-onh').textContent = fmtLvl(state.levels.onh);
-            document.getElementById('dash-onl').textContent = fmtLvl(state.levels.onl);
-            document.getElementById('dash-orh').textContent = fmtLvl(state.levels.orh);
-            document.getElementById('dash-orl').textContent = fmtLvl(state.levels.orl);
+            getDashEl('dash-pdh').textContent = fmtLvl(state.levels.pdh);
+            getDashEl('dash-pdl').textContent = fmtLvl(state.levels.pdl);
+            getDashEl('dash-pdc').textContent = fmtLvl(state.levels.pdc);
+            getDashEl('dash-onh').textContent = fmtLvl(state.levels.onh);
+            getDashEl('dash-onl').textContent = fmtLvl(state.levels.onl);
+            getDashEl('dash-orh').textContent = fmtLvl(state.levels.orh);
+            getDashEl('dash-orl').textContent = fmtLvl(state.levels.orl);
         }
 
         function renderEngineOverlays(bars, state) {
