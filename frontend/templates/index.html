@@ -1652,6 +1652,8 @@
         let confUpperSeries = null;     // 68% confidence upper band
         let confLowerSeries = null;     // 68% confidence lower band
         let latestPatternData = null;
+        let dailyProjectionLine = null;    // Horizontal price line for daily projected move
+        let overnightProjectionLine = null; // Horizontal price line for overnight projected move
 
         function handlePatternUpdate(msg) {
             latestPatternData = msg;
@@ -1700,6 +1702,28 @@
                     eodEl.textContent = proj.end_of_day_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
                     eodEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
                 }
+            }
+
+            // Draw projected move price line on chart
+            if (proj && proj.end_of_day_price && candleSeries) {
+                const targetPrice = proj.end_of_day_price;
+                const ret = proj.end_of_day_return || 0;
+                const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
+                const arrow = pts >= 0 ? '↑' : '↓';
+                const label = `RTH Proj ${arrow}${Math.abs(pts)} pts`;
+                const color = pts >= 0 ? '#26a69a' : '#ef5350';
+
+                if (dailyProjectionLine) {
+                    try { candleSeries.removePriceLine(dailyProjectionLine); } catch (e) {}
+                }
+                dailyProjectionLine = candleSeries.createPriceLine({
+                    price: targetPrice,
+                    color: color,
+                    lineWidth: 1,
+                    lineStyle: 2, // dashed
+                    axisLabelVisible: true,
+                    title: label,
+                });
             }
 
             // Render chart overlays
@@ -1845,6 +1869,27 @@
                 const ret = proj.end_of_session_return || 0;
                 eosEl.textContent = proj.end_of_session_price.toFixed(2) + ' (' + (ret > 0 ? '+' : '') + ret.toFixed(2) + '%)';
                 eosEl.className = 'dash-val ' + (ret > 0 ? 'pos' : ret < 0 ? 'neg' : 'neutral');
+
+                // Draw overnight projected move price line on chart
+                if (candleSeries) {
+                    const targetPrice = proj.end_of_session_price;
+                    const pts = currentPrice ? Math.round(targetPrice - currentPrice) : 0;
+                    const arrow = pts >= 0 ? '↑' : '↓';
+                    const label = `ON Proj ${arrow}${Math.abs(pts)} pts`;
+                    const color = pts >= 0 ? '#42A5F5' : '#FF7043'; // blue bullish, orange bearish
+
+                    if (overnightProjectionLine) {
+                        try { candleSeries.removePriceLine(overnightProjectionLine); } catch (e) {}
+                    }
+                    overnightProjectionLine = candleSeries.createPriceLine({
+                        price: targetPrice,
+                        color: color,
+                        lineWidth: 1,
+                        lineStyle: 2, // dashed
+                        axisLabelVisible: true,
+                        title: label,
+                    });
+                }
             }
         }
 
