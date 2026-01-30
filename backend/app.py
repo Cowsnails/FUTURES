@@ -711,6 +711,40 @@ async def get_cache_info(symbol: str):
         raise HTTPException(status_code=404, detail=f"No cache found for {symbol}")
 
 
+_TF_SECONDS = {
+    '5min': 300, '15min': 900, '30min': 1800,
+    '1H': 3600, '2H': 7200, '4H': 14400
+}
+
+def _update_higher_timeframes(symbol: str, bar_data: dict, is_new_bar: bool):
+    """Aggregate a 1-min bar into all higher timeframe preloaded data."""
+    t = bar_data.get('time', 0)
+    if not t:
+        return
+    for tf, secs in _TF_SECONDS.items():
+        tf_list = preloaded_data.get(symbol, {}).get(tf)
+        if tf_list is None:
+            continue
+        bar_start = (t // secs) * secs
+        if tf_list and tf_list[-1]['time'] == bar_start:
+            # Update existing bar
+            last = tf_list[-1]
+            last['high'] = max(last['high'], bar_data['high'])
+            last['low'] = min(last['low'], bar_data['low'])
+            last['close'] = bar_data['close']
+            last['volume'] = last['volume'] + bar_data.get('volume', 0)
+        else:
+            # New bar for this timeframe
+            tf_list.append({
+                'time': bar_start,
+                'open': bar_data['open'],
+                'high': bar_data['high'],
+                'low': bar_data['low'],
+                'close': bar_data['close'],
+                'volume': bar_data.get('volume', 0),
+            })
+
+
 @app.websocket("/ws/{symbol}/{timeframe}")
 async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str = "1min"):
     """
@@ -767,36 +801,12 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
 
         # Helper function to send timeframe data from memory
         async def send_timeframe_data(tf: str):
-            """Send data for a timeframe - aggregated live from 1min data"""
+            """Send preloaded data for a timeframe - instant from memory"""
             if symbol not in preloaded_data:
                 logger.warning(f"[{symbol}] No preloaded data at all")
                 return
 
-            if tf == '1min':
-                data_list = preloaded_data[symbol].get('1min', [])
-            else:
-                # Re-aggregate from live 1min data so higher timeframes
-                # include bars accumulated since startup
-                import pandas as pd
-                bars_1min = preloaded_data[symbol].get('1min', [])
-                if bars_1min and historical_fetcher:
-                    df = pd.DataFrame(bars_1min)
-                    # Keep only OHLCV columns, drop dupes, remove bad rows
-                    cols = ['time', 'open', 'high', 'low', 'close', 'volume']
-                    df = df[[c for c in cols if c in df.columns]].copy()
-                    df = df.dropna(subset=['time'])
-                    df['time'] = df['time'].astype(int)
-                    df = df[df['time'] > 0]
-                    df = df.drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
-                    agg_df = historical_fetcher.aggregate_bars(df, tf)
-                    # Convert numpy types to native Python for JSON
-                    data_list = [
-                        {k: int(v) if k == 'time' else float(v) for k, v in row.items()}
-                        for row in agg_df.to_dict('records')
-                    ]
-                else:
-                    data_list = preloaded_data[symbol].get(tf, [])
-
+            data_list = preloaded_data[symbol].get(tf, [])
             if data_list:
                 await connection_manager.send_to_client(websocket, {
                     'type': 'historical',
@@ -829,9 +839,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                     """Called on every bar update"""
                     logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
 
-                    # Keep preloaded_data up-to-date with new bars
-                    if is_new_bar and symbol in preloaded_data and '1min' in preloaded_data[symbol]:
-                        preloaded_data[symbol]['1min'].append(bar_data)
+                    # Keep ALL timeframes in preloaded_data up-to-date
+                    if symbol in preloaded_data and '1min' in preloaded_data[symbol]:
+                        if is_new_bar:
+                            preloaded_data[symbol]['1min'].append(bar_data)
+                        _update_higher_timeframes(symbol, bar_data, is_new_bar)
 
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
