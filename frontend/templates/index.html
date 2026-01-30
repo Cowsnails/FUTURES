@@ -1452,6 +1452,32 @@
                 const state = scalpingEngine.compute(bars, false, sessionOverride, latestPatternData?.forecast?.confluence_score ?? null);
                 if (!state) return;
                 updateDashboard(state);
+
+                // Also send tick-level BUY/SELL to backend for stats
+                // (signals are fleeting — seconds to 1 min max — must catch on ticks too)
+                if (ws && ws.readyState === WebSocket.OPEN && state.decision &&
+                    (state.decision.action === 'BUY' || state.decision.action === 'SELL')) {
+                    const lastBar = bars[bars.length - 1];
+                    ws.send(JSON.stringify({
+                        type: 'trade_signal',
+                        bar_time: lastBar.time,
+                        price: lastBar.close,
+                        action: state.decision.action,
+                        confluence: state.confluence?.total || 0,
+                        atr: state.indicators?.atr10 || 0,
+                        indicators: {
+                            vwap_score: state.scores?.vwap || 0,
+                            ema_score: state.scores?.ema || 0,
+                            rsi_score: state.scores?.rsi || 0,
+                            adx_score: state.scores?.adx || 0,
+                            volume_score: state.scores?.volume || 0,
+                            rsi_val: state.indicators?.rsi7 || 0,
+                            adx_val: state.indicators?.adx10 || 0,
+                            atr_val: state.indicators?.atr10 || 0,
+                            chop_val: state.indicators?.chop14 || 0,
+                        },
+                    }));
+                }
             }
         }
 

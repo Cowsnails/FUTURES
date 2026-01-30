@@ -33,10 +33,11 @@ STATS_DIR = Path(__file__).parent.parent / "trading_stats"
 DB_PATH = STATS_DIR / "live" / "signals.db"
 
 # Signal state machine
-CONFIRMATION_BARS = 2          # Bars needed to confirm a signal
+CONFIRMATION_BARS = 1          # Instant confirmation — signals are fleeting (seconds)
 ENTRY_THRESHOLD = 0.30         # |confluence| to trigger detection
 EXIT_THRESHOLD = 0.15          # |confluence| to cancel (hysteresis)
-DETECTION_TIMEOUT_BARS = 5     # Max bars in DETECTED before expiring
+DETECTION_TIMEOUT_BARS = 3     # Max updates in DETECTED before expiring
+MIN_SIGNAL_GAP_SECONDS = 60    # Minimum gap between confirmed signals (cooldown)
 
 # Outcome measurement horizons (minutes)
 OUTCOME_HORIZONS = [1, 5, 15]
@@ -124,13 +125,15 @@ class ActiveSignal:
 class TradeSignalTracker:
     """
     State machine for scalping decision engine signals.
-    Requires 2 consecutive bars with |confluence| >= threshold to confirm.
+    Instant confirmation — signals are fleeting (last seconds to 1 min).
+    Cooldown prevents duplicate fires within MIN_SIGNAL_GAP_SECONDS.
     """
 
     def __init__(self):
         self._signal_counter = 0
         self.current_signal: Optional[ActiveSignal] = None
         self.pending_outcomes: List[ActiveSignal] = []  # Confirmed signals awaiting outcomes
+        self._last_confirmed_time: int = 0  # Cooldown tracking
 
     def _next_id(self) -> str:
         self._signal_counter += 1
@@ -158,59 +161,36 @@ class TradeSignalTracker:
             events.append(self._make_event(s, 'TRADE_RESOLVED'))
         self.pending_outcomes = [s for s in self.pending_outcomes if not s.resolved]
 
-        # ── State machine ──
-        if self.current_signal is None or self.current_signal.state == SignalState.IDLE:
-            if has_signal and abs(confluence) >= ENTRY_THRESHOLD:
+        # ── State machine (instant confirmation for fleeting signals) ──
+        # Signals last seconds to 1 min max, so we confirm immediately
+        # on first BUY/SELL with sufficient confluence. Cooldown prevents
+        # duplicate fires within MIN_SIGNAL_GAP_SECONDS.
+        if has_signal and abs(confluence) >= ENTRY_THRESHOLD:
+            # Check cooldown
+            if (bar_time - self._last_confirmed_time) >= MIN_SIGNAL_GAP_SECONDS:
                 sig = ActiveSignal(
                     signal_id=self._next_id(),
                     source='trade_signal',
-                    state=SignalState.DETECTED,
+                    state=SignalState.CONFIRMED,
                     direction=direction,
                     detected_at=bar_time,
+                    confirmed_at=bar_time,
                     confirmation_bars=1,
                     detection_bars=1,
                     confluence_score=confluence,
                     indicator_data=indicator_data,
+                    entry_price=price,
+                    entry_bar_time=bar_time,
                 )
-                self.current_signal = sig
-                events.append(self._make_event(sig, 'SIGNAL_DETECTED'))
+                events.append(self._make_event(sig, 'SIGNAL_CONFIRMED'))
 
-        elif self.current_signal.state == SignalState.DETECTED:
-            sig = self.current_signal
-            sig.detection_bars += 1
+                # Move to active and start outcome tracking
+                sig.state = SignalState.ACTIVE
+                self.pending_outcomes.append(sig)
+                self._last_confirmed_time = bar_time
 
-            # Check if signal persists in same direction
-            same_direction = (
-                (sig.direction == 'long' and confluence >= EXIT_THRESHOLD) or
-                (sig.direction == 'short' and confluence <= -EXIT_THRESHOLD)
-            )
-
-            if same_direction and has_signal:
-                sig.confirmation_bars += 1
-                sig.confluence_score = confluence  # Update to latest
-
-                if sig.confirmation_bars >= CONFIRMATION_BARS:
-                    sig.state = SignalState.CONFIRMED
-                    sig.confirmed_at = bar_time
-                    sig.entry_price = price
-                    sig.entry_bar_time = bar_time
-                    sig.indicator_data = indicator_data
-                    events.append(self._make_event(sig, 'SIGNAL_CONFIRMED'))
-
-                    # Move to active and start outcome tracking
-                    sig.state = SignalState.ACTIVE
-                    self.pending_outcomes.append(sig)
-                    self.current_signal = None
-            else:
-                # Signal faded
-                if sig.detection_bars >= DETECTION_TIMEOUT_BARS:
-                    sig.state = SignalState.EXPIRED
-                    events.append(self._make_event(sig, 'SIGNAL_EXPIRED'))
-                    self.current_signal = None
-                elif not has_signal and abs(confluence) < EXIT_THRESHOLD:
-                    sig.state = SignalState.EXPIRED
-                    events.append(self._make_event(sig, 'SIGNAL_CANCELLED'))
-                    self.current_signal = None
+                logger.info(f"Signal confirmed: {direction} @ {price:.2f} "
+                           f"(conf={confluence:.3f}, cooldown until +{MIN_SIGNAL_GAP_SECONDS}s)")
 
         return events if events else None
 
