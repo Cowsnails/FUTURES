@@ -6,6 +6,7 @@ Provides WebSocket streaming of real-time and historical market data.
 
 import asyncio
 import sys
+import time
 
 # CRITICAL: Windows-specific event loop configuration - MUST be first
 if sys.platform == 'win32':
