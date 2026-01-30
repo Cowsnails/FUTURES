@@ -402,15 +402,15 @@ def initialize_pattern_engines():
 
 async def pattern_match_loop():
     """
-    Background task: run pattern matching every 5 minutes, 24/7.
-    Runs immediately on first iteration, then every 5 min.
+    Background task: run pattern matching every 1 minute, 24/7.
+    Runs immediately on first iteration, then every 60s.
     """
     # Run immediately on startup
     await run_all_pattern_matches()
 
     while True:
         try:
-            await asyncio.sleep(300)  # 5 minutes
+            await asyncio.sleep(60)  # 1 minute
             await run_all_pattern_matches()
         except asyncio.CancelledError:
             logger.info("Pattern match loop cancelled")
