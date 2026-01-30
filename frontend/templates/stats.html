@@ -186,11 +186,14 @@
             <div class="no-data">Loading bracket trades...</div>
         </div>
 
-        <!-- Legacy Signal Stats Cards -->
-        <div class="section-title">Legacy Time-Snapshot Performance (Today)</div>
-        <div class="stats-grid" id="signalCards">
-            <div class="card"><div class="no-data">Loading signal stats...</div></div>
-        </div>
+        <!-- Legacy Signal Stats Cards (deprecated - kept for backward compat) -->
+        <details style="margin-bottom:16px">
+            <summary class="section-title" style="cursor:pointer;user-select:none">Legacy Time-Snapshot Performance (Today) <span style="color:#555;font-size:12px">[click to expand]</span></summary>
+            <p style="color:#666;font-size:12px;padding:8px 0">Deprecated: uses fixed-point thresholds (5/10/15 pts) that ignore ATR and volatility. Use Bracket Resolution above instead.</p>
+            <div class="stats-grid" id="signalCards">
+                <div class="card"><div class="no-data">Loading signal stats...</div></div>
+            </div>
+        </details>
 
         <!-- Pattern Accuracy -->
         <div class="section-title">Pattern Prediction Accuracy</div>

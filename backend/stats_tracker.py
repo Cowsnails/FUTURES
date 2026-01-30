@@ -47,7 +47,9 @@ MIN_SIGNAL_GAP_SECONDS = 60    # Minimum gap between confirmed signals (cooldown
 # Outcome measurement horizons (minutes)
 OUTCOME_HORIZONS = [1, 5, 15]
 
-# Win thresholds (points in signal direction)
+# DEPRECATED: Fixed-point win thresholds (legacy time-snapshot system).
+# The bracket resolution system (BracketParams / R-multiples) replaces these.
+# Kept only for backward-compatible legacy queries in get_today_stats/get_rolling_stats.
 WIN_THRESHOLD_1M = 5.0
 WIN_THRESHOLD_5M_ATR_MULT = 0.10
 WIN_THRESHOLD_15M_ATR_MULT = 0.25
