@@ -6,16 +6,18 @@ echo ═════════════════════════
 
 cd /d "%~dp0"
 
-:: Check for venv
+:: Create venv if it doesn't exist
 if not exist "venv\Scripts\python.exe" (
     echo   [1/3] Creating virtual environment...
     python -m venv venv
-    echo   [2/3] Installing dependencies (first run only^)...
-    venv\Scripts\pip install --upgrade pip -q
-    venv\Scripts\pip install -r requirements.txt -q
-    echo   [3/3] Setup complete!
-    echo.
 )
+
+:: Always ensure deps are installed (handles partial installs)
+echo   Checking dependencies...
+venv\Scripts\python.exe -m pip install --upgrade pip -q 2>nul
+venv\Scripts\python.exe -m pip install -r requirements.txt -q
+echo   Dependencies ready!
+echo.
 
 echo   Starting server on http://localhost:8000
 echo   Close this window to stop.
