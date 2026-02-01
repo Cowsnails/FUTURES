@@ -1,9 +1,9 @@
 """
-Setup Detectors Framework
+Setup Detectors Framework — Decision Tree Architecture
 
 Base classes and manager for running multiple intraday setup detectors
-simultaneously. Each detector analyzes incoming bars and emits signals
-that feed into the existing bracket resolution system for tracking.
+simultaneously. Each detector uses a weighted decision tree scoring model
+with regime classification, session timing, and evidence-tier confidence caps.
 
 All detection runs server-side. Results appear on the stats page only.
 
@@ -16,7 +16,8 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from enum import Enum
+from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,133 @@ logger = logging.getLogger(__name__)
 ET_OFFSET = timedelta(hours=-5)  # EST (no DST handling — good enough for RTH)
 RTH_OPEN_MINUTES = 9 * 60 + 30   # 9:30 ET in minutes-from-midnight
 RTH_CLOSE_MINUTES = 16 * 60      # 16:00 ET
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MARKET REGIME CLASSIFICATION (Wilder 1978, Dreiss 1992)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MarketRegime(Enum):
+    TRENDING_STRONG = "trending_strong"       # ADX > 30, CI < 38.2
+    TRENDING_MODERATE = "trending_moderate"   # ADX 25-30
+    RANGING = "ranging"                       # ADX < 20, CI 50-61.8
+    CHOPPY = "choppy"                         # ADX < 20, CI > 61.8
+    VOLATILE_EXPANSION = "volatile_expansion" # ATR ratio > 1.5
+    QUIET_COMPRESSION = "quiet_compression"   # ATR ratio < 0.75
+    UNKNOWN = "unknown"
+
+
+def classify_regime(adx: Optional[float], chop: Optional[float],
+                    atr_ratio: Optional[float]) -> MarketRegime:
+    """Classify current market regime from ADX, Choppiness Index, ATR ratio."""
+    if adx is None:
+        return MarketRegime.UNKNOWN
+
+    # Volatility regime overrides if extreme
+    if atr_ratio is not None:
+        if atr_ratio > 1.5:
+            return MarketRegime.VOLATILE_EXPANSION
+        if atr_ratio < 0.75:
+            return MarketRegime.QUIET_COMPRESSION
+
+    ci = chop if chop is not None else 50.0  # neutral default
+
+    if adx > 30 and ci < 38.2:
+        return MarketRegime.TRENDING_STRONG
+    if 25 <= adx <= 30:
+        return MarketRegime.TRENDING_MODERATE
+    if adx < 20 and ci > 61.8:
+        return MarketRegime.CHOPPY
+    if adx < 20:
+        return MarketRegime.RANGING
+
+    return MarketRegime.TRENDING_MODERATE  # fallback
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SESSION TIMING MULTIPLIERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+# category -> session -> multiplier
+SESSION_MULTIPLIERS: Dict[str, Dict[str, float]] = {
+    "breakout": {
+        "rth_open": 1.0, "am_drive": 0.9, "am_session": 0.7,
+        "lunch": 0.4, "pm_session": 0.7, "moc": 0.8,
+        "pre_market": 0.3, "post_market": 0.2,
+    },
+    "mean_reversion": {
+        "rth_open": 0.5, "am_drive": 0.7, "am_session": 0.8,
+        "lunch": 1.0, "pm_session": 0.8, "moc": 0.6,
+        "pre_market": 0.3, "post_market": 0.2,
+    },
+    "momentum": {
+        "rth_open": 1.0, "am_drive": 1.0, "am_session": 0.8,
+        "lunch": 0.3, "pm_session": 0.7, "moc": 0.6,
+        "pre_market": 0.3, "post_market": 0.2,
+    },
+    "level": {
+        "rth_open": 0.9, "am_drive": 1.0, "am_session": 0.8,
+        "lunch": 0.5, "pm_session": 0.8, "moc": 0.7,
+        "pre_market": 0.3, "post_market": 0.2,
+    },
+    "volatility": {
+        "rth_open": 1.0, "am_drive": 0.9, "am_session": 0.7,
+        "lunch": 0.3, "pm_session": 0.6, "moc": 0.5,
+        "pre_market": 0.4, "post_market": 0.3,
+    },
+    "micro": {
+        "rth_open": 0.8, "am_drive": 0.9, "am_session": 1.0,
+        "lunch": 0.6, "pm_session": 0.8, "moc": 0.5,
+        "pre_market": 0.3, "post_market": 0.2,
+    },
+    "vwap": {
+        "rth_open": 0.7, "am_drive": 0.9, "am_session": 1.0,
+        "lunch": 0.8, "pm_session": 0.7, "moc": 0.5,
+        "pre_market": 0.2, "post_market": 0.2,
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EVIDENCE TIERS & CONFIDENCE CAPS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EvidenceTier(Enum):
+    TIER1 = 1  # cap 0.85
+    TIER2 = 2  # cap 0.70
+    TIER3 = 3  # cap 0.55
+    TIER4 = 4  # cap 0.40
+
+TIER_CAPS = {
+    EvidenceTier.TIER1: 0.85,
+    EvidenceTier.TIER2: 0.70,
+    EvidenceTier.TIER3: 0.55,
+    EvidenceTier.TIER4: 0.40,
+}
+
+
+def confidence_to_bracket(confidence: float, atr: float) -> Dict[str, Any]:
+    """Map confidence score to trade bracket parameters."""
+    if confidence < 0.40:
+        return {"trade": False, "stop_atr": 0, "rr": 0, "max_bars": 0}
+    if confidence < 0.55:
+        return {"trade": True, "stop_atr": 2.0, "rr": 1.0, "max_bars": 10}
+    if confidence < 0.70:
+        return {"trade": True, "stop_atr": 1.5, "rr": 1.5, "max_bars": 20}
+    if confidence < 0.85:
+        return {"trade": True, "stop_atr": 1.0, "rr": 2.0, "max_bars": 30}
+    return {"trade": True, "stop_atr": 0.75, "rr": 2.5, "max_bars": 40}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DECISION TREE WEIGHT CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+W_PRICE_ACTION = 0.35
+W_VOLUME = 0.20
+W_MOMENTUM = 0.15
+W_REGIME = 0.20
+W_SESSION = 0.10
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -61,7 +189,7 @@ class BarInput:
 
 @dataclass
 class IndicatorState:
-    """Pre-computed indicators shared across all detectors (compute once)."""
+    """Pre-computed indicators shared across all detectors."""
     # Core
     ema9: Optional[float] = None
     ema20: Optional[float] = None
@@ -72,6 +200,13 @@ class IndicatorState:
     minus_di: Optional[float] = None
     atr14: Optional[float] = None
     volume_sma20: Optional[float] = None
+
+    # NEW: Decision tree indicators
+    chop14: Optional[float] = None    # Choppiness Index (Dreiss)
+    atr5: Optional[float] = None      # Short-term ATR
+    atr50: Optional[float] = None     # Long-term ATR
+    atr_ratio: Optional[float] = None # atr5/atr50
+    regime: MarketRegime = MarketRegime.UNKNOWN
 
     # Bollinger Bands (20, 2)
     bb_upper: Optional[float] = None
@@ -84,7 +219,7 @@ class IndicatorState:
     kc_lower: Optional[float] = None
 
     # TTM Squeeze
-    squeeze_on: bool = False  # True when BB inside KC
+    squeeze_on: bool = False
     squeeze_momentum: Optional[float] = None
 
     # VWAP (session-anchored)
@@ -99,140 +234,115 @@ class IndicatorState:
     pdc: Optional[float] = None
     onh: Optional[float] = None
     onl: Optional[float] = None
-    orh: Optional[float] = None  # opening range high (first 15 min)
-    orl: Optional[float] = None  # opening range low (first 15 min)
+
+    # Opening Range
+    orh: Optional[float] = None
+    orl: Optional[float] = None
     or_complete: bool = False
 
-    # Session info
-    session: str = ""
-    session_minutes: int = 0  # minutes since RTH open
+    # Session
     is_rth: bool = False
+    session_minutes: int = -1
+    session: str = "pre_market"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# INDICATOR MATH HELPERS
+# INDICATOR HELPERS (self-contained, no external deps)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _ema(values: List[float], period: int) -> Optional[float]:
-    """Compute EMA of last N values. Returns None if not enough data."""
-    if len(values) < period:
-        return None
-    k = 2.0 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
-
-
-def _sma(values: List[float], period: int) -> Optional[float]:
+def _sma(values: list, period: int) -> Optional[float]:
     if len(values) < period:
         return None
     return sum(values[-period:]) / period
 
 
-def _stdev(values: List[float], period: int) -> Optional[float]:
+def _ema(values: list, period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for val in values[period:]:
+        ema = (val - ema) * multiplier + ema
+    return ema
+
+
+def _stdev(values: list, period: int) -> Optional[float]:
     if len(values) < period:
         return None
     subset = values[-period:]
     mean = sum(subset) / period
-    variance = sum((v - mean) ** 2 for v in subset) / period
-    return math.sqrt(variance) if variance > 0 else 0.0
+    variance = sum((x - mean) ** 2 for x in subset) / period
+    return math.sqrt(variance)
 
 
-def _true_range(bars: List[BarInput], i: int) -> float:
-    """True range for bar at index i."""
-    b = bars[i]
-    if i == 0:
-        return b.high - b.low
-    prev_c = bars[i - 1].close
-    return max(b.high - b.low, abs(b.high - prev_c), abs(b.low - prev_c))
-
-
-def _compute_atr(bars: List[BarInput], period: int) -> Optional[float]:
-    """ATR using Wilder smoothing over last bars."""
-    n = len(bars)
-    if n < period + 1:
-        return None
-    # Initial ATR = simple average of first `period` TRs
-    tr_sum = sum(_true_range(bars, i) for i in range(n - period, n))
-    atr = tr_sum / period
-    return atr
-
-
-def _compute_rsi(closes: List[float], period: int) -> Optional[float]:
+def _compute_rsi(closes: list, period: int = 14) -> Optional[float]:
     if len(closes) < period + 1:
         return None
-    gains = []
-    losses = []
-    for i in range(len(closes) - period, len(closes)):
-        delta = closes[i] - closes[i - 1]
-        gains.append(max(delta, 0))
-        losses.append(max(-delta, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        delta = closes[-period - 1 + i] - closes[-period - 1 + i - 1]
+        if delta > 0:
+            gains += delta
+        else:
+            losses -= delta
+    avg_gain = gains / period
+    avg_loss = losses / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - (100 / (1 + rs))
 
 
-def _compute_adx(bars: List[BarInput], period: int = 14):
-    """Returns (adx, plus_di, minus_di) or (None, None, None)."""
-    n = len(bars)
-    if n < period * 2:
-        return None, None, None
-
-    plus_dms = []
-    minus_dms = []
+def _compute_atr(bars: list, period: int = 14) -> Optional[float]:
+    if len(bars) < period + 1:
+        return None
     trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i].high, bars[i].low, bars[i - 1].close
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+    return atr
 
-    for i in range(1, n):
-        h = bars[i].high
-        l = bars[i].low
-        ph = bars[i - 1].high
-        pl = bars[i - 1].low
-        pc = bars[i - 1].close
 
+def _compute_adx(bars: list, period: int = 14) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if len(bars) < period * 2 + 1:
+        return None, None, None
+    plus_dms, minus_dms, trs = [], [], []
+    for i in range(1, len(bars)):
+        h, l = bars[i].high, bars[i].low
+        ph, pl = bars[i - 1].high, bars[i - 1].low
         plus_dm = max(h - ph, 0) if (h - ph) > (pl - l) else 0
         minus_dm = max(pl - l, 0) if (pl - l) > (h - ph) else 0
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-
+        tr = max(h - l, abs(h - bars[i - 1].close), abs(l - bars[i - 1].close))
         plus_dms.append(plus_dm)
         minus_dms.append(minus_dm)
         trs.append(tr)
-
     if len(trs) < period:
         return None, None, None
-
-    # Wilder smoothing
     smoothed_plus = sum(plus_dms[:period])
     smoothed_minus = sum(minus_dms[:period])
     smoothed_tr = sum(trs[:period])
-
     dx_values = []
-
     for i in range(period, len(trs)):
         smoothed_plus = smoothed_plus - (smoothed_plus / period) + plus_dms[i]
         smoothed_minus = smoothed_minus - (smoothed_minus / period) + minus_dms[i]
         smoothed_tr = smoothed_tr - (smoothed_tr / period) + trs[i]
-
         if smoothed_tr == 0:
             continue
         plus_di = 100 * smoothed_plus / smoothed_tr
         minus_di = 100 * smoothed_minus / smoothed_tr
-
         di_sum = plus_di + minus_di
         if di_sum == 0:
             dx_values.append(0)
         else:
             dx_values.append(100 * abs(plus_di - minus_di) / di_sum)
-
     if len(dx_values) < period:
         return None, None, None
-
     adx = sum(dx_values[-period:]) / period
-
-    # Return last plus_di and minus_di
     if smoothed_tr == 0:
         return adx, 0, 0
     final_plus_di = 100 * smoothed_plus / smoothed_tr
@@ -240,14 +350,29 @@ def _compute_adx(bars: List[BarInput], period: int = 14):
     return adx, final_plus_di, final_minus_di
 
 
+def _compute_choppiness(bars: list, period: int = 14) -> Optional[float]:
+    """Choppiness Index (Dreiss 1992): 100 * LOG10(sum_atr / (HH-LL)) / LOG10(period)."""
+    if len(bars) < period + 1:
+        return None
+    recent = bars[-(period + 1):]
+    atr_sum = 0.0
+    for i in range(1, len(recent)):
+        h, l, pc = recent[i].high, recent[i].low, recent[i - 1].close
+        atr_sum += max(h - l, abs(h - pc), abs(l - pc))
+    hh = max(b.high for b in recent[1:])
+    ll = min(b.low for b in recent[1:])
+    hl_range = hh - ll
+    if hl_range <= 0:
+        return 50.0
+    return 100 * math.log10(atr_sum / hl_range) / math.log10(period)
+
+
 def _bar_to_et_minutes(bar_time: int) -> int:
-    """Convert unix timestamp to minutes-from-midnight in Eastern time."""
     dt = datetime.fromtimestamp(bar_time, tz=timezone.utc) + ET_OFFSET
     return dt.hour * 60 + dt.minute
 
 
 def _is_rth(bar_time: int) -> bool:
-    """Check if bar is during Regular Trading Hours (9:30-16:00 ET)."""
     m = _bar_to_et_minutes(bar_time)
     return RTH_OPEN_MINUTES <= m < RTH_CLOSE_MINUTES
 
@@ -271,21 +396,27 @@ def _session_label(minutes_since_open: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# BASE DETECTOR CLASS
+# BASE DETECTOR CLASS — Decision Tree Scoring
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SetupDetector:
     """
-    Base class for all setup detectors.
+    Base class with weighted decision tree scoring.
 
-    Subclasses must implement:
-      - update(bar, indicators, bars_history) -> Optional[SetupSignal]
+    Subclasses implement:
+      - score_price_action(bar, ind, bars) -> float 0-1
+      - score_volume(bar, ind, bars) -> float 0-1
+      - score_momentum(bar, ind, bars) -> float 0-1
+      - regime_scores() -> dict[MarketRegime, float]
+      - disabled_regimes() -> set of MarketRegime where confidence=0
+      - detect_direction(bar, ind, bars) -> Optional[str] "LONG"/"SHORT" or None
     """
 
     name: str = "base"
     display_name: str = "Base Setup"
     category: str = "unknown"
     hold_time: str = "unknown"
+    evidence_tier: EvidenceTier = EvidenceTier.TIER3
     min_cooldown_seconds: int = 60
 
     def __init__(self):
@@ -293,48 +424,14 @@ class SetupDetector:
         self._signal_counter: int = 0
         self._enabled: bool = True
 
-    def update(self, bar: BarInput, indicators: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        raise NotImplementedError
-
-    def can_signal(self, bar_time: int) -> bool:
+    def can_signal(self, now: int) -> bool:
         if not self._enabled:
             return False
-        return (bar_time - self._last_signal_time) >= self.min_cooldown_seconds
+        return (now - self._last_signal_time) >= self.min_cooldown_seconds
 
-    def record_signal(self, bar_time: int):
-        self._last_signal_time = bar_time
+    def record_signal(self, now: int):
+        self._last_signal_time = now
         self._signal_counter += 1
-
-    def make_signal(self, direction: str, bar: BarInput,
-                    indicators: IndicatorState,
-                    stop_price: float, target_price: float,
-                    stop_atr_mult: float, target_atr_mult: float,
-                    max_bars: int, confidence: float,
-                    reason: str) -> SetupSignal:
-        atr = indicators.atr14 or 1.0
-        return SetupSignal(
-            setup_name=self.name,
-            direction=direction,
-            entry_price=bar.close,
-            stop_price=stop_price,
-            target_price=target_price,
-            atr=atr,
-            stop_atr_mult=stop_atr_mult,
-            target_atr_mult=target_atr_mult,
-            max_bars=max_bars,
-            confidence=confidence,
-            reason=reason,
-            bar_time=bar.time,
-            indicator_snapshot={
-                'ema9': indicators.ema9,
-                'rsi14': indicators.rsi14,
-                'adx14': indicators.adx14,
-                'atr14': indicators.atr14,
-                'vwap': indicators.vwap,
-                'session': indicators.session,
-            },
-        )
 
     def reset(self):
         self._last_signal_time = 0
@@ -342,2106 +439,2026 @@ class SetupDetector:
 
     def get_info(self) -> dict:
         return {
-            'name': self.name,
-            'display_name': self.display_name,
-            'category': self.category,
-            'hold_time': self.hold_time,
-            'enabled': self._enabled,
-            'signal_count': self._signal_counter,
+            "name": self.name,
+            "display_name": self.display_name,
+            "category": self.category,
+            "hold_time": self.hold_time,
+            "evidence_tier": self.evidence_tier.value,
+            "enabled": self._enabled,
+            "signal_count": self._signal_counter,
         }
 
+    # ── Decision tree scoring ──
+
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        return 0.0
+
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        return 0.5  # neutral default
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        return 0.5
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        """Return 0-1 score for each regime. Higher = better fit."""
+        return {r: 0.5 for r in MarketRegime}
+
+    def disabled_regimes(self) -> set:
+        """Regimes where this setup should NOT fire (confidence forced to 0)."""
+        return set()
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        """Return 'LONG', 'SHORT', or None if no setup present."""
+        return None
+
+    def compute_confidence(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        """Weighted decision tree confidence scoring."""
+        # Check regime disable
+        if ind.regime in self.disabled_regimes():
+            return 0.0
+
+        pa = self.score_price_action(bar, ind, bars)
+        vol = self.score_volume(bar, ind, bars)
+        mom = self.score_momentum(bar, ind, bars)
+
+        # Regime score
+        r_scores = self.regime_scores()
+        regime_score = r_scores.get(ind.regime, 0.5)
+
+        # Session multiplier
+        sess_mults = SESSION_MULTIPLIERS.get(self.category, SESSION_MULTIPLIERS["momentum"])
+        session_score = sess_mults.get(ind.session, 0.3)
+
+        # Weighted sum
+        raw = (pa * W_PRICE_ACTION + vol * W_VOLUME + mom * W_MOMENTUM +
+               regime_score * W_REGIME + session_score * W_SESSION)
+
+        # Cap by evidence tier
+        cap = TIER_CAPS[self.evidence_tier]
+        return min(raw, cap)
+
+    def make_signal_from_confidence(self, direction: str, bar: BarInput,
+                                     ind: IndicatorState, confidence: float,
+                                     reason: str) -> Optional[SetupSignal]:
+        """Build a SetupSignal using confidence-to-bracket mapping."""
+        atr = ind.atr14
+        if not atr or atr <= 0:
+            return None
+
+        bracket = confidence_to_bracket(confidence, atr)
+        if not bracket["trade"]:
+            return None
+
+        stop_dist = bracket["stop_atr"] * atr
+        target_dist = stop_dist * bracket["rr"]
+
+        if direction == "LONG":
+            stop = bar.close - stop_dist
+            target = bar.close + target_dist
+        else:
+            stop = bar.close + stop_dist
+            target = bar.close - target_dist
+
+        return SetupSignal(
+            setup_name=self.name,
+            direction=direction,
+            entry_price=bar.close,
+            stop_price=stop,
+            target_price=target,
+            atr=atr,
+            stop_atr_mult=bracket["stop_atr"],
+            target_atr_mult=bracket["stop_atr"] * bracket["rr"],
+            max_bars=bracket["max_bars"],
+            confidence=confidence,
+            reason=reason,
+            bar_time=bar.time,
+            indicator_snapshot={
+                "regime": ind.regime.value,
+                "session": ind.session,
+                "adx": ind.adx14,
+                "chop": ind.chop14,
+                "atr_ratio": ind.atr_ratio,
+            }
+        )
+
+    # Legacy make_signal for compatibility
+    def make_signal(self, direction, bar, ind, stop_price, target_price,
+                    stop_atr_mult, target_atr_mult, max_bars, confidence, reason):
+        atr = ind.atr14 or 1.0
+        return SetupSignal(
+            setup_name=self.name, direction=direction,
+            entry_price=bar.close, stop_price=stop_price,
+            target_price=target_price, atr=atr,
+            stop_atr_mult=stop_atr_mult, target_atr_mult=target_atr_mult,
+            max_bars=max_bars, confidence=confidence,
+            reason=reason, bar_time=bar.time,
+        )
+
+    def update(self, bar: BarInput, indicators: IndicatorState,
+               bars_history: List[BarInput]) -> Optional[SetupSignal]:
+        """Main entry: detect direction, score confidence, emit signal."""
+        if not indicators.is_rth:
+            return None
+
+        direction = self.detect_direction(bar, indicators, bars_history)
+        if direction is None:
+            return None
+
+        confidence = self.compute_confidence(bar, indicators, bars_history)
+        if confidence < 0.40:
+            return None
+
+        reason = f"{self.display_name} {direction} (conf={confidence:.2f}, regime={indicators.regime.value})"
+        return self.make_signal_from_confidence(direction, bar, indicators, confidence, reason)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PHASE 1 DETECTORS
+# DETECTORS — Each one will be added incrementally below
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── 1.1 Opening Range Breakout (ORB) ──────────────────────────────────────
+# ── Setup 1: ORB Breakout (Tier 1) ──────────────────────────────────────
 
 class ORBBreakoutDetector(SetupDetector):
-    """
-    Opening Range Breakout — first 15 minutes define the range.
-    Entry on close above OR high / below OR low after the OR period.
-    Filters: ADX > 20, volume above average.
-    """
+    """Opening Range Breakout — Tier 1 evidence. Best in trending regimes during AM."""
     name = "orb_breakout"
-    display_name = "Opening Range Breakout"
-    category = "session"
+    display_name = "ORB Breakout"
+    category = "breakout"
     hold_time = "15-60min"
-    min_cooldown_seconds = 300  # 5 min between ORB signals
+    evidence_tier = EvidenceTier.TIER1
+    min_cooldown_seconds = 300
 
-    def __init__(self):
-        super().__init__()
-        self._or_high: Optional[float] = None
-        self._or_low: Optional[float] = None
-        self._or_complete: bool = False
-        self._or_date: str = ""
-        self._breakout_fired_long: bool = False
-        self._breakout_fired_short: bool = False
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
 
-    def reset(self):
-        super().reset()
-        self._or_high = None
-        self._or_low = None
-        self._or_complete = False
-        self._or_date = ""
-        self._breakout_fired_long = False
-        self._breakout_fired_short = False
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_STRONG: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.VOLATILE_EXPANSION: 0.7,
+            MarketRegime.RANGING: 0.4,
+            MarketRegime.QUIET_COMPRESSION: 0.6,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.or_complete or ind.orh is None or ind.orl is None:
             return None
-
+        if ind.session_minutes < 15 or ind.session_minutes > 120:
+            return None
         atr = ind.atr14
         if not atr or atr <= 0:
             return None
-
-        # Reset on new day
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._or_date:
-            self._or_date = today
-            self._or_high = None
-            self._or_low = None
-            self._or_complete = False
-            self._breakout_fired_long = False
-            self._breakout_fired_short = False
-
-        # Build opening range during first 15 minutes
-        if ind.session_minutes < 15:
-            if self._or_high is None:
-                self._or_high = bar.high
-                self._or_low = bar.low
-            else:
-                self._or_high = max(self._or_high, bar.high)
-                self._or_low = min(self._or_low, bar.low)
+        or_range = ind.orh - ind.orl
+        if or_range < 0.3 * atr or or_range > 3.0 * atr:
             return None
-
-        # Mark OR complete
-        if not self._or_complete:
-            self._or_complete = True
-
-        if self._or_high is None or self._or_low is None:
-            return None
-
-        or_range = self._or_high - self._or_low
-        if or_range < 0.5 * atr or or_range > 3.0 * atr:
-            return None  # Range too narrow or too wide
-
-        # Only signal in first 2 hours after open
-        if ind.session_minutes > 135:
-            return None
-
-        # Long breakout
-        if not self._breakout_fired_long and bar.close > self._or_high:
-            adx_ok = ind.adx14 is not None and ind.adx14 > 20
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.2
-            if adx_ok or vol_ok:
-                self._breakout_fired_long = True
-                stop = self._or_low - 0.25 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 2.0
-                conf = 0.6
-                if adx_ok and vol_ok:
-                    conf = 0.75
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2.0) / atr,
-                    max_bars=30, confidence=conf,
-                    reason=f"ORB long: close {bar.close:.1f} > OR high {self._or_high:.1f}"
-                )
-
-        # Short breakout
-        if not self._breakout_fired_short and bar.close < self._or_low:
-            adx_ok = ind.adx14 is not None and ind.adx14 > 20
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.2
-            if adx_ok or vol_ok:
-                self._breakout_fired_short = True
-                stop = self._or_high + 0.25 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 2.0
-                conf = 0.6
-                if adx_ok and vol_ok:
-                    conf = 0.75
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2.0) / atr,
-                    max_bars=30, confidence=conf,
-                    reason=f"ORB short: close {bar.close:.1f} < OR low {self._or_low:.1f}"
-                )
-
+        if bar.close > ind.orh and bar.close > bar.open:
+            return "LONG"
+        if bar.close < ind.orl and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if ind.orh is None or ind.orl is None or not ind.atr14:
+            return 0.0
+        or_range = ind.orh - ind.orl
+        # Clean break: close well beyond OR level
+        if bar.close > ind.orh:
+            penetration = (bar.close - ind.orh) / ind.atr14
+        else:
+            penetration = (ind.orl - bar.close) / ind.atr14
+        # Strong candle body vs wick
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        # Score: penetration quality + candle quality
+        pen_score = min(penetration / 0.5, 1.0)  # 0.5 ATR penetration = max
+        return min(1.0, pen_score * 0.6 + body_ratio * 0.4)
 
-# ── 1.2 VWAP Mean Reversion from ±2σ ─────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        if ratio >= 2.0:
+            return 1.0
+        if ratio >= 1.5:
+            return 0.8
+        if ratio >= 1.0:
+            return 0.6
+        return 0.3
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        # EMA alignment
+        if ind.ema9 and ind.ema20:
+            if bar.close > ind.orh and ind.ema9 > ind.ema20:
+                score += 0.2
+            elif bar.close < ind.orl and ind.ema9 < ind.ema20:
+                score += 0.2
+        # ADX confirmation
+        if ind.adx14 and ind.adx14 > 25:
+            score += 0.15
+        # RSI not extreme against direction
+        if ind.rsi14:
+            if bar.close > (ind.orh or 0) and ind.rsi14 < 75:
+                score += 0.1
+            elif bar.close < (ind.orl or 0) and ind.rsi14 > 25:
+                score += 0.1
+        return min(1.0, score)
+
+
+# ── Setup 2: VWAP Mean Reversion (Tier 3) ──────────────────────────────
 
 class VWAPMeanReversionDetector(SetupDetector):
-    """
-    VWAP Mean Reversion — enter when price touches ±2σ VWAP band
-    and shows rejection (close back inside band).
-    Filters: RSI oversold/overbought confirmation, not during strong trend.
-    """
-    name = "vwap_mr_2sigma"
-    display_name = "VWAP Mean Reversion ±2σ"
-    category = "vwap"
+    """VWAP Mean Reversion — fade extended moves back to VWAP. Best in ranging/lunch."""
+    name = "vwap_mean_reversion"
+    display_name = "VWAP Mean Reversion"
+    category = "mean_reversion"
     hold_time = "5-30min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 300
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth or ind.session_minutes < 30:
-            return None  # Need VWAP to stabilize
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
 
-        atr = ind.atr14
-        if not atr or atr <= 0:
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 1.0,
+            MarketRegime.CHOPPY: 0.6,
+            MarketRegime.TRENDING_MODERATE: 0.4,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.QUIET_COMPRESSION: 0.7,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.vwap is None or ind.vwap_std is None or not ind.atr14:
             return None
-        if ind.vwap is None or ind.vwap_std is None or ind.vwap_std <= 0:
+        if ind.session_minutes < 30:
             return None
-
-        upper2 = ind.vwap + 2 * ind.vwap_std
-        lower2 = ind.vwap - 2 * ind.vwap_std
-        rsi = ind.rsi14
-
-        # Strong trend filter — skip if ADX very high
-        if ind.adx14 is not None and ind.adx14 > 40:
+        if ind.vwap_std <= 0:
             return None
-
-        # Long: bar low touched lower 2σ, close pulled back above it
-        if bar.low <= lower2 and bar.close > lower2:
-            rsi_ok = rsi is not None and rsi < 35
-            wick_rejection = (bar.close - bar.low) > 0.5 * (bar.high - bar.low)
-            if rsi_ok or wick_rejection:
-                stop = bar.low - 0.5 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = ind.vwap  # revert to VWAP
-                conf = 0.55
-                if rsi_ok and wick_rejection:
-                    conf = 0.70
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr,
-                    target_atr_mult=abs(target - bar.close) / atr,
-                    max_bars=20, confidence=conf,
-                    reason=f"VWAP MR long: low {bar.low:.1f} hit -2σ {lower2:.1f}, RSI={rsi:.0f}" if rsi else f"VWAP MR long: wick rejection at -2σ"
-                )
-
-        # Short: bar high touched upper 2σ, close pulled back below it
-        if bar.high >= upper2 and bar.close < upper2:
-            rsi_ok = rsi is not None and rsi > 65
-            wick_rejection = (bar.high - bar.close) > 0.5 * (bar.high - bar.low)
-            if rsi_ok or wick_rejection:
-                stop = bar.high + 0.5 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = ind.vwap
-                conf = 0.55
-                if rsi_ok and wick_rejection:
-                    conf = 0.70
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr,
-                    target_atr_mult=abs(bar.close - target) / atr,
-                    max_bars=20, confidence=conf,
-                    reason=f"VWAP MR short: high {bar.high:.1f} hit +2σ {upper2:.1f}, RSI={rsi:.0f}" if rsi else f"VWAP MR short: wick rejection at +2σ"
-                )
-
+        dist = bar.close - ind.vwap
+        band = ind.vwap_std * 2
+        # Extended above upper band, reversal candle
+        if dist > band and bar.close < bar.open:
+            return "SHORT"
+        if dist < -band and bar.close > bar.open:
+            return "LONG"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.vwap_std or ind.vwap_std <= 0 or not ind.vwap:
+            return 0.0
+        dist = abs(bar.close - ind.vwap) / ind.vwap_std
+        # 2-3 std = good, 3+ = excellent
+        if dist >= 3.0:
+            ext_score = 1.0
+        elif dist >= 2.0:
+            ext_score = 0.6 + (dist - 2.0) * 0.4
+        else:
+            ext_score = 0.3
+        # Reversal candle quality
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, ext_score * 0.6 + body_ratio * 0.4)
 
-# ── 1.3 PDH/PDL Breakout Continuation ────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        # For MR, declining volume on extension is good, spike on reversal is good
+        if ratio >= 1.5:
+            return 0.8
+        if ratio >= 1.0:
+            return 0.6
+        return 0.4
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.rsi14:
+            if bar.close < ind.vwap and ind.rsi14 < 30:
+                score += 0.3  # Oversold for long
+            elif bar.close > ind.vwap and ind.rsi14 > 70:
+                score += 0.3  # Overbought for short
+        if ind.bb_upper and ind.bb_lower:
+            if bar.close > ind.bb_upper or bar.close < ind.bb_lower:
+                score += 0.15  # Outside BB
+        return min(1.0, score)
+
+
+# ── Setup 3: PDH/PDL Breakout (Tier 2) ─────────────────────────────────
 
 class PDHPDLBreakoutDetector(SetupDetector):
-    """
-    Previous Day High / Low breakout continuation.
-    Enter on close above PDH or below PDL with volume confirmation.
-    Stop behind the level, target 2R.
-    """
+    """Previous Day High/Low Breakout — Tier 2. Best in trending AM sessions."""
     name = "pdh_pdl_breakout"
     display_name = "PDH/PDL Breakout"
-    category = "level"
+    category = "breakout"
     hold_time = "15-60min"
-    min_cooldown_seconds = 600  # 10 min
+    evidence_tier = EvidenceTier.TIER2
+    min_cooldown_seconds = 600
 
-    def __init__(self):
-        super().__init__()
-        self._pdh_fired: bool = False
-        self._pdl_fired: bool = False
-        self._last_date: str = ""
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY, MarketRegime.RANGING}
 
-    def reset(self):
-        super().reset()
-        self._pdh_fired = False
-        self._pdl_fired = False
-        self._last_date = ""
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_STRONG: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.VOLATILE_EXPANSION: 0.6,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.RANGING: 0.0,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or ind.atr14 <= 0:
             return None
-
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        if ind.pdh is None or ind.pdl is None:
             return None
-
-        # Reset flags on new day
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._last_date:
-            self._last_date = today
-            self._pdh_fired = False
-            self._pdl_fired = False
-
-        pdh = ind.pdh
-        pdl = ind.pdl
-        if pdh is None or pdl is None:
+        if len(bars) < 3:
             return None
-
-        # Long: close above PDH
-        if not self._pdh_fired and bar.close > pdh and bar.low <= pdh + 0.5 * atr:
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20
-            if vol_ok or (ind.adx14 is not None and ind.adx14 > 25):
-                self._pdh_fired = True
-                stop = pdh - 0.75 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 2.0
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                    max_bars=30, confidence=0.65,
-                    reason=f"PDH breakout: close {bar.close:.1f} > PDH {pdh:.1f}"
-                )
-
-        # Short: close below PDL
-        if not self._pdl_fired and bar.close < pdl and bar.high >= pdl - 0.5 * atr:
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20
-            if vol_ok or (ind.adx14 is not None and ind.adx14 > 25):
-                self._pdl_fired = True
-                stop = pdl + 0.75 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 2.0
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                    max_bars=30, confidence=0.65,
-                    reason=f"PDL breakout: close {bar.close:.1f} < PDL {pdl:.1f}"
-                )
-
+        prev = bars[-2]
+        # Long: close breaks above PDH, prev bar was below
+        if bar.close > ind.pdh and prev.close <= ind.pdh and bar.close > bar.open:
+            return "LONG"
+        # Short: close breaks below PDL
+        if bar.close < ind.pdl and prev.close >= ind.pdl and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        # How far through the level
+        if bar.close > ind.pdh:
+            pen = (bar.close - ind.pdh) / ind.atr14
+        else:
+            pen = (ind.pdl - bar.close) / ind.atr14
+        pen_score = min(pen / 0.4, 1.0)
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, pen_score * 0.5 + body_ratio * 0.3 + 0.2)
 
-# ── 1.4 EMA-9 Pullback in Trend ──────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        if ratio >= 2.0:
+            return 1.0
+        if ratio >= 1.3:
+            return 0.7
+        return 0.4
 
-class EMA9PullbackDetector(SetupDetector):
-    """
-    Linda Raschke's "Holy Grail" — EMA-9 pullback in a confirmed trend.
-    Requires ADX > 25 with directional bias. Entry on bar that touches
-    EMA-9 and closes back in trend direction.
-    """
-    name = "ema9_pullback"
-    display_name = "EMA-9 Pullback"
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.ema9 and ind.ema20:
+            if bar.close > ind.pdh and ind.ema9 > ind.ema20:
+                score += 0.2
+            elif bar.close < ind.pdl and ind.ema9 < ind.ema20:
+                score += 0.2
+        if ind.adx14 and ind.adx14 > 25:
+            score += 0.15
+        if ind.rsi14:
+            if bar.close > ind.pdh and 50 < ind.rsi14 < 75:
+                score += 0.1
+            elif bar.close < ind.pdl and 25 < ind.rsi14 < 50:
+                score += 0.1
+        return min(1.0, score)
+
+
+# ── Setup 4: EMA Pullback / Holy Grail (Tier 1) ────────────────────────
+
+class EMA20PullbackDetector(SetupDetector):
+    """Holy Grail (Raschke) — EMA-20 pullback in strong trend. ADX > 30, EMA-20 per original specs."""
+    name = "ema20_pullback"
+    display_name = "Holy Grail (EMA-20)"
     category = "momentum"
-    hold_time = "5-30min"
+    hold_time = "10-40min"
+    evidence_tier = EvidenceTier.TIER1
     min_cooldown_seconds = 300
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY, MarketRegime.RANGING}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_STRONG: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.VOLATILE_EXPANSION: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.3,
+            MarketRegime.RANGING: 0.0,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.4,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.ema20 or not ind.adx14 or not ind.atr14:
             return None
-
-        atr = ind.atr14
-        ema = ind.ema9
-        adx = ind.adx14
-        plus_di = ind.plus_di
-        minus_di = ind.minus_di
-
-        if not all([atr, ema, adx, plus_di is not None, minus_di is not None]):
+        # Raschke original: ADX > 30
+        if ind.adx14 < 30:
             return None
-        if atr <= 0:
+        if len(bars) < 5:
             return None
-
-        # Need strong trend
-        if adx < 25:
-            return None
-
-        # Uptrend pullback: +DI > -DI, bar low touches EMA-9, close above EMA-9
-        if plus_di > minus_di:
-            if bar.low <= ema + 0.1 * atr and bar.close > ema:
-                # Confirm pullback: previous bar(s) were above EMA
-                if len(bars_history) >= 3:
-                    prev = bars_history[-2]
-                    if prev.low > ema - 0.3 * atr:
-                        stop = bar.low - 0.75 * atr
-                        risk = bar.close - stop
-                        if risk <= 0:
-                            return None
-                        target = bar.close + risk * 2.0
-                        conf = 0.60 + min(0.15, (adx - 25) / 100)
-                        return self.make_signal(
-                            "LONG", bar, ind,
-                            stop_price=stop, target_price=target,
-                            stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                            max_bars=20, confidence=conf,
-                            reason=f"EMA9 pullback long: ADX={adx:.0f}, low {bar.low:.1f} touched EMA {ema:.1f}"
-                        )
-
-        # Downtrend pullback: -DI > +DI, bar high touches EMA-9, close below EMA-9
-        if minus_di > plus_di:
-            if bar.high >= ema - 0.1 * atr and bar.close < ema:
-                if len(bars_history) >= 3:
-                    prev = bars_history[-2]
-                    if prev.high < ema + 0.3 * atr:
-                        stop = bar.high + 0.75 * atr
-                        risk = stop - bar.close
-                        if risk <= 0:
-                            return None
-                        target = bar.close - risk * 2.0
-                        conf = 0.60 + min(0.15, (adx - 25) / 100)
-                        return self.make_signal(
-                            "SHORT", bar, ind,
-                            stop_price=stop, target_price=target,
-                            stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                            max_bars=20, confidence=conf,
-                            reason=f"EMA9 pullback short: ADX={adx:.0f}, high {bar.high:.1f} touched EMA {ema:.1f}"
-                        )
-
+        # Long: uptrend (price above EMA-20 recently), pullback touches EMA-20, bounce
+        above_count = sum(1 for b in bars[-10:-1] if b.close > ind.ema20)
+        if above_count >= 7:
+            # Pullback: low touched EMA-20
+            if bar.low <= ind.ema20 * 1.002 and bar.close > ind.ema20 and bar.close > bar.open:
+                return "LONG"
+        below_count = sum(1 for b in bars[-10:-1] if b.close < ind.ema20)
+        if below_count >= 7:
+            if bar.high >= ind.ema20 * 0.998 and bar.close < ind.ema20 and bar.close < bar.open:
+                return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.ema20 or not ind.atr14:
+            return 0.0
+        # How precisely did price touch EMA-20?
+        touch_dist = abs(bar.low - ind.ema20) / ind.atr14 if bar.close > ind.ema20 else abs(bar.high - ind.ema20) / ind.atr14
+        precision = max(0, 1.0 - touch_dist * 3)  # Closer = better
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, precision * 0.5 + body_ratio * 0.3 + 0.2)
 
-# ── 1.5 TTM Squeeze ──────────────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        # Volume drying up on pullback then expanding on bounce = ideal
+        if ratio >= 1.3:
+            return 0.8
+        if ratio >= 0.8:
+            return 0.6
+        return 0.4
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.adx14:
+            if ind.adx14 > 35:
+                score += 0.25
+            elif ind.adx14 > 30:
+                score += 0.15
+        if ind.plus_di and ind.minus_di:
+            if bar.close > ind.ema20 and ind.plus_di > ind.minus_di:
+                score += 0.15
+            elif bar.close < ind.ema20 and ind.minus_di > ind.plus_di:
+                score += 0.15
+        return min(1.0, score)
+
+
+# ── Setup 5: TTM Squeeze (Tier 3) ──────────────────────────────────────
 
 class TTMSqueezeDetector(SetupDetector):
-    """
-    TTM Squeeze — Bollinger Bands contract inside Keltner Channels
-    (squeeze ON), then fire when squeeze releases with momentum.
-    """
+    """TTM Squeeze — BB inside KC then fires with momentum. Volatility breakout."""
     name = "ttm_squeeze"
-    display_name = "TTM Squeeze Fire"
+    display_name = "TTM Squeeze"
     category = "volatility"
-    hold_time = "15-60min"
+    hold_time = "10-40min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 600
 
     def __init__(self):
         super().__init__()
-        self._was_squeezing: bool = False
-        self._squeeze_bars: int = 0
+        self._prev_squeeze_on: bool = False
 
     def reset(self):
         super().reset()
-        self._was_squeezing = False
-        self._squeeze_bars = 0
+        self._prev_squeeze_on = False
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth or ind.session_minutes < 30:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.QUIET_COMPRESSION: 1.0,
+            MarketRegime.RANGING: 0.7,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        # Squeeze must have just fired (was on, now off)
+        was_on = self._prev_squeeze_on
+        self._prev_squeeze_on = ind.squeeze_on
+        if not was_on or ind.squeeze_on:
             return None
-
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        if ind.squeeze_momentum is None:
             return None
-
-        squeeze_on = ind.squeeze_on
-        momentum = ind.squeeze_momentum
-
-        if squeeze_on:
-            self._squeeze_bars += 1
-            self._was_squeezing = True
-            return None
-
-        # Squeeze just released
-        if self._was_squeezing and not squeeze_on and momentum is not None:
-            self._was_squeezing = False
-            bars_in_squeeze = self._squeeze_bars
-            self._squeeze_bars = 0
-
-            # Need at least 6 bars of squeeze for reliability
-            if bars_in_squeeze < 6:
-                return None
-
-            if momentum > 0:
-                # Bullish release
-                stop = bar.close - 1.5 * atr
-                risk = bar.close - stop
-                target = bar.close + risk * 2.0
-                conf = 0.60 + min(0.15, bars_in_squeeze / 50)
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.5, target_atr_mult=3.0,
-                    max_bars=30, confidence=conf,
-                    reason=f"TTM squeeze fire LONG: {bars_in_squeeze} bars squeezed, momentum={momentum:.2f}"
-                )
-            elif momentum < 0:
-                # Bearish release
-                stop = bar.close + 1.5 * atr
-                risk = stop - bar.close
-                target = bar.close - risk * 2.0
-                conf = 0.60 + min(0.15, bars_in_squeeze / 50)
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.5, target_atr_mult=3.0,
-                    max_bars=30, confidence=conf,
-                    reason=f"TTM squeeze fire SHORT: {bars_in_squeeze} bars squeezed, momentum={momentum:.2f}"
-                )
-
-        if not squeeze_on:
-            self._squeeze_bars = 0
-            self._was_squeezing = False
-
+        if ind.squeeze_momentum > 0:
+            return "LONG"
+        if ind.squeeze_momentum < 0:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if ind.squeeze_momentum is None or not ind.atr14:
+            return 0.0
+        # Momentum magnitude relative to ATR
+        mom_mag = abs(ind.squeeze_momentum) / ind.atr14
+        mom_score = min(mom_mag / 1.0, 1.0)
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, mom_score * 0.6 + body_ratio * 0.4)
 
-# ── 1.6 Overnight High/Low Sweep Reversal ────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        if ratio >= 1.5:
+            return 0.9
+        if ratio >= 1.0:
+            return 0.6
+        return 0.3
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.ema9 and ind.ema20:
+            if ind.squeeze_momentum and ind.squeeze_momentum > 0 and ind.ema9 > ind.ema20:
+                score += 0.2
+            elif ind.squeeze_momentum and ind.squeeze_momentum < 0 and ind.ema9 < ind.ema20:
+                score += 0.2
+        if ind.adx14 and ind.adx14 > 20:
+            score += 0.15
+        return min(1.0, score)
+
+
+# ── Setup 6: ON H/L Sweep (Tier 2) ─────────────────────────────────────
 
 class ONHLSweepDetector(SetupDetector):
-    """
-    Overnight High/Low Sweep Reversal — price sweeps ON level then
-    reverses back inside. Classic liquidity grab setup.
-    """
+    """Overnight High/Low Sweep — sweep ON level then reverse. Tier 2."""
     name = "on_hl_sweep"
-    display_name = "ON H/L Sweep Reversal"
+    display_name = "ON H/L Sweep"
     category = "level"
-    hold_time = "10-45min"
+    hold_time = "10-40min"
+    evidence_tier = EvidenceTier.TIER2
     min_cooldown_seconds = 600
 
-    def __init__(self):
-        super().__init__()
-        self._onh_swept: bool = False
-        self._onl_swept: bool = False
-        self._last_date: str = ""
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
 
-    def reset(self):
-        super().reset()
-        self._onh_swept = False
-        self._onl_swept = False
-        self._last_date = ""
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.VOLATILE_EXPANSION: 0.6,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.onh is None or ind.onl is None or not ind.atr14:
             return None
-
+        if ind.session_minutes < 5 or ind.session_minutes > 90:
+            return None
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-
-        # Reset on new day
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._last_date:
-            self._last_date = today
-            self._onh_swept = False
-            self._onl_swept = False
-
-        onh = ind.onh
-        onl = ind.onl
-        if onh is None or onl is None:
-            return None
-
-        # Only during first 2 hours
-        if ind.session_minutes > 120:
-            return None
-
-        # Short: sweep above ONH then close back below it
-        if not self._onh_swept and bar.high > onh and bar.close < onh:
-            wick_above = bar.high - onh
-            if 0 < wick_above < 1.5 * atr:
-                self._onh_swept = True
-                stop = bar.high + 0.5 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 1.5
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=25, confidence=0.65,
-                    reason=f"ON high sweep: high {bar.high:.1f} > ONH {onh:.1f}, close back {bar.close:.1f}"
-                )
-
-        # Long: sweep below ONL then close back above it
-        if not self._onl_swept and bar.low < onl and bar.close > onl:
-            wick_below = onl - bar.low
-            if 0 < wick_below < 1.5 * atr:
-                self._onl_swept = True
-                stop = bar.low - 0.5 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 1.5
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=25, confidence=0.65,
-                    reason=f"ON low sweep: low {bar.low:.1f} < ONL {onl:.1f}, close back {bar.close:.1f}"
-                )
-
+        # Sweep ONH then reject (close back below)
+        if bar.high > ind.onh and bar.close < ind.onh - 0.1 * atr and bar.close < bar.open:
+            return "SHORT"
+        # Sweep ONL then reject (close back above)
+        if bar.low < ind.onl and bar.close > ind.onl + 0.1 * atr and bar.close > bar.open:
+            return "LONG"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        # Wick through level = sweep quality
+        if bar.high > ind.onh:
+            wick = bar.high - ind.onh
+            rejection = ind.onh - bar.close
+        else:
+            wick = ind.onl - bar.low
+            rejection = bar.close - ind.onl
+        wick_score = min(wick / (0.5 * ind.atr14), 1.0)
+        rej_score = min(rejection / (0.3 * ind.atr14), 1.0)
+        return min(1.0, wick_score * 0.4 + rej_score * 0.4 + 0.2)
 
-# ── 1.7 Volume Spike Breakout ────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        if ratio >= 1.5:
+            return 0.9
+        if ratio >= 1.0:
+            return 0.6
+        return 0.4
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.rsi14:
+            if bar.close > ind.onl and ind.rsi14 < 40:
+                score += 0.2
+            elif bar.close < ind.onh and ind.rsi14 > 60:
+                score += 0.2
+        return min(1.0, score)
+
+
+# ── Setup 7: Volume Spike Breakout (Tier 3) ────────────────────────────
 
 class VolumeSpikeBreakoutDetector(SetupDetector):
-    """
-    Volume Spike Breakout — volume surges > 2x 20-SMA while price
-    breaks out of recent 5-bar range. Indicates institutional activity.
-    """
+    """Volume Spike Breakout — 2x+ volume with range breakout. Tier 3."""
     name = "volume_spike_breakout"
     display_name = "Volume Spike Breakout"
     category = "momentum"
     hold_time = "5-20min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 300
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
-            return None
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
 
-        atr = ind.atr14
-        vol_sma = ind.volume_sma20
-        if not atr or atr <= 0:
-            return None
-        if vol_sma is None or vol_sma <= 0:
-            return None
-        if len(bars_history) < 7:
-            return None
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_STRONG: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.VOLATILE_EXPANSION: 0.7,
+            MarketRegime.QUIET_COMPRESSION: 0.6,
+            MarketRegime.RANGING: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-        # Volume must be > 2x average
-        if bar.volume < vol_sma * 2.0:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or ind.atr14 <= 0:
             return None
-
-        # 5-bar range (excluding current bar)
-        lookback = bars_history[-6:-1]
-        range_high = max(b.high for b in lookback)
-        range_low = min(b.low for b in lookback)
-        range_size = range_high - range_low
-
-        # Range shouldn't be too wide (consolidation, not trending)
-        if range_size > 2.5 * atr:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
             return None
-        if range_size < 0.3 * atr:
+        if bar.volume < ind.volume_sma20 * 2.0:
             return None
-
-        # Long breakout
-        if bar.close > range_high and bar.close > bar.open:
-            stop = range_low - 0.25 * atr
-            risk = bar.close - stop
-            if risk <= 0:
-                return None
-            target = bar.close + risk * 1.5
-            vol_ratio = bar.volume / vol_sma
-            conf = min(0.80, 0.55 + (vol_ratio - 2.0) * 0.05)
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=15, confidence=conf,
-                reason=f"Vol spike long: vol={bar.volume:.0f} ({vol_ratio:.1f}x avg), broke {range_high:.1f}"
-            )
-
-        # Short breakout
-        if bar.close < range_low and bar.close < bar.open:
-            stop = range_high + 0.25 * atr
-            risk = stop - bar.close
-            if risk <= 0:
-                return None
-            target = bar.close - risk * 1.5
-            vol_ratio = bar.volume / vol_sma
-            conf = min(0.80, 0.55 + (vol_ratio - 2.0) * 0.05)
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=15, confidence=conf,
-                reason=f"Vol spike short: vol={bar.volume:.0f} ({vol_ratio:.1f}x avg), broke {range_low:.1f}"
-            )
-
+        if len(bars) < 7:
+            return None
+        lookback = bars[-6:-1]
+        rh = max(b.high for b in lookback)
+        rl = min(b.low for b in lookback)
+        rng = rh - rl
+        if rng > 2.5 * ind.atr14 or rng < 0.3 * ind.atr14:
+            return None
+        if bar.close > rh and bar.close > bar.open:
+            return "LONG"
+        if bar.close < rl and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or len(bars) < 7:
+            return 0.0
+        lookback = bars[-6:-1]
+        rh = max(b.high for b in lookback)
+        rl = min(b.low for b in lookback)
+        if bar.close > rh:
+            pen = (bar.close - rh) / ind.atr14
+        else:
+            pen = (rl - bar.close) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, min(pen / 0.4, 1.0) * 0.5 + body_ratio * 0.3 + 0.2)
 
-# ── 2.1 VWAP Breakout and Retest ─────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        if ratio >= 3.0:
+            return 1.0
+        if ratio >= 2.0:
+            return 0.8
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.ema9 and ind.ema20:
+            if bar.close > bar.open and ind.ema9 > ind.ema20:
+                score += 0.2
+            elif bar.close < bar.open and ind.ema9 < ind.ema20:
+                score += 0.2
+        if ind.adx14 and ind.adx14 > 20:
+            score += 0.15
+        return min(1.0, score)
+
+
+# ── Setup 8: VWAP Breakout & Retest (Tier 4) ───────────────────────────
 
 class VWAPBreakoutRetestDetector(SetupDetector):
-    """
-    VWAP Breakout & Retest — price crosses VWAP with volume, then
-    pulls back to VWAP and gets rejected. Multi-step state machine.
-    """
+    """VWAP Breakout & Retest — cross VWAP with volume, pullback, rejection. Tier 4."""
     name = "vwap_breakout_retest"
     display_name = "VWAP Breakout & Retest"
     category = "vwap"
     hold_time = "5-30min"
+    evidence_tier = EvidenceTier.TIER4
     min_cooldown_seconds = 600
 
     def __init__(self):
         super().__init__()
-        self._breakout_dir: Optional[str] = None  # "LONG" or "SHORT"
-        self._breakout_price: Optional[float] = None
-        self._breakout_time: int = 0
+        self._breakout_dir: Optional[str] = None
         self._awaiting_retest: bool = False
         self._bars_since_breakout: int = 0
 
     def reset(self):
         super().reset()
         self._breakout_dir = None
-        self._breakout_price = None
         self._awaiting_retest = False
         self._bars_since_breakout = 0
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth or ind.session_minutes < 15:
-            return None
-        atr = ind.atr14
-        if not atr or atr <= 0 or ind.vwap is None:
-            return None
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
 
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.TRENDING_STRONG: 0.6,
+            MarketRegime.RANGING: 0.7,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.VOLATILE_EXPANSION: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.vwap is None or not ind.atr14 or ind.session_minutes < 15:
+            return None
         vwap = ind.vwap
-
-        # Timeout stale breakout
+        atr = ind.atr14
+        # Timeout
         if self._awaiting_retest:
             self._bars_since_breakout += 1
             if self._bars_since_breakout > 15:
                 self._awaiting_retest = False
                 self._breakout_dir = None
-
-        # Step 1: Detect breakout
-        if not self._awaiting_retest and len(bars_history) >= 3:
-            prev1 = bars_history[-2]
-            prev2 = bars_history[-3]
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.5
-
-            # Bullish breakout: previous bars below VWAP, current above
+        # Step 1: detect breakout
+        if not self._awaiting_retest and len(bars) >= 3:
+            prev1, prev2 = bars[-2], bars[-3]
+            vol_ok = ind.volume_sma20 and bar.volume > ind.volume_sma20 * 1.5
             if prev1.close < vwap and prev2.close < vwap and bar.close > vwap and vol_ok:
                 self._breakout_dir = "LONG"
-                self._breakout_price = vwap
                 self._awaiting_retest = True
                 self._bars_since_breakout = 0
                 return None
-
-            # Bearish breakout
             if prev1.close > vwap and prev2.close > vwap and bar.close < vwap and vol_ok:
                 self._breakout_dir = "SHORT"
-                self._breakout_price = vwap
                 self._awaiting_retest = True
                 self._bars_since_breakout = 0
                 return None
-
-        # Step 2: Detect retest
+        # Step 2: detect retest
         if self._awaiting_retest and self._breakout_dir == "LONG":
-            # Price pulls back to VWAP, rejection candle
             if bar.low <= vwap + 0.1 * atr and bar.close > vwap and bar.close > bar.open:
                 self._awaiting_retest = False
                 self._breakout_dir = None
-                stop = vwap - 1.0 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 2.0
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.0, target_atr_mult=2.0,
-                    max_bars=15, confidence=0.55,
-                    reason=f"VWAP retest long: pullback to {vwap:.1f}, rejection close {bar.close:.1f}"
-                )
-
+                return "LONG"
         if self._awaiting_retest and self._breakout_dir == "SHORT":
             if bar.high >= vwap - 0.1 * atr and bar.close < vwap and bar.close < bar.open:
                 self._awaiting_retest = False
                 self._breakout_dir = None
-                stop = vwap + 1.0 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 2.0
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.0, target_atr_mult=2.0,
-                    max_bars=15, confidence=0.55,
-                    reason=f"VWAP retest short: pullback to {vwap:.1f}, rejection close {bar.close:.1f}"
-                )
-
+                return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.vwap or not ind.atr14:
+            return 0.0
+        # Rejection quality from VWAP
+        dist = abs(bar.close - ind.vwap) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        body_ratio = body / full if full > 0 else 0
+        return min(1.0, min(dist / 0.3, 1.0) * 0.4 + body_ratio * 0.4 + 0.2)
 
-# ── 2.2 VWAP Cross with Momentum ─────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        ratio = bar.volume / ind.volume_sma20
+        return min(1.0, 0.3 + ratio * 0.3)
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        score = 0.5
+        if ind.ema9 and ind.vwap:
+            if bar.close > ind.vwap and ind.ema9 > ind.vwap:
+                score += 0.2
+            elif bar.close < ind.vwap and ind.ema9 < ind.vwap:
+                score += 0.2
+        return min(1.0, score)
+
+
+# ── Setup 9: VWAP Cross with Momentum (Tier 3) ─────────────────────────
 
 class VWAPCrossMomentumDetector(SetupDetector):
-    """
-    VWAP Cross with EMA-9 + ADX + Volume momentum confirmation.
-    """
+    """VWAP Cross with EMA + ADX + Volume confirmation. Tier 3."""
     name = "vwap_cross_momentum"
     display_name = "VWAP Cross + Momentum"
     category = "vwap"
     hold_time = "5-30min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 300
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_MODERATE: 0.9,
+            MarketRegime.TRENDING_STRONG: 0.7,
+            MarketRegime.RANGING: 0.5,
+            MarketRegime.VOLATILE_EXPANSION: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.vwap is None or not ind.ema9 or not ind.adx14 or not ind.atr14:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0 or ind.vwap is None or ind.ema9 is None:
+        if len(bars) < 3:
             return None
-        if len(bars_history) < 3:
-            return None
-
-        vwap = ind.vwap
-        prev = bars_history[-2]
-        adx = ind.adx14
-        plus_di = ind.plus_di
-        minus_di = ind.minus_di
-        rsi = ind.rsi14
-
-        # Session filter: best during AM drive or PM session
-        if ind.session_minutes > 120 and ind.session_minutes < 270:
-            return None  # Skip lunch
-
-        # Long: cross above VWAP + momentum
-        if prev.close < vwap and bar.close > vwap and bar.close > ind.ema9:
-            adx_ok = adx is not None and adx > 20 and plus_di is not None and minus_di is not None and plus_di > minus_di
-            rsi_ok = rsi is not None and 50 < rsi < 70
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.3
-            if adx_ok and vol_ok and rsi_ok:
-                stop = bar.close - 1.5 * atr
-                risk = bar.close - stop
-                target = bar.close + risk * 1.5
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.5, target_atr_mult=2.25,
-                    max_bars=20, confidence=0.60,
-                    reason=f"VWAP cross long: close {bar.close:.1f} > VWAP {vwap:.1f}, ADX={adx:.0f}"
-                )
-
-        # Short: cross below VWAP + momentum
-        if prev.close > vwap and bar.close < vwap and bar.close < ind.ema9:
-            adx_ok = adx is not None and adx > 20 and plus_di is not None and minus_di is not None and minus_di > plus_di
-            rsi_ok = rsi is not None and 30 < rsi < 50
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.3
-            if adx_ok and vol_ok and rsi_ok:
-                stop = bar.close + 1.5 * atr
-                risk = stop - bar.close
-                target = bar.close - risk * 1.5
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=1.5, target_atr_mult=2.25,
-                    max_bars=20, confidence=0.60,
-                    reason=f"VWAP cross short: close {bar.close:.1f} < VWAP {vwap:.1f}, ADX={adx:.0f}"
-                )
-
+        prev = bars[-2]
+        # Bullish cross: prev below VWAP, current above, EMA9 confirms
+        if prev.close < ind.vwap and bar.close > ind.vwap and ind.ema9 > ind.vwap:
+            if ind.adx14 > 20 and bar.close > bar.open:
+                return "LONG"
+        if prev.close > ind.vwap and bar.close < ind.vwap and ind.ema9 < ind.vwap:
+            if ind.adx14 > 20 and bar.close < bar.open:
+                return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or not ind.vwap:
+            return 0.0
+        pen = abs(bar.close - ind.vwap) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, min(pen / 0.3, 1.0) * 0.5 + br * 0.3 + 0.2)
 
-# ── 2.3 First VWAP Touch After Gap ───────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.9
+        if r >= 1.0:
+            return 0.6
+        return 0.3
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.adx14 and ind.adx14 > 25:
+            s += 0.2
+        if ind.rsi14:
+            if bar.close > ind.vwap and 50 < ind.rsi14 < 70:
+                s += 0.15
+            elif bar.close < ind.vwap and 30 < ind.rsi14 < 50:
+                s += 0.15
+        return min(1.0, s)
+
+
+# ── Setup 10: First VWAP Touch After Gap (Tier 2) ──────────────────────
 
 class FirstVWAPTouchAfterGapDetector(SetupDetector):
-    """
-    First VWAP Touch After Gap — gap up/down, first touch of VWAP
-    within 30-90 minutes acts as support/resistance.
-    """
-    name = "first_vwap_touch_gap"
-    display_name = "First VWAP Touch After Gap"
+    """First VWAP Touch After Gap — gap day, first approach to VWAP. Tier 2."""
+    name = "first_vwap_touch"
+    display_name = "First VWAP Touch"
     category = "vwap"
-    hold_time = "15-60min"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER2
     min_cooldown_seconds = 900
 
     def __init__(self):
         super().__init__()
-        self._gap_direction: Optional[str] = None  # "UP" or "DOWN"
-        self._gap_size: float = 0.0
-        self._vwap_touched: bool = False
-        self._day_date: str = ""
+        self._touched_today: bool = False
+        self._touch_date: str = ""
 
     def reset(self):
         super().reset()
-        self._gap_direction = None
-        self._vwap_touched = False
-        self._day_date = ""
+        self._touched_today = False
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_MODERATE: 0.9,
+            MarketRegime.TRENDING_STRONG: 0.7,
+            MarketRegime.RANGING: 0.6,
+            MarketRegime.VOLATILE_EXPANSION: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.vwap is None or not ind.atr14 or not ind.pdc:
+            return None
+        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
+        if today != self._touch_date:
+            self._touch_date = today
+            self._touched_today = False
+        if self._touched_today:
+            return None
+        if ind.session_minutes < 15 or ind.session_minutes > 120:
             return None
         atr = ind.atr14
-        if not atr or atr <= 0 or ind.vwap is None or ind.pdc is None:
-            return None
-
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._day_date:
-            self._day_date = today
-            self._gap_direction = None
-            self._vwap_touched = False
-
-        # Detect gap on first RTH bar
-        if ind.session_minutes == 0 and self._gap_direction is None:
-            gap_pct = (bar.open - ind.pdc) / ind.pdc
-            if gap_pct >= 0.005:
-                self._gap_direction = "UP"
-                self._gap_size = gap_pct
-            elif gap_pct <= -0.005:
-                self._gap_direction = "DOWN"
-                self._gap_size = abs(gap_pct)
-            return None
-
-        if self._gap_direction is None or self._vwap_touched:
-            return None
-
-        # Only within 30-90 minutes
-        if ind.session_minutes < 30 or ind.session_minutes > 90:
-            return None
-
+        gap = abs(bar.open - ind.pdc)
+        if gap < 0.5 * atr:
+            return None  # Need meaningful gap
         vwap = ind.vwap
-
-        # Gap up: first VWAP touch from above = long
-        if self._gap_direction == "UP":
-            if bar.low <= vwap + 0.1 * atr and bar.close > vwap:
-                self._vwap_touched = True
-                rsi = ind.rsi14
-                if rsi is not None and rsi < 35:
-                    return None  # Too weak
-                stop = bar.low - 0.5 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 1.5
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=30, confidence=0.58,
-                    reason=f"First VWAP touch after gap up: touched {vwap:.1f}, gap {self._gap_size*100:.1f}%"
-                )
-
-        # Gap down: first VWAP touch from below = short
-        if self._gap_direction == "DOWN":
-            if bar.high >= vwap - 0.1 * atr and bar.close < vwap:
-                self._vwap_touched = True
-                rsi = ind.rsi14
-                if rsi is not None and rsi > 65:
-                    return None
-                stop = bar.high + 0.5 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 1.5
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=30, confidence=0.58,
-                    reason=f"First VWAP touch after gap down: touched {vwap:.1f}, gap {self._gap_size*100:.1f}%"
-                )
-
+        # Gap up, price pulls back to VWAP from above
+        if bar.open > ind.pdc and bar.low <= vwap + 0.15 * atr and bar.close > vwap and bar.close > bar.open:
+            self._touched_today = True
+            return "LONG"
+        # Gap down, price rallies to VWAP from below
+        if bar.open < ind.pdc and bar.high >= vwap - 0.15 * atr and bar.close < vwap and bar.close < bar.open:
+            self._touched_today = True
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or not ind.vwap:
+            return 0.0
+        touch_precision = 1.0 - min(abs(bar.low - ind.vwap) / (0.3 * ind.atr14), 1.0)
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, touch_precision * 0.5 + br * 0.3 + 0.2)
 
-# ── 2.4 ORB Failure Reversal ─────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        return min(1.0, 0.3 + r * 0.3)
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close > ind.vwap and ind.rsi14 < 60:
+                s += 0.2
+            elif bar.close < ind.vwap and ind.rsi14 > 40:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 11: ORB Failure Reversal (Tier 3) ────────────────────────────
 
 class ORBFailureReversalDetector(SetupDetector):
-    """
-    ORB Failure Reversal — price breaks OR boundary, fails to continue,
-    reverses back inside. "When what should happen doesn't happen."
-    """
+    """ORB Failure — false breakout of OR that reverses. Tier 3."""
     name = "orb_failure_reversal"
     display_name = "ORB Failure Reversal"
-    category = "session"
-    hold_time = "15-45min"
+    category = "mean_reversion"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 600
 
-    def __init__(self):
-        super().__init__()
-        self._or_high: Optional[float] = None
-        self._or_low: Optional[float] = None
-        self._or_complete: bool = False
-        self._or_date: str = ""
-        self._long_break_bar: int = 0
-        self._short_break_bar: int = 0
-        self._long_failure_fired: bool = False
-        self._short_failure_fired: bool = False
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
 
-    def reset(self):
-        super().reset()
-        self._or_high = None
-        self._or_low = None
-        self._or_complete = False
-        self._or_date = ""
-        self._long_break_bar = 0
-        self._short_break_bar = 0
-        self._long_failure_fired = False
-        self._short_failure_fired = False
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 1.0,
+            MarketRegime.CHOPPY: 0.6,
+            MarketRegime.TRENDING_MODERATE: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.or_complete or ind.orh is None or ind.orl is None or not ind.atr14:
             return None
+        if ind.session_minutes < 20 or ind.session_minutes > 120:
+            return None
+        if len(bars) < 3:
+            return None
+        prev = bars[-2]
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._or_date:
-            self._or_date = today
-            self._or_high = None
-            self._or_low = None
-            self._or_complete = False
-            self._long_break_bar = 0
-            self._short_break_bar = 0
-            self._long_failure_fired = False
-            self._short_failure_fired = False
-
-        # Build OR
-        if ind.session_minutes < 15:
-            if self._or_high is None:
-                self._or_high = bar.high
-                self._or_low = bar.low
-            else:
-                self._or_high = max(self._or_high, bar.high)
-                self._or_low = min(self._or_low, bar.low)
-            return None
-
-        if not self._or_complete:
-            self._or_complete = True
-
-        if self._or_high is None or self._or_low is None:
-            return None
-
-        bar_idx = len(bars_history)
-
-        # Track breakout above OR high
-        if bar.close > self._or_high and self._long_break_bar == 0:
-            self._long_break_bar = bar_idx
-
-        # Track breakout below OR low
-        if bar.close < self._or_low and self._short_break_bar == 0:
-            self._short_break_bar = bar_idx
-
-        # Failure of long breakout: broke above, then close back inside within 5-10 bars
-        if (self._long_break_bar > 0 and not self._long_failure_fired
-                and 5 <= (bar_idx - self._long_break_bar) <= 10
-                and bar.close < self._or_high and bar.close < bar.open):
-            self._long_failure_fired = True
-            stop = self._or_high + 0.5 * atr
-            risk = stop - bar.close
-            if risk <= 0:
-                return None
-            target = self._or_low
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=abs(bar.close - target) / atr,
-                max_bars=30, confidence=0.65,
-                reason=f"ORB failure reversal short: broke {self._or_high:.1f}, failed back to {bar.close:.1f}"
-            )
-
-        # Failure of short breakout
-        if (self._short_break_bar > 0 and not self._short_failure_fired
-                and 5 <= (bar_idx - self._short_break_bar) <= 10
-                and bar.close > self._or_low and bar.close > bar.open):
-            self._short_failure_fired = True
-            stop = self._or_low - 0.5 * atr
-            risk = bar.close - stop
-            if risk <= 0:
-                return None
-            target = self._or_high
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=abs(target - bar.close) / atr,
-                max_bars=30, confidence=0.65,
-                reason=f"ORB failure reversal long: broke {self._or_low:.1f}, failed back to {bar.close:.1f}"
-            )
-
+        # Failed long breakout: prev broke above ORH, current closes back inside
+        if prev.high > ind.orh and prev.close > ind.orh and bar.close < ind.orh and bar.close < bar.open:
+            return "SHORT"
+        # Failed short breakout
+        if prev.low < ind.orl and prev.close < ind.orl and bar.close > ind.orl and bar.close > bar.open:
+            return "LONG"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or ind.orh is None:
+            return 0.0
+        or_mid = (ind.orh + ind.orl) / 2
+        # How far back inside OR did it close?
+        if bar.close < ind.orh:
+            inside = (ind.orh - bar.close) / ind.atr14
+        else:
+            inside = (bar.close - ind.orl) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, min(inside / 0.3, 1.0) * 0.5 + br * 0.3 + 0.2)
 
-# ── 2.5 A-B-C Morning Reversal ───────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.8
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close < ind.orh and ind.rsi14 > 60:
+                s += 0.2  # Overbought rejection
+            elif bar.close > ind.orl and ind.rsi14 < 40:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 12: ABC Morning Reversal (Tier 4) ────────────────────────────
 
 class ABCMorningReversalDetector(SetupDetector):
-    """
-    A-B-C Morning Reversal — Elliott-based 3-point pattern in first
-    90 minutes. A=initial extreme, B=retracement 38-62%, C=failed retest.
-    """
+    """ABC Morning Reversal — 3-wave morning pattern. Tier 4."""
     name = "abc_morning_reversal"
-    display_name = "A-B-C Morning Reversal"
-    category = "session"
-    hold_time = "15-60min"
+    display_name = "ABC Morning Reversal"
+    category = "mean_reversion"
+    hold_time = "15-45min"
+    evidence_tier = EvidenceTier.TIER4
     min_cooldown_seconds = 900
 
-    def __init__(self):
-        super().__init__()
-        self._swing_highs: List[float] = []
-        self._swing_lows: List[float] = []
-        self._day_date: str = ""
-        self._fired: bool = False
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG, MarketRegime.VOLATILE_EXPANSION}
 
-    def reset(self):
-        super().reset()
-        self._swing_highs = []
-        self._swing_lows = []
-        self._day_date = ""
-        self._fired = False
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.VOLATILE_EXPANSION: 0.0,
+            MarketRegime.UNKNOWN: 0.4,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or ind.session_minutes < 30 or ind.session_minutes > 120:
+            return None
+        if len(bars) < 15:
             return None
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-        if len(bars_history) < 10:
-            return None
-
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._day_date:
-            self._day_date = today
-            self._fired = False
-
-        if self._fired:
-            return None
-
-        # Only during 9:45-11:00 ET
-        if ind.session_minutes < 15 or ind.session_minutes > 90:
-            return None
-
-        # Find swing points in recent 20 bars
-        recent = bars_history[-20:]
-        if len(recent) < 10:
-            return None
-
-        # Find highest high and lowest low as potential A points
-        max_h = max(b.high for b in recent[:10])
-        min_l = min(b.low for b in recent[:10])
-
-        # Bearish ABC: A=high, B=retrace down, C=lower high
-        ab_range = max_h - min_l
-        if ab_range < 0.5 * atr:
-            return None
-
-        # Check if current area is a "C" point (lower high failing)
-        if bar.high < max_h and bar.high > min_l:
-            # C is a failed retest - check Fibonacci
-            retrace_b = (max_h - min_l)
-            c_level = (bar.high - min_l) / retrace_b if retrace_b > 0 else 0
-            if 0.382 <= c_level <= 0.786:
-                # Bar shows rejection (close near low)
-                if bar.close < bar.open and (bar.high - bar.close) > 0.5 * (bar.high - bar.low):
-                    self._fired = True
-                    stop = max_h + 0.25 * atr
-                    risk = stop - bar.close
-                    if risk <= 0:
-                        return None
-                    target = bar.close - ab_range * 0.618
-                    return self.make_signal(
-                        "SHORT", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=abs(bar.close - target) / atr,
-                        max_bars=30, confidence=0.60,
-                        reason=f"ABC reversal short: A={max_h:.1f} C={bar.high:.1f} fib={c_level:.2f}"
-                    )
-
-        # Bullish ABC: A=low, B=retrace up, C=higher low
-        if bar.low > min_l and bar.low < max_h:
-            retrace_b = (max_h - min_l)
-            c_level = (max_h - bar.low) / retrace_b if retrace_b > 0 else 0
-            if 0.382 <= c_level <= 0.786:
-                if bar.close > bar.open and (bar.close - bar.low) > 0.5 * (bar.high - bar.low):
-                    self._fired = True
-                    stop = min_l - 0.25 * atr
-                    risk = bar.close - stop
-                    if risk <= 0:
-                        return None
-                    target = bar.close + ab_range * 0.618
-                    return self.make_signal(
-                        "LONG", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=abs(target - bar.close) / atr,
-                        max_bars=30, confidence=0.60,
-                        reason=f"ABC reversal long: A={min_l:.1f} C={bar.low:.1f} fib={c_level:.2f}"
-                    )
-
+        recent = bars[-12:]
+        highs = [b.high for b in recent]
+        lows = [b.low for b in recent]
+        # Find A (first swing), B (retrace), C (second swing lower than A)
+        a_idx = highs.index(max(highs))
+        # Bearish ABC: high at A, retrace to B, lower high at C
+        if a_idx < 4 and a_idx > 0:
+            a_high = highs[a_idx]
+            b_low = min(lows[a_idx:a_idx + 4]) if a_idx + 4 <= len(lows) else min(lows[a_idx:])
+            c_highs = highs[a_idx + 2:]
+            if c_highs:
+                c_high = max(c_highs)
+                if c_high < a_high and bar.close < b_low and bar.close < bar.open:
+                    return "SHORT"
+        # Bullish ABC
+        a_idx_l = lows.index(min(lows))
+        if a_idx_l < 4 and a_idx_l > 0:
+            a_low = lows[a_idx_l]
+            b_high = max(highs[a_idx_l:a_idx_l + 4]) if a_idx_l + 4 <= len(highs) else max(highs[a_idx_l:])
+            c_lows = lows[a_idx_l + 2:]
+            if c_lows:
+                c_low = min(c_lows)
+                if c_low > a_low and bar.close > b_high and bar.close > bar.open:
+                    return "LONG"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, br * 0.5 + 0.3)
 
-# ── 2.6 NR7+ORB Combination ──────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        return min(1.0, 0.3 + r * 0.25)
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close > bar.open and ind.rsi14 < 45:
+                s += 0.2
+            elif bar.close < bar.open and ind.rsi14 > 55:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 13: NR7 + ORB (Tier 1) ───────────────────────────────────────
 
 class NR7ORBDetector(SetupDetector):
-    """
-    NR7 + ORB Combination — when today's daily range so far is narrowest
-    of 7, ORB breakout has much higher probability.
-    Uses intraday rolling range as proxy for daily NR7.
-    """
+    """NR7 day + Opening Range Breakout — narrowest range in 7 days predicts expansion. Tier 1."""
     name = "nr7_orb"
-    display_name = "NR7 + ORB Combo"
+    display_name = "NR7 + ORB"
     category = "volatility"
-    hold_time = "30min-4hr"
-    min_cooldown_seconds = 900
+    hold_time = "15-60min"
+    evidence_tier = EvidenceTier.TIER1
+    min_cooldown_seconds = 600
 
-    def __init__(self):
-        super().__init__()
-        self._daily_ranges: List[float] = []  # last 7 days
-        self._cur_day_range: float = 0.0
-        self._cur_day_high: float = 0.0
-        self._cur_day_low: float = float('inf')
-        self._cur_day_date: str = ""
-        self._nr7_flag: bool = False
-        self._fired: bool = False
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.VOLATILE_EXPANSION}
 
-    def reset(self):
-        super().reset()
-        self._daily_ranges = []
-        self._nr7_flag = False
-        self._fired = False
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.QUIET_COMPRESSION: 1.0,
+            MarketRegime.RANGING: 0.8,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.CHOPPY: 0.3,
+            MarketRegime.VOLATILE_EXPANSION: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.or_complete or ind.orh is None or ind.orl is None or not ind.atr14:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        if ind.session_minutes < 15 or ind.session_minutes > 90:
             return None
-
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-
-        # New day: store previous day range, check NR7
-        if today != self._cur_day_date:
-            if self._cur_day_date and self._cur_day_high > 0:
-                self._daily_ranges.append(self._cur_day_high - self._cur_day_low)
-                if len(self._daily_ranges) > 7:
-                    self._daily_ranges = self._daily_ranges[-7:]
-            self._cur_day_date = today
-            self._cur_day_high = bar.high
-            self._cur_day_low = bar.low
-            self._fired = False
-
-            # Check NR7
-            if len(self._daily_ranges) >= 7:
-                yesterday = self._daily_ranges[-1]
-                self._nr7_flag = yesterday <= min(self._daily_ranges[-7:])
-            else:
-                self._nr7_flag = False
-        else:
-            self._cur_day_high = max(self._cur_day_high, bar.high)
-            self._cur_day_low = min(self._cur_day_low, bar.low)
-
-        if not self._nr7_flag or self._fired:
+        if len(bars) < 50:
             return None
-
-        # Use OR levels from indicator state
-        if not ind.or_complete or ind.orh is None or ind.orl is None:
+        # Check NR7: today's OR range is narrowest in 7 "sessions" (use recent bars as proxy)
+        or_range = ind.orh - ind.orl
+        # Compare with ranges of last 7 groups of 15 bars
+        ranges = []
+        for i in range(1, 8):
+            start = max(0, len(bars) - i * 15 - 15)
+            end = max(0, len(bars) - i * 15)
+            if end <= start:
+                break
+            chunk = bars[start:end]
+            if chunk:
+                r = max(b.high for b in chunk) - min(b.low for b in chunk)
+                ranges.append(r)
+        if len(ranges) < 5:
             return None
-
-        # Only first 2 hours
-        if ind.session_minutes > 120:
-            return None
-
-        # Breakout
-        if bar.close > ind.orh:
-            self._fired = True
-            stop = ind.orl - 0.5 * atr
-            risk = bar.close - stop
-            if risk <= 0:
-                return None
-            target = bar.close + risk * 1.5
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=60, confidence=0.65,
-                reason=f"NR7+ORB long: NR7 day, close {bar.close:.1f} > OR high {ind.orh:.1f}"
-            )
-
-        if bar.close < ind.orl:
-            self._fired = True
-            stop = ind.orh + 0.5 * atr
-            risk = stop - bar.close
-            if risk <= 0:
-                return None
-            target = bar.close - risk * 1.5
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=60, confidence=0.65,
-                reason=f"NR7+ORB short: NR7 day, close {bar.close:.1f} < OR low {ind.orl:.1f}"
-            )
-
+        if or_range > min(ranges):
+            return None  # Not NR7
+        # Breakout direction
+        if bar.close > ind.orh and bar.close > bar.open:
+            return "LONG"
+        if bar.close < ind.orl and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or ind.orh is None:
+            return 0.0
+        if bar.close > ind.orh:
+            pen = (bar.close - ind.orh) / ind.atr14
+        else:
+            pen = (ind.orl - bar.close) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, min(pen / 0.4, 1.0) * 0.5 + br * 0.3 + 0.2)
 
-# ── 2.7 PDH/PDL Rejection ────────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.9
+        if r >= 1.0:
+            return 0.6
+        return 0.3
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.squeeze_on:
+            s += 0.2  # Squeeze confirms compression
+        if ind.adx14 and ind.adx14 < 20:
+            s += 0.15  # Low ADX = coiled
+        return min(1.0, s)
+
+
+# ── Setup 14: PDH/PDL Rejection (Tier 4) ───────────────────────────────
 
 class PDHPDLRejectionDetector(SetupDetector):
-    """
-    PDH/PDL Rejection — price approaches level but fails to break,
-    showing rejection candle pattern. Opposite of breakout.
-    """
+    """PDH/PDL Rejection — touch level and reject. Tier 4."""
     name = "pdh_pdl_rejection"
     display_name = "PDH/PDL Rejection"
     category = "level"
-    hold_time = "15-60min"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER4
     min_cooldown_seconds = 600
 
-    def __init__(self):
-        super().__init__()
-        self._pdh_reject_fired: bool = False
-        self._pdl_reject_fired: bool = False
-        self._last_date: str = ""
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
 
-    def reset(self):
-        super().reset()
-        self._pdh_reject_fired = False
-        self._pdl_reject_fired = False
-        self._last_date = ""
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if ind.pdh is None or ind.pdl is None or not ind.atr14:
             return None
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-
-        today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-        if today != self._last_date:
-            self._last_date = today
-            self._pdh_reject_fired = False
-            self._pdl_reject_fired = False
-
-        pdh = ind.pdh
-        pdl = ind.pdl
-        if pdh is None or pdl is None:
-            return None
-
-        bar_range = bar.high - bar.low
-        if bar_range <= 0:
-            return None
-
-        # Short rejection at PDH: wick touches/exceeds PDH, close below
-        if not self._pdh_reject_fired:
-            near_pdh = bar.high >= pdh - 0.15 * atr and bar.high <= pdh + 0.5 * atr
-            rejection = bar.close < pdh and (bar.high - bar.close) > 0.6 * bar_range  # upper wick
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20
-            if near_pdh and rejection and vol_ok:
-                self._pdh_reject_fired = True
-                stop = bar.high + 0.5 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 2.0
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                    max_bars=30, confidence=0.60,
-                    reason=f"PDH rejection short: high {bar.high:.1f} near PDH {pdh:.1f}, wick rejection"
-                )
-
-        # Long rejection at PDL
-        if not self._pdl_reject_fired:
-            near_pdl = bar.low <= pdl + 0.15 * atr and bar.low >= pdl - 0.5 * atr
-            rejection = bar.close > pdl and (bar.close - bar.low) > 0.6 * bar_range
-            vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20
-            if near_pdl and rejection and vol_ok:
-                self._pdl_reject_fired = True
-                stop = bar.low - 0.5 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 2.0
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                    max_bars=30, confidence=0.60,
-                    reason=f"PDL rejection long: low {bar.low:.1f} near PDL {pdl:.1f}, wick rejection"
-                )
-
+        # Rejection at PDH: wick above, close below
+        if bar.high >= ind.pdh - 0.1 * atr and bar.close < ind.pdh - 0.1 * atr and bar.close < bar.open:
+            return "SHORT"
+        if bar.low <= ind.pdl + 0.1 * atr and bar.close > ind.pdl + 0.1 * atr and bar.close > bar.open:
+            return "LONG"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        # Wick quality
+        if bar.close < bar.open:  # Bearish
+            wick = bar.high - max(bar.close, bar.open)
+        else:
+            wick = min(bar.close, bar.open) - bar.low
+        wick_ratio = wick / (bar.high - bar.low) if (bar.high - bar.low) > 0 else 0
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, wick_ratio * 0.4 + br * 0.3 + 0.2)
 
-# ── 2.8 Round Number Bounce ──────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        return min(1.0, 0.3 + r * 0.25)
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close < ind.pdh and ind.rsi14 > 65:
+                s += 0.2
+            elif bar.close > ind.pdl and ind.rsi14 < 35:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 15: Round Number Bounce (Tier 1) ─────────────────────────────
 
 class RoundNumberBounceDetector(SetupDetector):
-    """
-    Round Number Bounce — psychological S/R at major round numbers.
-    ES: 50s/100s, NQ: 250s/500s, GC: $50 increments.
-    """
+    """Round Number Bounce — institutional magnet levels. Tier 1."""
     name = "round_number_bounce"
     display_name = "Round Number Bounce"
     category = "level"
-    hold_time = "15-45min"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER1
     min_cooldown_seconds = 600
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.6,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def _nearest_round(self, price: float) -> float:
+        """Find nearest round number (multiples of 50 for ES, 25 for NQ-like)."""
+        # Use 25-point intervals
+        return round(price / 25) * 25
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or ind.atr14 <= 0:
             return None
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-
-        bar_range = bar.high - bar.low
-        if bar_range <= 0:
-            return None
-
-        price = bar.close
-
-        # Determine round number grid based on price magnitude
-        if price > 10000:
-            # NQ range — use 250 and 500 increments
-            major_step = 500
-            minor_step = 250
-        elif price > 3000:
-            # ES range — use 50 and 100 increments
-            major_step = 100
-            minor_step = 50
-        elif price > 1000:
-            # GC range — use 50 increments
-            major_step = 50
-            minor_step = 25
-        else:
-            major_step = 10
-            minor_step = 5
-
-        # Find nearest round number
-        nearest_major = round(price / major_step) * major_step
-        nearest_minor = round(price / minor_step) * minor_step
-
-        # Use the closest level
-        dist_major = abs(price - nearest_major)
-        dist_minor = abs(price - nearest_minor)
-        level = nearest_major if dist_major <= dist_minor else nearest_minor
-        proximity = abs(price - level)
-
-        # Must be within 0.25 * ATR of round number
-        if proximity > 0.25 * atr:
-            return None
-
-        # Need rejection pattern
-        # Long bounce: low near level, close above
-        if bar.low <= level + 0.1 * atr and bar.close > level:
-            upper_body = (bar.close - bar.low) / bar_range
-            if upper_body > 0.55:  # Close in upper portion = rejection
-                stop = level - 0.75 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 1.5
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=20, confidence=0.50,
-                    reason=f"Round number bounce long at {level:.0f}"
-                )
-
-        # Short bounce: high near level, close below
-        if bar.high >= level - 0.1 * atr and bar.close < level:
-            lower_body = (bar.high - bar.close) / bar_range
-            if lower_body > 0.55:
-                stop = level + 0.75 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 1.5
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=20, confidence=0.50,
-                    reason=f"Round number bounce short at {level:.0f}"
-                )
-
+        rn = self._nearest_round(bar.close)
+        dist = abs(bar.close - rn)
+        if dist > 0.3 * atr:
+            return None  # Not near enough
+        # Bounce off round number
+        if bar.low <= rn + 0.1 * atr and bar.close > rn and bar.close > bar.open:
+            return "LONG"
+        if bar.high >= rn - 0.1 * atr and bar.close < rn and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        rn = self._nearest_round(bar.close)
+        precision = 1.0 - min(abs(bar.close - rn) / (0.3 * ind.atr14), 1.0)
+        # Prior touches (confluence)
+        touches = 0
+        for b in bars[-20:]:
+            if abs(b.low - rn) < 0.15 * ind.atr14 or abs(b.high - rn) < 0.15 * ind.atr14:
+                touches += 1
+        touch_score = min(touches / 3, 1.0)
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, precision * 0.3 + touch_score * 0.3 + br * 0.2 + 0.2)
 
-# ── 2.9 RSI Divergence Reversal ──────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.9
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close > bar.open and ind.rsi14 < 45:
+                s += 0.2
+            elif bar.close < bar.open and ind.rsi14 > 55:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 16: RSI Divergence (Tier 2) ──────────────────────────────────
 
 class RSIDivergenceDetector(SetupDetector):
-    """
-    RSI Divergence Reversal — price makes new low but RSI makes higher
-    low (bullish), or price new high but RSI lower high (bearish).
-    """
+    """RSI Divergence — price makes new extreme but RSI doesn't. Tier 2."""
     name = "rsi_divergence"
-    display_name = "RSI Divergence Reversal"
-    category = "momentum"
-    hold_time = "5-30min"
+    display_name = "RSI Divergence"
+    category = "mean_reversion"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER2
     min_cooldown_seconds = 600
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.rsi14 or not ind.rsi14_prev or not ind.atr14:
             return None
-        atr = ind.atr14
-        rsi = ind.rsi14
-        rsi_prev = ind.rsi14_prev
-        if not atr or atr <= 0 or rsi is None or rsi_prev is None:
+        if len(bars) < 10:
             return None
-        if len(bars_history) < 10:
-            return None
-
-        # Strong trend filter — divergence fails in strong trends
-        if ind.adx14 is not None and ind.adx14 > 30:
-            return None
-
-        # Look back 5-10 bars for price extreme vs RSI extreme
-        lookback = bars_history[-10:-1]
-
-        # Bullish divergence: new price low, RSI higher low
-        cur_low = bar.low
-        prev_low = min(b.low for b in lookback)
-
-        if cur_low <= prev_low and rsi > 25:
-            # Estimate previous RSI at the low point — use simple heuristic:
-            # if current RSI is higher than it "should be" given new low, divergence
-            if rsi > 30 and rsi > rsi_prev:  # RSI rising while price falling
-                # Confirmation: bullish candle
-                if bar.close > bar.open and (bar.close - bar.low) > 0.5 * (bar.high - bar.low):
-                    stop = cur_low - 0.75 * atr
-                    risk = bar.close - stop
-                    if risk <= 0:
-                        return None
-                    target = bar.close + risk * 1.5
-                    return self.make_signal(
-                        "LONG", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                        max_bars=20, confidence=0.58,
-                        reason=f"RSI bullish divergence: new low {cur_low:.1f}, RSI={rsi:.0f} rising"
-                    )
-
-        # Bearish divergence: new price high, RSI lower high
-        cur_high = bar.high
-        prev_high = max(b.high for b in lookback)
-
-        if cur_high >= prev_high and rsi < 75:
-            if rsi < 70 and rsi < rsi_prev:  # RSI falling while price rising
-                if bar.close < bar.open and (bar.high - bar.close) > 0.5 * (bar.high - bar.low):
-                    stop = cur_high + 0.75 * atr
-                    risk = stop - bar.close
-                    if risk <= 0:
-                        return None
-                    target = bar.close - risk * 1.5
-                    return self.make_signal(
-                        "SHORT", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                        max_bars=20, confidence=0.58,
-                        reason=f"RSI bearish divergence: new high {cur_high:.1f}, RSI={rsi:.0f} falling"
-                    )
-
+        # Bullish divergence: price new low, RSI higher low
+        recent_lows = [b.low for b in bars[-10:]]
+        if bar.low <= min(recent_lows[:-1]) and ind.rsi14 > ind.rsi14_prev and ind.rsi14 < 40:
+            if bar.close > bar.open:
+                return "LONG"
+        # Bearish divergence
+        recent_highs = [b.high for b in bars[-10:]]
+        if bar.high >= max(recent_highs[:-1]) and ind.rsi14 < ind.rsi14_prev and ind.rsi14 > 60:
+            if bar.close < bar.open:
+                return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, br * 0.5 + 0.3)
 
-# ── 2.10 ADX Thrust ──────────────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        return min(1.0, 0.3 + r * 0.3)
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14 and ind.rsi14_prev:
+            div_strength = abs(ind.rsi14 - ind.rsi14_prev)
+            s += min(div_strength / 10, 0.3)
+        return min(1.0, s)
+
+
+# ── Setup 17: ADX Thrust (Tier 1) ──────────────────────────────────────
 
 class ADXThrustDetector(SetupDetector):
-    """
-    ADX Thrust — ADX crossing above 25 from below signals new trend.
-    """
+    """ADX Thrust — ADX rises sharply from low base. Trend initiation. Tier 1."""
     name = "adx_thrust"
     display_name = "ADX Thrust"
     category = "momentum"
     hold_time = "15-60min"
-    min_cooldown_seconds = 900
+    evidence_tier = EvidenceTier.TIER1
+    min_cooldown_seconds = 600
 
     def __init__(self):
         super().__init__()
         self._prev_adx: Optional[float] = None
 
-    def reset(self):
-        super().reset()
-        self._prev_adx = None
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
-            self._prev_adx = ind.adx14
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_STRONG: 1.0,
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.QUIET_COMPRESSION: 0.7,
+            MarketRegime.VOLATILE_EXPANSION: 0.5,
+            MarketRegime.RANGING: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.adx14 or not ind.plus_di or not ind.minus_di:
             return None
-        atr = ind.atr14
-        adx = ind.adx14
-        if not atr or atr <= 0 or adx is None:
-            self._prev_adx = adx
+        prev_adx = self._prev_adx
+        self._prev_adx = ind.adx14
+        if prev_adx is None:
             return None
-
-        # Detect cross above 25
-        crossed = (self._prev_adx is not None and self._prev_adx < 25 and adx >= 25)
-        self._prev_adx = adx
-
-        if not crossed:
-            return None
-
-        plus_di = ind.plus_di
-        minus_di = ind.minus_di
-        if plus_di is None or minus_di is None:
-            return None
-
-        vol_ok = ind.volume_sma20 is not None and bar.volume >= ind.volume_sma20
-
-        # Long: +DI > -DI
-        if plus_di > minus_di and bar.close > (ind.ema9 or 0):
-            stop = bar.close - 2.0 * atr
-            risk = bar.close - stop
-            target = bar.close + risk * 1.5
-            conf = 0.55 if vol_ok else 0.48
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=2.0, target_atr_mult=3.0,
-                max_bars=30, confidence=conf,
-                reason=f"ADX thrust long: ADX crossed 25 ({adx:.0f}), +DI={plus_di:.0f} > -DI={minus_di:.0f}"
-            )
-
-        # Short: -DI > +DI
-        if minus_di > plus_di and bar.close < (ind.ema9 or float('inf')):
-            stop = bar.close + 2.0 * atr
-            risk = stop - bar.close
-            target = bar.close - risk * 1.5
-            conf = 0.55 if vol_ok else 0.48
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=2.0, target_atr_mult=3.0,
-                max_bars=30, confidence=conf,
-                reason=f"ADX thrust short: ADX crossed 25 ({adx:.0f}), -DI={minus_di:.0f} > +DI={plus_di:.0f}"
-            )
-
+        # ADX thrust: was below 20, now above 25 (rapid rise)
+        if prev_adx < 20 and ind.adx14 > 25:
+            if ind.plus_di > ind.minus_di:
+                return "LONG"
+            else:
+                return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        # Directional candle
+        if bar.close > bar.open and ind.plus_di and ind.minus_di and ind.plus_di > ind.minus_di:
+            dir_score = 0.3
+        elif bar.close < bar.open and ind.minus_di and ind.plus_di and ind.minus_di > ind.plus_di:
+            dir_score = 0.3
+        else:
+            dir_score = 0.1
+        return min(1.0, br * 0.4 + dir_score + 0.2)
 
-# ── 2.11 ATR Expansion Trade ─────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.9
+        if r >= 1.0:
+            return 0.6
+        return 0.4
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.adx14 and self._prev_adx:
+            thrust = ind.adx14 - self._prev_adx
+            s += min(thrust / 10, 0.3)
+        if ind.ema9 and ind.ema20:
+            if bar.close > bar.open and ind.ema9 > ind.ema20:
+                s += 0.1
+            elif bar.close < bar.open and ind.ema9 < ind.ema20:
+                s += 0.1
+        return min(1.0, s)
+
+
+# ── Setup 18: ATR Expansion (Tier 4) ───────────────────────────────────
 
 class ATRExpansionDetector(SetupDetector):
-    """
-    ATR Expansion Trade — after sustained ATR compression, breakout
-    on channel break with momentum.
-    """
+    """ATR Expansion — volatility expanding from low base. Tier 4."""
     name = "atr_expansion"
-    display_name = "ATR Expansion Trade"
+    display_name = "ATR Expansion"
     category = "volatility"
-    hold_time = "15-60min"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER4
     min_cooldown_seconds = 600
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.CHOPPY}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.VOLATILE_EXPANSION: 0.9,
+            MarketRegime.QUIET_COMPRESSION: 0.8,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.RANGING: 0.4,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr_ratio or not ind.atr14:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        # ATR expanding: short-term ATR much larger than long-term
+        if ind.atr_ratio < 1.3:
             return None
-        if len(bars_history) < 50:
-            return None
+        # Direction from candle
+        body = abs(bar.close - bar.open)
+        if body < 0.3 * ind.atr14:
+            return None  # Need directional bar
+        if bar.close > bar.open:
+            return "LONG"
+        return "SHORT"
 
-        # Compute ATR SMA-50 for compression detection
-        recent_atrs = []
-        for i in range(max(0, len(bars_history) - 50), len(bars_history)):
-            recent_atrs.append(_true_range(bars_history, i))
-        if len(recent_atrs) < 50:
-            return None
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        body_atr = body / ind.atr14
+        return min(1.0, min(body_atr / 0.5, 1.0) * 0.4 + br * 0.3 + 0.2)
 
-        atr_sma50 = sum(recent_atrs) / len(recent_atrs)
-        if atr_sma50 <= 0:
-            return None
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.8
+        return 0.5
 
-        # Compression: current ATR < 70% of 50-bar ATR average
-        # But current bar shows expansion
-        prev_atr_avg = sum(recent_atrs[-15:-1]) / 14 if len(recent_atrs) >= 15 else atr
-        compressed = prev_atr_avg < 0.7 * atr_sma50
-        cur_bar_range = bar.high - bar.low
-        expanding = cur_bar_range > 1.5 * prev_atr_avg
-
-        if not (compressed and expanding):
-            return None
-
-        # 20-bar channel break
-        highs_20 = [b.high for b in bars_history[-21:-1]]
-        lows_20 = [b.low for b in bars_history[-21:-1]]
-        chan_high = max(highs_20)
-        chan_low = min(lows_20)
-
-        if bar.close > chan_high and bar.close > bar.open:
-            stop = bar.close - 2.0 * atr
-            risk = bar.close - stop
-            target = bar.close + risk * 1.5
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=2.0, target_atr_mult=3.0,
-                max_bars=30, confidence=0.55,
-                reason=f"ATR expansion long: compression broke up, range={cur_bar_range:.1f} vs avg={prev_atr_avg:.1f}"
-            )
-
-        if bar.close < chan_low and bar.close < bar.open:
-            stop = bar.close + 2.0 * atr
-            risk = stop - bar.close
-            target = bar.close - risk * 1.5
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=2.0, target_atr_mult=3.0,
-                max_bars=30, confidence=0.55,
-                reason=f"ATR expansion short: compression broke down, range={cur_bar_range:.1f} vs avg={prev_atr_avg:.1f}"
-            )
-
-        return None
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.atr_ratio and ind.atr_ratio > 1.5:
+            s += 0.2
+        if ind.adx14 and ind.adx14 > 20:
+            s += 0.15
+        return min(1.0, s)
 
 
-# ── 2.12 NR4/NR7 Standalone Breakout ─────────────────────────────────────
+# ── Setup 19: NR4/NR7 Breakout (Tier 1) ────────────────────────────────
 
 class NR4NR7BreakoutDetector(SetupDetector):
-    """
-    NR4/NR7 Standalone Breakout — narrowest range bar of 4 or 7,
-    enter on breakout of that bar's range.
-    Uses intraday bars (not daily like NR7+ORB combo).
-    """
+    """NR4 inside bar breakout — narrowest range in 4 bars. Tier 1."""
     name = "nr4_nr7_breakout"
-    display_name = "NR4/NR7 Bar Breakout"
+    display_name = "NR4/NR7 Breakout"
     category = "volatility"
-    hold_time = "5-30min"
-    min_cooldown_seconds = 420
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER1
+    min_cooldown_seconds = 600
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.VOLATILE_EXPANSION}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.QUIET_COMPRESSION: 1.0,
+            MarketRegime.RANGING: 0.7,
+            MarketRegime.TRENDING_MODERATE: 0.6,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.CHOPPY: 0.3,
+            MarketRegime.VOLATILE_EXPANSION: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or len(bars) < 6:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        # Check NR4: current bar has narrowest range in last 4
+        ranges = [b.high - b.low for b in bars[-5:-1]]
+        cur_range = bar.high - bar.low
+        if cur_range > min(ranges):
             return None
-        if len(bars_history) < 9:
-            return None
-
-        # Check if previous bar was NR7 (narrowest of last 7)
-        prev = bars_history[-2]
-        prev_range = prev.high - prev.low
-        if prev_range <= 0:
-            return None
-
-        ranges_7 = [b.high - b.low for b in bars_history[-8:-1]]
-        is_nr7 = prev_range <= min(ranges_7)
-
-        ranges_4 = [b.high - b.low for b in bars_history[-5:-1]]
-        is_nr4 = prev_range <= min(ranges_4)
-
-        if not (is_nr4 or is_nr7):
-            return None
-
-        # Current bar breaks out of NR bar range
-        if bar.close > prev.high and bar.close > bar.open:
-            stop = prev.low - 0.25 * atr
-            risk = bar.close - stop
-            if risk <= 0:
-                return None
-            target = bar.close + risk * 1.5
-            label = "NR7" if is_nr7 else "NR4"
-            conf = 0.60 if is_nr7 else 0.55
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=20, confidence=conf,
-                reason=f"{label} breakout long: close {bar.close:.1f} > NR high {prev.high:.1f}"
-            )
-
-        if bar.close < prev.low and bar.close < bar.open:
-            stop = prev.high + 0.25 * atr
-            risk = stop - bar.close
-            if risk <= 0:
-                return None
-            target = bar.close - risk * 1.5
-            label = "NR7" if is_nr7 else "NR4"
-            conf = 0.60 if is_nr7 else 0.55
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                max_bars=20, confidence=conf,
-                reason=f"{label} breakout short: close {bar.close:.1f} < NR low {prev.low:.1f}"
-            )
-
+        # Inside bar check
+        prev = bars[-2]
+        if bar.high > prev.high or bar.low < prev.low:
+            return None  # Not inside bar
+        # Direction on breakout of prev bar
+        if bar.close > prev.high * 0.999 and bar.close > bar.open:
+            return "LONG"
+        if bar.close < prev.low * 1.001 and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, br * 0.5 + 0.3)
 
-# ── 2.13 VCP Intraday ────────────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.9
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.squeeze_on:
+            s += 0.25
+        if ind.adx14 and ind.adx14 < 20:
+            s += 0.15
+        return min(1.0, s)
+
+
+# ── Setup 20: VCP Intraday (Tier 2) ────────────────────────────────────
 
 class VCPIntradayDetector(SetupDetector):
-    """
-    Volatility Contraction Pattern — progressively smaller pullbacks
-    with declining volume, then breakout on volume expansion.
-    """
+    """Volatility Contraction Pattern — decreasing range bars. Tier 2."""
     name = "vcp_intraday"
     display_name = "VCP Intraday"
     category = "volatility"
-    hold_time = "15-60min"
-    min_cooldown_seconds = 900
-
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
-            return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-        if len(bars_history) < 30:
-            return None
-
-        # Look for 3 contractions in last 30 bars
-        # Split into 3 segments of ~10 bars each
-        seg1 = bars_history[-30:-20]
-        seg2 = bars_history[-20:-10]
-        seg3 = bars_history[-10:-1]
-
-        range1 = max(b.high for b in seg1) - min(b.low for b in seg1)
-        range2 = max(b.high for b in seg2) - min(b.low for b in seg2)
-        range3 = max(b.high for b in seg3) - min(b.low for b in seg3)
-
-        vol1 = sum(b.volume for b in seg1)
-        vol2 = sum(b.volume for b in seg2)
-        vol3 = sum(b.volume for b in seg3)
-
-        # Progressive contraction: each range smaller
-        if not (range1 > range2 > range3):
-            return None
-        # Volume declining
-        if not (vol1 > vol2 > vol3):
-            return None
-        # Minimum contraction ratio
-        if range3 > 0.7 * range1:
-            return None
-
-        # Pivot = highest high of consolidation
-        pivot_high = max(b.high for b in bars_history[-30:-1])
-        pivot_low = min(b.low for b in bars_history[-30:-1])
-
-        # Breakout with volume
-        vol_ok = ind.volume_sma20 is not None and bar.volume > ind.volume_sma20 * 1.4
-
-        if bar.close > pivot_high and vol_ok:
-            stop = pivot_low
-            risk = bar.close - stop
-            if risk <= 0 or risk > 3 * atr:
-                return None
-            target = bar.close + risk * 2.0
-            return self.make_signal(
-                "LONG", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                max_bars=40, confidence=0.60,
-                reason=f"VCP long: 3 contractions ({range1:.1f}→{range2:.1f}→{range3:.1f}), breakout {bar.close:.1f}"
-            )
-
-        if bar.close < pivot_low and vol_ok:
-            stop = pivot_high
-            risk = stop - bar.close
-            if risk <= 0 or risk > 3 * atr:
-                return None
-            target = bar.close - risk * 2.0
-            return self.make_signal(
-                "SHORT", bar, ind,
-                stop_price=stop, target_price=target,
-                stop_atr_mult=risk / atr, target_atr_mult=(risk * 2) / atr,
-                max_bars=40, confidence=0.60,
-                reason=f"VCP short: 3 contractions ({range1:.1f}→{range2:.1f}→{range3:.1f}), breakdown {bar.close:.1f}"
-            )
-
-        return None
-
-
-# ── 2.14 Liquidity Sweep & Reversal ──────────────────────────────────────
-
-class LiquiditySweepDetector(SetupDetector):
-    """
-    Liquidity Sweep — price sweeps beyond a swing high/low to trigger
-    stops, then reverses with displacement candle.
-    """
-    name = "liquidity_sweep"
-    display_name = "Liquidity Sweep & Reversal"
-    category = "micro"
-    hold_time = "5-30min"
+    hold_time = "10-30min"
+    evidence_tier = EvidenceTier.TIER2
     min_cooldown_seconds = 600
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.VOLATILE_EXPANSION, MarketRegime.CHOPPY}
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.QUIET_COMPRESSION: 1.0,
+            MarketRegime.RANGING: 0.7,
+            MarketRegime.TRENDING_MODERATE: 0.8,
+            MarketRegime.TRENDING_STRONG: 0.5,
+            MarketRegime.VOLATILE_EXPANSION: 0.0,
+            MarketRegime.CHOPPY: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or len(bars) < 10:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        # Check 3 contracting ranges
+        ranges = [b.high - b.low for b in bars[-5:-1]]
+        if len(ranges) < 4:
             return None
-        if len(bars_history) < 15:
-            return None
-
-        # Find swing high/low in last 10-20 bars
-        lookback = bars_history[-20:-1]
-        swing_high = max(b.high for b in lookback)
-        swing_low = min(b.low for b in lookback)
-
-        bar_body = abs(bar.close - bar.open)
-        bar_range = bar.high - bar.low
-        if bar_range <= 0:
-            return None
-
-        vol_ok = ind.volume_sma20 is not None and bar.volume >= ind.volume_sma20 * 1.5
-
-        # Bullish sweep: wick below swing low, close back above
-        penetration_low = swing_low - bar.low
-        if penetration_low >= 0.2 * atr and bar.close > swing_low and bar.close > bar.open:
-            # Displacement: body >= 70% of range
-            if bar_body >= 0.6 * bar_range and vol_ok:
-                stop = bar.low - 0.25 * atr
-                risk = bar.close - stop
-                if risk <= 0:
-                    return None
-                target = bar.close + risk * 1.5
-                return self.make_signal(
-                    "LONG", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=20, confidence=0.55,
-                    reason=f"Liquidity sweep long: swept {swing_low:.1f} by {penetration_low:.1f}, reversed"
-                )
-
-        # Bearish sweep: wick above swing high, close back below
-        penetration_high = bar.high - swing_high
-        if penetration_high >= 0.2 * atr and bar.close < swing_high and bar.close < bar.open:
-            if bar_body >= 0.6 * bar_range and vol_ok:
-                stop = bar.high + 0.25 * atr
-                risk = stop - bar.close
-                if risk <= 0:
-                    return None
-                target = bar.close - risk * 1.5
-                return self.make_signal(
-                    "SHORT", bar, ind,
-                    stop_price=stop, target_price=target,
-                    stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                    max_bars=20, confidence=0.55,
-                    reason=f"Liquidity sweep short: swept {swing_high:.1f} by {penetration_high:.1f}, reversed"
-                )
-
+        if not (ranges[-1] < ranges[-2] < ranges[-3]):
+            return None  # Not contracting
+        # Breakout of the contraction
+        pivot_high = max(b.high for b in bars[-5:-1])
+        pivot_low = min(b.low for b in bars[-5:-1])
+        if bar.close > pivot_high and bar.close > bar.open:
+            return "LONG"
+        if bar.close < pivot_low and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or len(bars) < 5:
+            return 0.0
+        pivot_high = max(b.high for b in bars[-5:-1])
+        pivot_low = min(b.low for b in bars[-5:-1])
+        if bar.close > pivot_high:
+            pen = (bar.close - pivot_high) / ind.atr14
+        else:
+            pen = (pivot_low - bar.close) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, min(pen / 0.3, 1.0) * 0.4 + br * 0.3 + 0.2)
 
-# ── 2.15 Fair Value Gap Fill ──────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        # Volume should expand on breakout
+        if r >= 1.5:
+            return 0.9
+        if r >= 1.0:
+            return 0.6
+        return 0.3
 
-class FVGFillDetector(SetupDetector):
-    """
-    Fair Value Gap Fill — 3-candle imbalance pattern. When price
-    returns to fill the gap zone, enter in the original momentum direction.
-    """
-    name = "fvg_fill"
-    display_name = "Fair Value Gap Fill"
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.ema9 and ind.ema20:
+            if bar.close > bar.open and ind.ema9 > ind.ema20:
+                s += 0.2
+            elif bar.close < bar.open and ind.ema9 < ind.ema20:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 21: Liquidity Sweep (Tier 3) ─────────────────────────────────
+
+class LiquiditySweepDetector(SetupDetector):
+    """Liquidity Sweep — sweep recent swing then reverse. Tier 3."""
+    name = "liquidity_sweep"
+    display_name = "Liquidity Sweep"
     category = "micro"
-    hold_time = "5-30min"
+    hold_time = "5-20min"
+    evidence_tier = EvidenceTier.TIER3
     min_cooldown_seconds = 300
 
-    def __init__(self):
-        super().__init__()
-        self._active_fvgs: List[dict] = []  # {type, top, bottom, bar_time}
-        self._max_fvgs: int = 10
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.VOLATILE_EXPANSION: 0.6,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.TRENDING_STRONG: 0.4,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def reset(self):
-        super().reset()
-        self._active_fvgs = []
-
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or len(bars) < 15:
             return None
         atr = ind.atr14
-        if not atr or atr <= 0:
-            return None
-        if len(bars_history) < 4:
-            return None
-
-        c1 = bars_history[-3]  # candle 1
-        c2 = bars_history[-2]  # candle 2 (momentum)
-        c3 = bar              # candle 3
-
-        # Detect new bullish FVG: candle3.low > candle1.high
-        if c3.low > c1.high:
-            gap_size = c3.low - c1.high
-            body_c2 = abs(c2.close - c2.open)
-            avg_body = atr * 0.5  # rough proxy
-            if gap_size >= 0.5 * atr and body_c2 > avg_body:
-                self._active_fvgs.append({
-                    'type': 'bullish', 'top': c3.low, 'bottom': c1.high,
-                    'bar_time': bar.time
-                })
-
-        # Detect new bearish FVG: candle3.high < candle1.low
-        if c3.high < c1.low:
-            gap_size = c1.low - c3.high
-            body_c2 = abs(c2.close - c2.open)
-            avg_body = atr * 0.5
-            if gap_size >= 0.5 * atr and body_c2 > avg_body:
-                self._active_fvgs.append({
-                    'type': 'bearish', 'top': c1.low, 'bottom': c3.high,
-                    'bar_time': bar.time
-                })
-
-        # Trim old FVGs (> 60 bars old)
-        self._active_fvgs = [
-            f for f in self._active_fvgs
-            if (bar.time - f['bar_time']) < 3600
-        ][-self._max_fvgs:]
-
-        # Check if current bar fills any FVG
-        for fvg in self._active_fvgs:
-            # Skip FVGs created on this bar
-            if fvg['bar_time'] >= bars_history[-2].time:
-                continue
-
-            if fvg['type'] == 'bullish':
-                # Price retraces into bullish FVG zone = long
-                if bar.low <= fvg['top'] and bar.close > fvg['bottom']:
-                    # Rejection in gap zone
-                    if bar.close > bar.open:
-                        self._active_fvgs.remove(fvg)
-                        stop = fvg['bottom'] - 0.25 * atr
-                        risk = bar.close - stop
-                        if risk <= 0:
-                            return None
-                        target = bar.close + risk * 1.5
-                        return self.make_signal(
-                            "LONG", bar, ind,
-                            stop_price=stop, target_price=target,
-                            stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                            max_bars=15, confidence=0.55,
-                            reason=f"FVG fill long: retrace to gap zone {fvg['bottom']:.1f}-{fvg['top']:.1f}"
-                        )
-
-            elif fvg['type'] == 'bearish':
-                if bar.high >= fvg['bottom'] and bar.close < fvg['top']:
-                    if bar.close < bar.open:
-                        self._active_fvgs.remove(fvg)
-                        stop = fvg['top'] + 0.25 * atr
-                        risk = stop - bar.close
-                        if risk <= 0:
-                            return None
-                        target = bar.close - risk * 1.5
-                        return self.make_signal(
-                            "SHORT", bar, ind,
-                            stop_price=stop, target_price=target,
-                            stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                            max_bars=15, confidence=0.55,
-                            reason=f"FVG fill short: retrace to gap zone {fvg['bottom']:.1f}-{fvg['top']:.1f}"
-                        )
-
+        lookback = bars[-15:-1]
+        swing_low = min(b.low for b in lookback)
+        swing_high = max(b.high for b in lookback)
+        # Sweep below swing low, close back above
+        if bar.low < swing_low and bar.close > swing_low + 0.1 * atr and bar.close > bar.open:
+            return "LONG"
+        if bar.high > swing_high and bar.close < swing_high - 0.1 * atr and bar.close < bar.open:
+            return "SHORT"
         return None
 
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14 or len(bars) < 15:
+            return 0.0
+        lookback = bars[-15:-1]
+        swing_low = min(b.low for b in lookback)
+        swing_high = max(b.high for b in lookback)
+        if bar.low < swing_low:
+            sweep_depth = (swing_low - bar.low) / ind.atr14
+            rejection = (bar.close - swing_low) / ind.atr14
+        else:
+            sweep_depth = (bar.high - swing_high) / ind.atr14
+            rejection = (swing_high - bar.close) / ind.atr14
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, min(sweep_depth / 0.3, 1.0) * 0.3 + min(rejection / 0.2, 1.0) * 0.3 + br * 0.2 + 0.1)
 
-# ── 2.16 Absorption Proxy ────────────────────────────────────────────────
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 2.0:
+            return 1.0
+        if r >= 1.5:
+            return 0.8
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close > bar.open and ind.rsi14 < 35:
+                s += 0.25
+            elif bar.close < bar.open and ind.rsi14 > 65:
+                s += 0.25
+        return min(1.0, s)
+
+
+# ── Setup 22: FVG Fill (Tier 2) ────────────────────────────────────────
+
+class FVGFillDetector(SetupDetector):
+    """Fair Value Gap Fill — price returns to fill imbalance. Tier 2."""
+    name = "fvg_fill"
+    display_name = "FVG Fill"
+    category = "micro"
+    hold_time = "5-20min"
+    evidence_tier = EvidenceTier.TIER2
+    min_cooldown_seconds = 300
+
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.TRENDING_MODERATE: 0.9,
+            MarketRegime.TRENDING_STRONG: 0.7,
+            MarketRegime.RANGING: 0.6,
+            MarketRegime.VOLATILE_EXPANSION: 0.5,
+            MarketRegime.QUIET_COMPRESSION: 0.4,
+            MarketRegime.CHOPPY: 0.3,
+            MarketRegime.UNKNOWN: 0.5,
+        }
+
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or len(bars) < 5:
+            return None
+        atr = ind.atr14
+        # Scan recent bars for FVG (3-bar pattern where bar2 doesn't overlap bar0)
+        for i in range(len(bars) - 4, max(len(bars) - 15, 0), -1):
+            if i < 0 or i + 2 >= len(bars) - 1:
+                continue
+            b0, b1, b2 = bars[i], bars[i + 1], bars[i + 2]
+            # Bullish FVG: gap between b0.high and b2.low
+            if b2.low > b0.high and (b2.low - b0.high) > 0.2 * atr:
+                gap_top = b2.low
+                gap_bot = b0.high
+                # Current bar fills into the gap
+                if bar.low <= gap_top and bar.close > gap_bot and bar.close > bar.open:
+                    return "LONG"
+            # Bearish FVG
+            if b0.low > b2.high and (b0.low - b2.high) > 0.2 * atr:
+                gap_top = b0.low
+                gap_bot = b2.high
+                if bar.high >= gap_bot and bar.close < gap_top and bar.close < bar.open:
+                    return "SHORT"
+        return None
+
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, br * 0.5 + 0.3)
+
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 1.5:
+            return 0.8
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.ema9 and ind.ema20:
+            if bar.close > bar.open and ind.ema9 > ind.ema20:
+                s += 0.2
+            elif bar.close < bar.open and ind.ema9 < ind.ema20:
+                s += 0.2
+        return min(1.0, s)
+
+
+# ── Setup 23: Absorption Proxy (Tier 4) ────────────────────────────────
 
 class AbsorptionProxyDetector(SetupDetector):
-    """
-    Absorption Proxy — high volume + tiny range + tiny body at key
-    level = institutional absorption. Enter on "release" candle.
-    """
+    """Absorption — high volume with no price progress = institutional absorption. Tier 4."""
     name = "absorption_proxy"
     display_name = "Absorption Proxy"
     category = "micro"
     hold_time = "5-20min"
-    min_cooldown_seconds = 600
+    evidence_tier = EvidenceTier.TIER4
+    min_cooldown_seconds = 300
 
-    def __init__(self):
-        super().__init__()
-        self._absorption_detected: bool = False
-        self._absorption_level: float = 0.0
-        self._absorption_bar_idx: int = 0
+    def disabled_regimes(self) -> set:
+        return {MarketRegime.TRENDING_STRONG}
 
-    def reset(self):
-        super().reset()
-        self._absorption_detected = False
+    def regime_scores(self) -> Dict[MarketRegime, float]:
+        return {
+            MarketRegime.RANGING: 0.9,
+            MarketRegime.TRENDING_MODERATE: 0.7,
+            MarketRegime.QUIET_COMPRESSION: 0.5,
+            MarketRegime.CHOPPY: 0.4,
+            MarketRegime.VOLATILE_EXPANSION: 0.3,
+            MarketRegime.TRENDING_STRONG: 0.0,
+            MarketRegime.UNKNOWN: 0.5,
+        }
 
-    def update(self, bar: BarInput, ind: IndicatorState,
-               bars_history: List[BarInput]) -> Optional[SetupSignal]:
-        if not ind.is_rth:
+    def detect_direction(self, bar: BarInput, ind: IndicatorState,
+                         bars: List[BarInput]) -> Optional[str]:
+        if not ind.atr14 or not ind.volume_sma20 or ind.volume_sma20 <= 0:
             return None
-        atr = ind.atr14
-        if not atr or atr <= 0:
+        if len(bars) < 5:
             return None
-
+        # High volume, small range = absorption
+        if bar.volume < ind.volume_sma20 * 2.0:
+            return None
         bar_range = bar.high - bar.low
-        bar_body = abs(bar.close - bar.open)
-        bar_idx = len(bars_history)
-        vol_sma = ind.volume_sma20
-
-        # Detect absorption: high volume + small range + small body
-        if vol_sma is not None and vol_sma > 0:
-            high_vol = bar.volume >= vol_sma * 2.0
-            small_range = bar_range < 0.5 * atr
-            small_body = bar_range > 0 and (bar_body / bar_range) < 0.3
-
-            if high_vol and small_range and small_body:
-                self._absorption_detected = True
-                self._absorption_level = (bar.high + bar.low) / 2
-                self._absorption_bar_idx = bar_idx
-                return None
-
-        # Look for release candle within 5 bars of absorption
-        if self._absorption_detected and (bar_idx - self._absorption_bar_idx) <= 5:
-            # Release = strong directional candle
-            strong_body = bar_body > 0.7 * bar_range if bar_range > 0 else False
-            big_move = bar_range > 1.0 * atr
-
-            if strong_body and big_move:
-                self._absorption_detected = False
-
-                if bar.close > bar.open:
-                    # Bullish release
-                    stop = self._absorption_level - 0.5 * atr
-                    risk = bar.close - stop
-                    if risk <= 0:
-                        return None
-                    target = bar.close + risk * 1.5
-                    return self.make_signal(
-                        "LONG", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                        max_bars=15, confidence=0.50,
-                        reason=f"Absorption release long: absorbed at {self._absorption_level:.1f}, bullish release"
-                    )
-                else:
-                    # Bearish release
-                    stop = self._absorption_level + 0.5 * atr
-                    risk = stop - bar.close
-                    if risk <= 0:
-                        return None
-                    target = bar.close - risk * 1.5
-                    return self.make_signal(
-                        "SHORT", bar, ind,
-                        stop_price=stop, target_price=target,
-                        stop_atr_mult=risk / atr, target_atr_mult=(risk * 1.5) / atr,
-                        max_bars=15, confidence=0.50,
-                        reason=f"Absorption release short: absorbed at {self._absorption_level:.1f}, bearish release"
-                    )
-
-        # Timeout absorption after 5 bars
-        if self._absorption_detected and (bar_idx - self._absorption_bar_idx) > 5:
-            self._absorption_detected = False
-
+        if bar_range > 0.5 * ind.atr14:
+            return None  # Too much movement, not absorption
+        # Direction: where is price relative to recent range?
+        recent = bars[-10:-1]
+        mid = (max(b.high for b in recent) + min(b.low for b in recent)) / 2
+        # Absorption at lows = bullish, at highs = bearish
+        if bar.close < mid and bar.close > bar.open:
+            return "LONG"
+        if bar.close > mid and bar.close < bar.open:
+            return "SHORT"
         return None
+
+    def score_price_action(self, bar: BarInput, ind: IndicatorState,
+                           bars: List[BarInput]) -> float:
+        if not ind.atr14:
+            return 0.0
+        # Smaller range = more absorption
+        bar_range = bar.high - bar.low
+        compression = 1.0 - min(bar_range / (0.5 * ind.atr14), 1.0)
+        body = abs(bar.close - bar.open)
+        full = bar.high - bar.low
+        br = body / full if full > 0 else 0
+        return min(1.0, compression * 0.4 + br * 0.3 + 0.2)
+
+    def score_volume(self, bar: BarInput, ind: IndicatorState,
+                     bars: List[BarInput]) -> float:
+        if not ind.volume_sma20 or ind.volume_sma20 <= 0:
+            return 0.5
+        r = bar.volume / ind.volume_sma20
+        if r >= 3.0:
+            return 1.0
+        if r >= 2.0:
+            return 0.8
+        return 0.5
+
+    def score_momentum(self, bar: BarInput, ind: IndicatorState,
+                       bars: List[BarInput]) -> float:
+        s = 0.5
+        if ind.rsi14:
+            if bar.close > bar.open and ind.rsi14 < 40:
+                s += 0.2
+            elif bar.close < bar.open and ind.rsi14 > 60:
+                s += 0.2
+        return min(1.0, s)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SETUP MANAGER — with self-contained indicator computation
+# SETUP MANAGER (placeholder — will be added after all detectors)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SetupManager:
@@ -2456,7 +2473,7 @@ class SetupManager:
         self._max_history: int = 600
         self._indicator_state = IndicatorState()
 
-        # VWAP session accumulators (reset each RTH day)
+        # VWAP session accumulators
         self._vwap_cum_vol: float = 0.0
         self._vwap_cum_pv: float = 0.0
         self._vwap_cum_pv2: float = 0.0
@@ -2482,9 +2499,7 @@ class SetupManager:
         self._or_complete: bool = False
         self._or_date: str = ""
 
-        # RSI state for prev tracking
         self._prev_rsi: Optional[float] = None
-
         logger.info("SetupManager initialized")
 
     def register(self, detector: SetupDetector):
@@ -2492,33 +2507,37 @@ class SetupManager:
         logger.info(f"Registered setup detector: {detector.name} ({detector.display_name})")
 
     def register_all_defaults(self):
-        """Register all 23 setup detectors from the research catalog."""
-        # Phase 1: Foundation (7)
-        self.register(ORBBreakoutDetector())            # Setup 5
-        self.register(VWAPMeanReversionDetector())       # Setup 1
-        self.register(PDHPDLBreakoutDetector())          # Setup 10
-        self.register(EMA9PullbackDetector())            # Setup 13
-        self.register(TTMSqueezeDetector())              # Setup 17
-        self.register(ONHLSweepDetector())               # Setup 11
-        self.register(VolumeSpikeBreakoutDetector())     # Setup 15
+        """Register all 23 setup detectors with decision tree scoring."""
+        # Tier 1 (cap 0.85)
+        self.register(ORBBreakoutDetector())            # 1
+        self.register(NR7ORBDetector())                 # 13
+        self.register(NR4NR7BreakoutDetector())         # 19
+        self.register(RoundNumberBounceDetector())      # 15
+        self.register(EMA20PullbackDetector())          # 4 (Holy Grail)
+        self.register(ADXThrustDetector())              # 17
 
-        # Phase 2: Advanced (16)
-        self.register(VWAPBreakoutRetestDetector())      # Setup 2
-        self.register(VWAPCrossMomentumDetector())       # Setup 3
-        self.register(FirstVWAPTouchAfterGapDetector())  # Setup 4
-        self.register(ORBFailureReversalDetector())      # Setup 6
-        self.register(ABCMorningReversalDetector())      # Setup 7
-        self.register(NR7ORBDetector())                  # Setup 8
-        self.register(PDHPDLRejectionDetector())         # Setup 9
-        self.register(RoundNumberBounceDetector())       # Setup 12
-        self.register(RSIDivergenceDetector())           # Setup 14
-        self.register(ADXThrustDetector())               # Setup 16
-        self.register(ATRExpansionDetector())            # Setup 18
-        self.register(NR4NR7BreakoutDetector())          # Setup 19
-        self.register(VCPIntradayDetector())             # Setup 20
-        self.register(LiquiditySweepDetector())          # Setup 21
-        self.register(FVGFillDetector())                 # Setup 22
-        self.register(AbsorptionProxyDetector())         # Setup 23
+        # Tier 2 (cap 0.70)
+        self.register(FirstVWAPTouchAfterGapDetector()) # 10
+        self.register(PDHPDLBreakoutDetector())         # 3
+        self.register(ONHLSweepDetector())              # 6
+        self.register(RSIDivergenceDetector())          # 16
+        self.register(FVGFillDetector())                # 22
+        self.register(VCPIntradayDetector())            # 20
+
+        # Tier 3 (cap 0.55)
+        self.register(VWAPMeanReversionDetector())      # 2
+        self.register(VWAPCrossMomentumDetector())      # 9
+        self.register(ORBFailureReversalDetector())     # 11
+        self.register(VolumeSpikeBreakoutDetector())    # 7
+        self.register(TTMSqueezeDetector())             # 5
+        self.register(LiquiditySweepDetector())         # 21
+
+        # Tier 4 (cap 0.40)
+        self.register(VWAPBreakoutRetestDetector())     # 8
+        self.register(ABCMorningReversalDetector())     # 12
+        self.register(PDHPDLRejectionDetector())        # 14
+        self.register(ATRExpansionDetector())           # 18
+        self.register(AbsorptionProxyDetector())        # 23
 
         logger.info(f"SetupManager: {len(self.detectors)} detectors registered")
 
@@ -2532,21 +2551,17 @@ class SetupManager:
             close=bar_data.get('close', 0),
             volume=bar_data.get('volume', 0),
         )
-
         self._bars_history.append(bar)
         if len(self._bars_history) > self._max_history:
             self._bars_history = self._bars_history[-self._max_history:]
 
-        # Compute all indicators from bar history
         self._compute_indicators(bar)
 
-        # Override with externally provided values if available
         if indicators:
             self._merge_external_indicators(indicators)
         if levels:
             self._merge_external_levels(levels)
 
-        # Run all detectors
         signals: List[SetupSignal] = []
         for detector in self.detectors:
             if not detector.can_signal(bar.time):
@@ -2562,13 +2577,9 @@ class SetupManager:
                     )
             except Exception as e:
                 logger.error(f"Error in detector {detector.name}: {e}", exc_info=True)
-
         return signals
 
-    # ── Self-contained indicator computation ──
-
     def _compute_indicators(self, bar: BarInput):
-        """Compute all indicators from raw bar history."""
         ind = self._indicator_state
         bars = self._bars_history
         n = len(bars)
@@ -2579,37 +2590,42 @@ class SetupManager:
         ind.session_minutes = et_min - RTH_OPEN_MINUTES if ind.is_rth else -1
         ind.session = _session_label(ind.session_minutes)
 
-        # Need minimum bars for indicators
         if n < 20:
             return
 
         closes = [b.close for b in bars]
         volumes = [b.volume for b in bars]
 
-        # EMA-9
         ind.ema9 = _ema(closes[-50:], 9) if n >= 9 else None
-
-        # EMA-20
         ind.ema20 = _ema(closes[-60:], 20) if n >= 20 else None
-
-        # RSI-14
         ind.rsi14_prev = ind.rsi14
         ind.rsi14 = _compute_rsi(closes, 14) if n >= 16 else None
-
-        # ATR-14
         ind.atr14 = _compute_atr(bars, 14) if n >= 15 else None
 
-        # ADX-14
+        # NEW: ATR-5 and ATR-50 for regime classification
+        ind.atr5 = _compute_atr(bars, 5) if n >= 6 else None
+        ind.atr50 = _compute_atr(bars, 50) if n >= 51 else None
+        if ind.atr5 and ind.atr50 and ind.atr50 > 0:
+            ind.atr_ratio = ind.atr5 / ind.atr50
+        else:
+            ind.atr_ratio = None
+
+        # NEW: Choppiness Index
+        ind.chop14 = _compute_choppiness(bars, 14) if n >= 15 else None
+
+        # ADX
         if n >= 30:
             adx, plus_di, minus_di = _compute_adx(bars, 14)
             ind.adx14 = adx
             ind.plus_di = plus_di
             ind.minus_di = minus_di
 
-        # Volume SMA-20
+        # NEW: Regime classification
+        ind.regime = classify_regime(ind.adx14, ind.chop14, ind.atr_ratio)
+
         ind.volume_sma20 = _sma(volumes, 20) if n >= 20 else None
 
-        # Bollinger Bands (20, 2)
+        # Bollinger Bands
         bb_sma = _sma(closes, 20)
         bb_std = _stdev(closes, 20)
         if bb_sma is not None and bb_std is not None:
@@ -2617,7 +2633,7 @@ class SetupManager:
             ind.bb_upper = bb_sma + 2 * bb_std
             ind.bb_lower = bb_sma - 2 * bb_std
 
-        # Keltner Channels (20, 1.5 * ATR)
+        # Keltner Channels
         kc_mid = _ema(closes[-60:], 20) if n >= 20 else None
         kc_atr = ind.atr14
         if kc_mid is not None and kc_atr is not None:
@@ -2625,10 +2641,9 @@ class SetupManager:
             ind.kc_upper = kc_mid + 1.5 * kc_atr
             ind.kc_lower = kc_mid - 1.5 * kc_atr
 
-        # TTM Squeeze: BB inside KC
-        if (ind.bb_upper is not None and ind.kc_upper is not None):
+        # TTM Squeeze
+        if ind.bb_upper is not None and ind.kc_upper is not None:
             ind.squeeze_on = (ind.bb_upper < ind.kc_upper and ind.bb_lower > ind.kc_lower)
-            # Momentum: close - midline of (highest high + lowest low)/2 + SMA20 over 20 bars
             if n >= 20:
                 hh = max(b.high for b in bars[-20:])
                 ll = min(b.low for b in bars[-20:])
@@ -2637,36 +2652,25 @@ class SetupManager:
                     avg_ml = (midline + bb_sma) / 2
                     ind.squeeze_momentum = bar.close - avg_ml
 
-        # VWAP (reset each RTH day)
         self._update_vwap(bar)
-
-        # PDH/PDL/PDC
         self._update_daily_levels(bar)
-
-        # Overnight H/L
         self._update_overnight_levels(bar)
-
-        # Opening Range
         self._update_opening_range(bar)
 
     def _update_vwap(self, bar: BarInput):
-        """Session-anchored VWAP computation."""
         ind = self._indicator_state
         if not ind.is_rth:
             return
-
         today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
         if today != self._vwap_date:
             self._vwap_date = today
             self._vwap_cum_vol = 0.0
             self._vwap_cum_pv = 0.0
             self._vwap_cum_pv2 = 0.0
-
         typical = (bar.high + bar.low + bar.close) / 3.0
         self._vwap_cum_vol += bar.volume
         self._vwap_cum_pv += typical * bar.volume
         self._vwap_cum_pv2 += typical * typical * bar.volume
-
         if self._vwap_cum_vol > 0:
             ind.vwap = self._vwap_cum_pv / self._vwap_cum_vol
             variance = (self._vwap_cum_pv2 / self._vwap_cum_vol) - (ind.vwap ** 2)
@@ -2675,12 +2679,9 @@ class SetupManager:
             ind.vwap_lower2 = ind.vwap - 2 * ind.vwap_std
 
     def _update_daily_levels(self, bar: BarInput):
-        """Track PDH/PDL/PDC from daily OHLC."""
         ind = self._indicator_state
         today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-
         if today != self._cur_day_date:
-            # New day — previous day becomes PDH/PDL
             if self._cur_day_high is not None:
                 self._prev_day_high = self._cur_day_high
                 self._prev_day_low = self._cur_day_low
@@ -2694,24 +2695,19 @@ class SetupManager:
                 self._cur_day_high = max(self._cur_day_high, bar.high)
                 self._cur_day_low = min(self._cur_day_low, bar.low)
                 self._cur_day_close = bar.close
-
         ind.pdh = self._prev_day_high
         ind.pdl = self._prev_day_low
         ind.pdc = self._prev_day_close
 
     def _update_overnight_levels(self, bar: BarInput):
-        """Track overnight session high/low (16:00 - 9:30 ET)."""
         ind = self._indicator_state
         today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-
         if ind.is_rth:
-            # During RTH, expose ON levels
             if today != self._on_date:
                 self._on_date = today
             ind.onh = self._on_high
             ind.onl = self._on_low
         else:
-            # Overnight session — accumulate
             if today != self._on_date:
                 self._on_date = today
                 self._on_high = bar.high
@@ -2722,19 +2718,15 @@ class SetupManager:
                     self._on_low = min(self._on_low, bar.low)
 
     def _update_opening_range(self, bar: BarInput):
-        """Track opening range (first 15 min of RTH)."""
         ind = self._indicator_state
         today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
-
         if not ind.is_rth:
             return
-
         if today != self._or_date:
             self._or_date = today
             self._or_high = None
             self._or_low = None
             self._or_complete = False
-
         if ind.session_minutes < 15:
             if self._or_high is None:
                 self._or_high = bar.high
@@ -2744,20 +2736,17 @@ class SetupManager:
                 self._or_low = min(self._or_low, bar.low)
         else:
             self._or_complete = True
-
         ind.orh = self._or_high
         ind.orl = self._or_low
         ind.or_complete = self._or_complete
 
     def _merge_external_indicators(self, indicators: dict):
-        """Override computed values with externally provided ones if available."""
         ind = self._indicator_state
         for key in ['ema9', 'rsi14', 'adx14', 'plus_di', 'minus_di',
                      'atr14', 'volume_sma20', 'vwap']:
             val = indicators.get(key)
             if val is not None:
                 setattr(ind, key, val)
-        # Also accept frontend naming conventions
         for src, dst in [('atr10', 'atr14'), ('rsi7', 'rsi14'),
                          ('adx10', 'adx14'), ('plusDI', 'plus_di'),
                          ('minusDI', 'minus_di')]:
