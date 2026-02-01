@@ -6,6 +6,7 @@ Provides WebSocket streaming of real-time and historical market data.
 
 import asyncio
 import sys
+import time
 
 # CRITICAL: Windows-specific event loop configuration - MUST be first
 if sys.platform == 'win32':
@@ -93,6 +94,7 @@ from .security import (
 )
 from .pattern_matcher import DailyPatternEngine, OvernightPatternEngine
 from .stats_tracker import StatsManager, get_trading_date
+from .setup_detectors import SetupManager
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
@@ -126,6 +128,7 @@ pattern_engines: Dict[str, DailyPatternEngine] = {}
 overnight_engines: Dict[str, OvernightPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
 stats_manager: Optional[StatsManager] = None
+setup_manager: Optional[SetupManager] = None
 
 
 class ConnectionManager:
@@ -538,9 +541,14 @@ async def lifespan(app: FastAPI):
         initialize_pattern_engines()
 
         # Initialize stats tracking system
-        global stats_manager
+        global stats_manager, setup_manager
         stats_manager = StatsManager()
         logger.info("✓ Stats tracking system initialized")
+
+        # Initialize setup detector manager
+        setup_manager = SetupManager()
+        setup_manager.register_all_defaults()
+        logger.info(f"✓ Setup detector manager initialized ({len(setup_manager.detectors)} detectors)")
 
         # Start pattern matching background loop
         global pattern_task
@@ -807,6 +815,20 @@ async def get_bracket_trades(session_date: str = None, limit: int = 50):
     return stats_manager.db.get_bracket_trades(session_date=session_date, limit=limit)
 
 
+@app.get("/api/stats/setups")
+async def get_setup_leaderboard():
+    """Get per-setup performance leaderboard."""
+    if not stats_manager:
+        return {"error": "Stats not initialized"}
+    try:
+        leaderboard = stats_manager.db.get_setup_leaderboard()
+        detectors = setup_manager.get_detector_info() if setup_manager else []
+        return {"leaderboard": leaderboard, "detectors": detectors}
+    except Exception as e:
+        logger.error(f"Error in /api/stats/setups: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/stats")
 async def stats_page():
     """Serve the stats dashboard page."""
@@ -994,9 +1016,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
             try:
                 # Callback for bar updates
                 async def on_bar_update(bar_data: dict, is_new_bar: bool):
-                    """Called on every bar update"""
-                    logger.debug(f"[{symbol}] Bar update callback fired: is_new_bar={is_new_bar}")
-
+                    """Called on every bar update - sends immediately for real-time price display"""
                     # Keep ALL timeframes in preloaded_data up-to-date
                     if symbol in preloaded_data and '1min' in preloaded_data[symbol]:
                         if is_new_bar:
@@ -1004,8 +1024,6 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         _update_higher_timeframes(symbol, bar_data, is_new_bar)
 
                     # Feed every bar to stats tracker so pending signals get resolved
-                    # (outcome tracking needs continuous price updates at +1m, +5m, +15m)
-                    # Now passes OHLC for bracket resolution
                     if stats_manager and is_new_bar:
                         stats_manager.update_pending_outcomes(
                             symbol=symbol,
@@ -1016,12 +1034,21 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             bar_low=bar_data.get('low', 0),
                         )
 
+                    # Run setup detectors on new bars
+                    if setup_manager and stats_manager and is_new_bar:
+                        try:
+                            signals = setup_manager.process_bar(bar_data)
+                            for sig in signals:
+                                stats_manager.process_setup_signal(symbol, sig)
+                        except Exception as e:
+                            logger.error(f"Error in setup detectors: {e}", exc_info=True)
+
                     await connection_manager.broadcast(symbol, {
                         'type': 'bar_update',
                         'data': bar_data,
                         'is_new_bar': is_new_bar,
                         'symbol': symbol
-                    }, immediate=True)  # Send immediately, no batching for real-time price updates
+                    }, immediate=True)
 
                 # Start streaming
                 logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")
