@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FUTURES Charting
+Comment=Futures Trading & Charting Application
+Exec=bash -c 'cd /home/user/FUTURES && ./start.sh'
+Icon=/home/user/FUTURES/assets/icon.png
+Terminal=true
+Categories=Finance;Office;
+StartupNotify=true
