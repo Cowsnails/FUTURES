@@ -129,6 +129,9 @@ overnight_engines: Dict[str, OvernightPatternEngine] = {}
 pattern_task: Optional[asyncio.Task] = None
 stats_manager: Optional[StatsManager] = None
 setup_manager: Optional[SetupManager] = None
+background_stream_task: Optional[asyncio.Task] = None
+# Track which symbols have background streams running
+_background_streams_active: set = set()
 
 
 class ConnectionManager:
@@ -492,6 +495,83 @@ async def run_all_pattern_matches():
                 stats_manager.evaluate_closed_sessions(symbol, current_price)
 
 
+async def _start_background_streams():
+    """
+    Start real-time streams for all configured symbols on startup.
+    Feeds bars to setup detectors + stats resolution continuously,
+    regardless of whether any frontend clients are connected.
+    """
+    global _background_streams_active
+
+    # Wait a moment for everything to initialize
+    await asyncio.sleep(3)
+
+    symbols = ['MNQ', 'MES', 'MGC']
+    logger.info(f"Starting background streams for setup detectors: {symbols}")
+
+    for symbol in symbols:
+        if not realtime_manager:
+            logger.warning("realtime_manager not available for background streams")
+            return
+
+        try:
+            contract = get_current_contract(symbol)
+
+            async def make_bg_callback(sym):
+                """Create a closure that captures the symbol."""
+                async def on_background_bar(bar_data: dict, is_new_bar: bool):
+                    """Background bar handler — feeds detectors and stats only."""
+                    # Update preloaded data so frontend gets fresh data when it connects
+                    if sym in preloaded_data and '1min' in preloaded_data[sym]:
+                        if is_new_bar:
+                            preloaded_data[sym]['1min'].append(bar_data)
+                        _update_higher_timeframes(sym, bar_data, is_new_bar)
+
+                    # Feed to stats tracker for bracket resolution
+                    if stats_manager and is_new_bar:
+                        stats_manager.update_pending_outcomes(
+                            symbol=sym,
+                            bar_time=bar_data.get('time', 0),
+                            price=bar_data.get('close', 0),
+                            bar_open=bar_data.get('open', 0),
+                            bar_high=bar_data.get('high', 0),
+                            bar_low=bar_data.get('low', 0),
+                        )
+
+                    # Run setup detectors
+                    if setup_manager and stats_manager and is_new_bar:
+                        try:
+                            signals = setup_manager.process_bar(bar_data)
+                            for sig in signals:
+                                stats_manager.process_setup_signal(sym, sig)
+                        except Exception as e:
+                            logger.error(f"[BG-{sym}] Setup detector error: {e}", exc_info=True)
+
+                    # Also broadcast to any connected WebSocket clients
+                    await connection_manager.broadcast(sym, {
+                        'type': 'bar_update',
+                        'data': bar_data,
+                        'is_new_bar': is_new_bar,
+                        'symbol': sym
+                    }, immediate=True)
+
+                return on_background_bar
+
+            callback = await make_bg_callback(symbol)
+            success = await realtime_manager.start_stream(contract, callback)
+
+            if success:
+                _background_streams_active.add(symbol)
+                logger.info(f"✓ Background stream started for {symbol}")
+            else:
+                logger.error(f"✗ Failed to start background stream for {symbol}")
+
+        except Exception as e:
+            logger.error(f"✗ Error starting background stream for {symbol}: {e}", exc_info=True)
+
+    logger.info(f"Background streams active: {_background_streams_active}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
@@ -554,12 +634,24 @@ async def lifespan(app: FastAPI):
         global pattern_task
         pattern_task = asyncio.create_task(pattern_match_loop())
 
+        # Start background streams for all symbols — runs setup detectors
+        # and stats resolution continuously, independent of frontend connections
+        global background_stream_task
+        background_stream_task = asyncio.create_task(_start_background_streams())
+
         logger.info("Application started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down application...")
+
+    if background_stream_task:
+        background_stream_task.cancel()
+        try:
+            await background_stream_task
+        except asyncio.CancelledError:
+            pass
 
     if pattern_task:
         pattern_task.cancel()
@@ -1011,19 +1103,20 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                 'message': f"Failed to load historical data: {str(e)}"
             })
 
-        # Step 2: Start real-time streaming
-        if realtime_manager:
+        # Step 2: Real-time streaming
+        # Background streams already handle data feed, stats, and setup detectors.
+        # If a background stream is already running, just log it — no duplicate needed.
+        if symbol in _background_streams_active:
+            logger.info(f"[{symbol}] Background stream already active — client will receive broadcasts")
+        elif realtime_manager:
             try:
-                # Callback for bar updates
+                # No background stream — start one now (fallback)
                 async def on_bar_update(bar_data: dict, is_new_bar: bool):
-                    """Called on every bar update - sends immediately for real-time price display"""
-                    # Keep ALL timeframes in preloaded_data up-to-date
                     if symbol in preloaded_data and '1min' in preloaded_data[symbol]:
                         if is_new_bar:
                             preloaded_data[symbol]['1min'].append(bar_data)
                         _update_higher_timeframes(symbol, bar_data, is_new_bar)
 
-                    # Feed every bar to stats tracker so pending signals get resolved
                     if stats_manager and is_new_bar:
                         stats_manager.update_pending_outcomes(
                             symbol=symbol,
@@ -1034,7 +1127,6 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             bar_low=bar_data.get('low', 0),
                         )
 
-                    # Run setup detectors on new bars
                     if setup_manager and stats_manager and is_new_bar:
                         try:
                             signals = setup_manager.process_bar(bar_data)
@@ -1050,12 +1142,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                         'symbol': symbol
                     }, immediate=True)
 
-                # Start streaming
-                logger.info(f"[{symbol}] Calling realtime_manager.start_stream()...")
+                logger.info(f"[{symbol}] No background stream — starting on-demand...")
                 success = await realtime_manager.start_stream(contract, on_bar_update)
 
                 if success:
-                    logger.info(f"✓ Real-time stream started successfully for {symbol}")
+                    logger.info(f"✓ Real-time stream started for {symbol}")
                 else:
                     logger.error(f"❌ start_stream() returned False for {symbol}")
                     await connection_manager.send_to_client(websocket, {
@@ -1152,8 +1243,10 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
         connection_manager.disconnect(websocket, symbol)
         logger.info(f"Cleaned up WebSocket for {symbol} ({remaining_clients} clients remaining)")
 
-        # Stop streaming if no more clients for this symbol
-        if realtime_manager and remaining_clients == 0:
+        # Background streams keep running — never stop on client disconnect
+        if remaining_clients == 0 and symbol in _background_streams_active:
+            logger.info(f"Last client disconnected — background stream keeps running for {symbol}")
+        elif realtime_manager and remaining_clients == 0 and symbol not in _background_streams_active:
             logger.info(f"Last client disconnected - stopping stream for {symbol}")
             realtime_manager.stop_stream(symbol)
         elif remaining_clients > 0:
