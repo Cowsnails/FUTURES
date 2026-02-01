@@ -692,13 +692,44 @@
                     breakout: '🔺', mean_reversion: '🔄', momentum: '⚡', level: '📏',
                     volatility: '💥', micro: '🔬', vwap: '📊', unknown: '❓'
                 };
+                // Build lookup from leaderboard data
+                const statsMap = {};
+                for (const s of leaderboard) {
+                    statsMap[s.setup_name] = s;
+                }
+
                 html += `<div style="margin-bottom:14px;color:#aaa;font-size:13px;font-weight:600">${detectors.length} Setups Registered &nbsp;|&nbsp; ${detectors.filter(d=>d.enabled).length} Enabled &nbsp;|&nbsp; ${detectors.reduce((s,d)=>s+d.signal_count,0)} Signals Emitted</div>`;
-                html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:16px">';
+                html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px;margin-bottom:16px">';
                 for (const d of detectors) {
                     const tc = tierColors[d.evidence_tier] || '#888';
                     const tl = tierLabels[d.evidence_tier] || '?';
                     const icon = catIcons[d.category] || '❓';
-                    const sigTxt = d.signal_count > 0 ? `<span style="color:#26a69a;font-weight:600">${d.signal_count} signals</span>` : '<span style="color:#555">0 signals</span>';
+                    const st = statsMap[d.name];
+                    const hasTrades = st && st.total_trades > 0;
+
+                    // Stats row
+                    let statsRow = '';
+                    if (hasTrades) {
+                        const wr = st.bracket_win_rate !== null ? (st.bracket_win_rate * 100).toFixed(1) + '%' : '-';
+                        const wrCol = st.bracket_win_rate >= 0.55 ? '#26a69a' : st.bracket_win_rate >= 0.45 ? '#ffca28' : '#ef5350';
+                        const avgR = st.avg_r !== null ? st.avg_r.toFixed(2) + 'R' : '-';
+                        const avgRCol = st.avg_r > 0 ? '#26a69a' : st.avg_r < 0 ? '#ef5350' : '#888';
+                        const totalR = st.total_r !== null ? st.total_r.toFixed(1) + 'R' : '-';
+                        const totalRCol = st.total_r > 0 ? '#26a69a' : st.total_r < 0 ? '#ef5350' : '#888';
+                        statsRow = `
+                            <div style="display:flex;justify-content:space-between;font-size:11px;margin-top:6px;padding-top:6px;border-top:1px solid #2a2a3a">
+                                <span style="color:${wrCol};font-weight:700">${wr}</span>
+                                <span style="color:#888">${st.total_trades} trades</span>
+                                <span style="color:${avgRCol};font-weight:600">${avgR}</span>
+                                <span style="color:${totalRCol};font-weight:600">${totalR}</span>
+                            </div>`;
+                    } else {
+                        statsRow = `
+                            <div style="font-size:10px;margin-top:6px;padding-top:6px;border-top:1px solid #2a2a3a;color:#444">
+                                ${d.signal_count > 0 ? d.signal_count + ' signals · awaiting resolution' : 'No signals yet'}
+                            </div>`;
+                    }
+
                     html += `<div style="background:#1e1e2f;border:1px solid ${d.enabled ? '#333' : '#2a1a1a'};border-radius:8px;padding:10px 12px;${!d.enabled ? 'opacity:0.5;' : ''}">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
                             <span style="font-size:12px;font-weight:700;color:#ddd">${icon} ${d.display_name}</span>
@@ -706,8 +737,8 @@
                         </div>
                         <div style="display:flex;justify-content:space-between;font-size:11px;color:#777">
                             <span>${d.category} · ${d.hold_time}</span>
-                            ${sigTxt}
                         </div>
+                        ${statsRow}
                     </div>`;
                 }
                 html += '</div>';
