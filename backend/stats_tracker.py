@@ -837,7 +837,7 @@ CREATE TABLE IF NOT EXISTS bracket_signals (
 CREATE INDEX IF NOT EXISTS idx_bracket_sig_symbol ON bracket_signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_bracket_sig_time ON bracket_signals(entry_time);
 CREATE INDEX IF NOT EXISTS idx_bracket_sig_session ON bracket_signals(session_date);
-CREATE INDEX IF NOT EXISTS idx_bracket_sig_setup ON bracket_signals(setup_name);
+-- NOTE: idx_bracket_sig_setup index created in _migrate() after column exists
 
 -- Bracket resolutions: primary bracket + secondary time snapshots
 CREATE TABLE IF NOT EXISTS bracket_resolutions (
@@ -993,8 +993,10 @@ class TradingStatsDB:
         except sqlite3.OperationalError:
             logger.info("Migrating: adding setup_name to bracket_signals")
             cursor.execute("ALTER TABLE bracket_signals ADD COLUMN setup_name TEXT DEFAULT 'confluence_v1'")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_bracket_sig_setup ON bracket_signals(setup_name)")
             self.conn.commit()
+        # Always ensure index exists (safe even if column was just added)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bracket_sig_setup ON bracket_signals(setup_name)")
+        self.conn.commit()
 
     # ── Write operations ──
 
