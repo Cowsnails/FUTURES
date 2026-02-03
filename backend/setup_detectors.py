@@ -685,9 +685,9 @@ class ORBBreakoutDetector(SetupDetector):
         score = 0.5
         # EMA alignment
         if ind.ema9 and ind.ema20:
-            if bar.close > ind.orh and ind.ema9 > ind.ema20:
+            if ind.orh is not None and bar.close > ind.orh and ind.ema9 > ind.ema20:
                 score += 0.2
-            elif bar.close < ind.orl and ind.ema9 < ind.ema20:
+            elif ind.orl is not None and bar.close < ind.orl and ind.ema9 < ind.ema20:
                 score += 0.2
         # ADX confirmation
         if ind.adx14 and ind.adx14 > 25:
@@ -2635,7 +2635,7 @@ class SetupManager:
         if not self._bars_history:
             logger.debug(f"get_all_readiness: no bars in history yet")
             return [{"name": d.name, "display_name": d.display_name,
-                     "category": d.category, "tier": d.tier,
+                     "category": d.category, "tier": d.evidence_tier.value,
                      "readiness": 0.0} for d in self.detectors]
         bar = self._bars_history[-1]
         ind = self._indicator_state
@@ -2650,7 +2650,7 @@ class SetupManager:
                 "name": d.name,
                 "display_name": d.display_name,
                 "category": d.category,
-                "tier": d.tier,
+                "tier": d.evidence_tier.value,
                 "readiness": round(score, 1),
             })
         return results
