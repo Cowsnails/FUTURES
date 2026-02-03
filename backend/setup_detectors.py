@@ -2570,6 +2570,28 @@ class SetupManager:
 
         logger.info(f"SetupManager: {len(self.detectors)} detectors registered")
 
+    def seed_history(self, bars: List[dict]):
+        """Pre-seed bar history from historical data (no signal emission).
+        Call this ONCE after registration to warm up indicators."""
+        if not bars:
+            logger.warning("seed_history called with empty bars list")
+            return
+        logger.info(f"Seeding SetupManager with {len(bars)} historical bars...")
+        for bar_data in bars:
+            bar = BarInput(
+                time=bar_data.get('time', 0),
+                open=bar_data.get('open', 0),
+                high=bar_data.get('high', 0),
+                low=bar_data.get('low', 0),
+                close=bar_data.get('close', 0),
+                volume=bar_data.get('volume', 0),
+            )
+            self._bars_history.append(bar)
+            if len(self._bars_history) > self._max_history:
+                self._bars_history = self._bars_history[-self._max_history:]
+            self._compute_indicators(bar)
+        logger.info(f"SetupManager seeded: {len(self._bars_history)} bars in history")
+
     def process_bar(self, bar_data: dict, indicators: dict = None,
                     levels: dict = None, session: str = "") -> List[SetupSignal]:
         bar = BarInput(
@@ -2611,6 +2633,7 @@ class SetupManager:
     def get_all_readiness(self) -> List[dict]:
         """Return confluence meter (0-100%) for all registered detectors."""
         if not self._bars_history:
+            logger.debug(f"get_all_readiness: no bars in history yet")
             return [{"name": d.name, "display_name": d.display_name,
                      "category": d.category, "tier": d.tier,
                      "readiness": 0.0} for d in self.detectors]
@@ -2620,7 +2643,8 @@ class SetupManager:
         for d in self.detectors:
             try:
                 score = d.readiness_score(bar, ind, self._bars_history)
-            except Exception:
+            except Exception as e:
+                logger.error(f"readiness_score error for {d.name}: {e}", exc_info=True)
                 score = 0.0
             results.append({
                 "name": d.name,
