@@ -921,6 +921,19 @@ async def get_setup_leaderboard():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.get("/api/stats/setups/readiness")
+async def get_setup_readiness():
+    """Get confluence meter (0-100%) for all 23 setups."""
+    if not setup_manager:
+        return {"error": "Setup manager not initialized"}
+    try:
+        readiness = setup_manager.get_all_readiness()
+        return {"readiness": readiness}
+    except Exception as e:
+        logger.error(f"Error in /api/stats/setups/readiness: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/stats")
 async def stats_page():
     """Serve the stats dashboard page."""
