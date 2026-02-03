@@ -77,37 +77,37 @@ SESSION_MULTIPLIERS: Dict[str, Dict[str, float]] = {
     "breakout": {
         "rth_open": 1.0, "am_drive": 0.9, "am_session": 0.7,
         "lunch": 0.4, "pm_session": 0.7, "moc": 0.8,
-        "pre_market": 0.3, "post_market": 0.2,
+        "pre_market": 0.3, "post_market": 0.2, "globex": 0.5,
     },
     "mean_reversion": {
         "rth_open": 0.5, "am_drive": 0.7, "am_session": 0.8,
         "lunch": 1.0, "pm_session": 0.8, "moc": 0.6,
-        "pre_market": 0.3, "post_market": 0.2,
+        "pre_market": 0.3, "post_market": 0.2, "globex": 0.6,
     },
     "momentum": {
         "rth_open": 1.0, "am_drive": 1.0, "am_session": 0.8,
         "lunch": 0.3, "pm_session": 0.7, "moc": 0.6,
-        "pre_market": 0.3, "post_market": 0.2,
+        "pre_market": 0.3, "post_market": 0.2, "globex": 0.4,
     },
     "level": {
         "rth_open": 0.9, "am_drive": 1.0, "am_session": 0.8,
         "lunch": 0.5, "pm_session": 0.8, "moc": 0.7,
-        "pre_market": 0.3, "post_market": 0.2,
+        "pre_market": 0.3, "post_market": 0.2, "globex": 0.5,
     },
     "volatility": {
         "rth_open": 1.0, "am_drive": 0.9, "am_session": 0.7,
         "lunch": 0.3, "pm_session": 0.6, "moc": 0.5,
-        "pre_market": 0.4, "post_market": 0.3,
+        "pre_market": 0.4, "post_market": 0.3, "globex": 0.4,
     },
     "micro": {
         "rth_open": 0.8, "am_drive": 0.9, "am_session": 1.0,
         "lunch": 0.6, "pm_session": 0.8, "moc": 0.5,
-        "pre_market": 0.3, "post_market": 0.2,
+        "pre_market": 0.3, "post_market": 0.2, "globex": 0.5,
     },
     "vwap": {
         "rth_open": 0.7, "am_drive": 0.9, "am_session": 1.0,
         "lunch": 0.8, "pm_session": 0.7, "moc": 0.5,
-        "pre_market": 0.2, "post_market": 0.2,
+        "pre_market": 0.2, "post_market": 0.2, "globex": 0.4,
     },
 }
 
@@ -377,22 +377,25 @@ def _is_rth(bar_time: int) -> bool:
     return RTH_OPEN_MINUTES <= m < RTH_CLOSE_MINUTES
 
 
-def _session_label(minutes_since_open: int) -> str:
-    if minutes_since_open < 0:
-        return "pre_market"
-    if minutes_since_open < 15:
-        return "rth_open"
-    if minutes_since_open < 60:
-        return "am_drive"
-    if minutes_since_open < 150:
-        return "am_session"
-    if minutes_since_open < 240:
-        return "lunch"
-    if minutes_since_open < 360:
-        return "pm_session"
-    if minutes_since_open < 390:
-        return "moc"
-    return "post_market"
+def _session_label(minutes_since_open: int, is_rth: bool = True) -> str:
+    """Label session for futures 23/5 trading.
+    Covers both RTH (9:30-16:00 ET) and globex/overnight."""
+    if is_rth:
+        if minutes_since_open < 15:
+            return "rth_open"
+        if minutes_since_open < 60:
+            return "am_drive"
+        if minutes_since_open < 150:
+            return "am_session"
+        if minutes_since_open < 240:
+            return "lunch"
+        if minutes_since_open < 360:
+            return "pm_session"
+        if minutes_since_open < 390:
+            return "moc"
+        return "post_market"
+    # Globex / overnight session
+    return "globex"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -562,9 +565,6 @@ class SetupDetector:
     def update(self, bar: BarInput, indicators: IndicatorState,
                bars_history: List[BarInput]) -> Optional[SetupSignal]:
         """Main entry: detect direction, score confidence, emit signal."""
-        if not indicators.is_rth:
-            return None
-
         direction = self.detect_direction(bar, indicators, bars_history)
         if direction is None:
             return None
@@ -573,7 +573,7 @@ class SetupDetector:
         if confidence < 0.40:
             return None
 
-        reason = f"{self.display_name} {direction} (conf={confidence:.2f}, regime={indicators.regime.value})"
+        reason = f"{self.display_name} {direction} (conf={confidence:.2f}, regime={indicators.regime.value}, session={indicators.session})"
         return self.make_signal_from_confidence(direction, bar, indicators, confidence, reason)
 
 
@@ -610,7 +610,8 @@ class ORBBreakoutDetector(SetupDetector):
                          bars: List[BarInput]) -> Optional[str]:
         if not ind.or_complete or ind.orh is None or ind.orl is None:
             return None
-        if ind.session_minutes < 15 or ind.session_minutes > 120:
+        # During RTH, only trade first 2 hours after open; globex = always allowed
+        if ind.is_rth and (ind.session_minutes < 15 or ind.session_minutes > 120):
             return None
         atr = ind.atr14
         if not atr or atr <= 0:
@@ -705,7 +706,7 @@ class VWAPMeanReversionDetector(SetupDetector):
                          bars: List[BarInput]) -> Optional[str]:
         if ind.vwap is None or ind.vwap_std is None or not ind.atr14:
             return None
-        if ind.session_minutes < 30:
+        if ind.is_rth and ind.session_minutes < 30:
             return None
         if ind.vwap_std <= 0:
             return None
@@ -1047,7 +1048,7 @@ class ONHLSweepDetector(SetupDetector):
                          bars: List[BarInput]) -> Optional[str]:
         if ind.onh is None or ind.onl is None or not ind.atr14:
             return None
-        if ind.session_minutes < 5 or ind.session_minutes > 90:
+        if ind.is_rth and (ind.session_minutes < 5 or ind.session_minutes > 90):
             return None
         atr = ind.atr14
         # Sweep ONH then reject (close back below)
@@ -1221,7 +1222,9 @@ class VWAPBreakoutRetestDetector(SetupDetector):
 
     def detect_direction(self, bar: BarInput, ind: IndicatorState,
                          bars: List[BarInput]) -> Optional[str]:
-        if ind.vwap is None or not ind.atr14 or ind.session_minutes < 15:
+        if ind.vwap is None or not ind.atr14:
+            return None
+        if ind.is_rth and ind.session_minutes < 15:
             return None
         vwap = ind.vwap
         atr = ind.atr14
@@ -1406,7 +1409,7 @@ class FirstVWAPTouchAfterGapDetector(SetupDetector):
             self._touched_today = False
         if self._touched_today:
             return None
-        if ind.session_minutes < 15 or ind.session_minutes > 120:
+        if ind.is_rth and (ind.session_minutes < 15 or ind.session_minutes > 120):
             return None
         atr = ind.atr14
         gap = abs(bar.open - ind.pdc)
@@ -1480,7 +1483,7 @@ class ORBFailureReversalDetector(SetupDetector):
                          bars: List[BarInput]) -> Optional[str]:
         if not ind.or_complete or ind.orh is None or ind.orl is None or not ind.atr14:
             return None
-        if ind.session_minutes < 20 or ind.session_minutes > 120:
+        if ind.is_rth and (ind.session_minutes < 20 or ind.session_minutes > 120):
             return None
         if len(bars) < 3:
             return None
@@ -1556,7 +1559,9 @@ class ABCMorningReversalDetector(SetupDetector):
 
     def detect_direction(self, bar: BarInput, ind: IndicatorState,
                          bars: List[BarInput]) -> Optional[str]:
-        if not ind.atr14 or ind.session_minutes < 30 or ind.session_minutes > 120:
+        if not ind.atr14:
+            return None
+        if ind.is_rth and (ind.session_minutes < 30 or ind.session_minutes > 120):
             return None
         if len(bars) < 15:
             return None
@@ -1641,7 +1646,7 @@ class NR7ORBDetector(SetupDetector):
                          bars: List[BarInput]) -> Optional[str]:
         if not ind.or_complete or ind.orh is None or ind.orl is None or not ind.atr14:
             return None
-        if ind.session_minutes < 15 or ind.session_minutes > 90:
+        if ind.is_rth and (ind.session_minutes < 15 or ind.session_minutes > 90):
             return None
         if len(bars) < 50:
             return None
@@ -2588,7 +2593,7 @@ class SetupManager:
         ind.is_rth = _is_rth(bar.time)
         et_min = _bar_to_et_minutes(bar.time)
         ind.session_minutes = et_min - RTH_OPEN_MINUTES if ind.is_rth else -1
-        ind.session = _session_label(ind.session_minutes)
+        ind.session = _session_label(ind.session_minutes, ind.is_rth)
 
         if n < 20:
             return
@@ -2658,9 +2663,8 @@ class SetupManager:
         self._update_opening_range(bar)
 
     def _update_vwap(self, bar: BarInput):
+        """Compute VWAP anchored to daily session (resets each calendar day)."""
         ind = self._indicator_state
-        if not ind.is_rth:
-            return
         today = datetime.fromtimestamp(bar.time, tz=timezone.utc).strftime('%Y-%m-%d')
         if today != self._vwap_date:
             self._vwap_date = today
