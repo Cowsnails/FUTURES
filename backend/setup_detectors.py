@@ -562,6 +562,30 @@ class SetupDetector:
             reason=reason, bar_time=bar.time,
         )
 
+    def readiness_score(self, bar: BarInput, ind: IndicatorState,
+                        bars: List[BarInput]) -> float:
+        """
+        Confluence meter: 0-100 showing how close this setup is to triggering.
+        Computes weighted confidence even when direction isn't confirmed yet.
+        """
+        if ind.regime in self.disabled_regimes():
+            return 0.0
+
+        pa = self.score_price_action(bar, ind, bars)
+        vol = self.score_volume(bar, ind, bars)
+        mom = self.score_momentum(bar, ind, bars)
+
+        r_scores = self.regime_scores()
+        regime_score = r_scores.get(ind.regime, 0.5)
+
+        sess_mults = SESSION_MULTIPLIERS.get(self.category, SESSION_MULTIPLIERS["momentum"])
+        session_score = sess_mults.get(ind.session, 0.3)
+
+        raw = (pa * W_PRICE_ACTION + vol * W_VOLUME + mom * W_MOMENTUM +
+               regime_score * W_REGIME + session_score * W_SESSION)
+
+        return min(100.0, raw * 100.0)
+
     def update(self, bar: BarInput, indicators: IndicatorState,
                bars_history: List[BarInput]) -> Optional[SetupSignal]:
         """Main entry: detect direction, score confidence, emit signal."""
@@ -2583,6 +2607,29 @@ class SetupManager:
             except Exception as e:
                 logger.error(f"Error in detector {detector.name}: {e}", exc_info=True)
         return signals
+
+    def get_all_readiness(self) -> List[dict]:
+        """Return confluence meter (0-100%) for all registered detectors."""
+        if not self._bars_history:
+            return [{"name": d.name, "display_name": d.display_name,
+                     "category": d.category, "tier": d.tier,
+                     "readiness": 0.0} for d in self.detectors]
+        bar = self._bars_history[-1]
+        ind = self._indicator_state
+        results = []
+        for d in self.detectors:
+            try:
+                score = d.readiness_score(bar, ind, self._bars_history)
+            except Exception:
+                score = 0.0
+            results.append({
+                "name": d.name,
+                "display_name": d.display_name,
+                "category": d.category,
+                "tier": d.tier,
+                "readiness": round(score, 1),
+            })
+        return results
 
     def _compute_indicators(self, bar: BarInput):
         ind = self._indicator_state

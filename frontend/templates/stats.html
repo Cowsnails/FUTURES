@@ -672,7 +672,7 @@
             container.innerHTML = html;
         }
 
-        function renderSetupLeaderboard(data) {
+        function renderSetupLeaderboard(data, readinessData) {
             const container = document.getElementById('setupLeaderboardCard');
             const leaderboard = data.leaderboard || [];
             const detectors = data.detectors || [];
@@ -696,6 +696,13 @@
                 const statsMap = {};
                 for (const s of leaderboard) {
                     statsMap[s.setup_name] = s;
+                }
+                // Readiness lookup
+                const readinessMap = {};
+                if (readinessData && readinessData.readiness) {
+                    for (const r of readinessData.readiness) {
+                        readinessMap[r.name] = r.readiness;
+                    }
                 }
 
                 html += `<div style="margin-bottom:14px;color:#aaa;font-size:13px;font-weight:600">${detectors.length} Setups Registered &nbsp;|&nbsp; ${detectors.filter(d=>d.enabled).length} Enabled &nbsp;|&nbsp; ${detectors.reduce((s,d)=>s+d.signal_count,0)} Signals Emitted</div>`;
@@ -730,6 +737,19 @@
                             </div>`;
                     }
 
+                    const pct = readinessMap[d.name] || 0;
+                    const barCol = pct >= 75 ? '#26a69a' : pct >= 50 ? '#ffca28' : pct >= 25 ? '#ff8a65' : '#555';
+                    const meterBar = `
+                        <div style="margin-top:6px;padding-top:6px;border-top:1px solid #2a2a3a">
+                            <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px">
+                                <span style="color:#888">Confluence</span>
+                                <span style="color:${barCol};font-weight:700">${pct.toFixed(1)}%</span>
+                            </div>
+                            <div style="background:#111;border-radius:3px;height:6px;overflow:hidden">
+                                <div style="width:${pct}%;height:100%;background:${barCol};border-radius:3px;transition:width 0.5s"></div>
+                            </div>
+                        </div>`;
+
                     html += `<div style="background:#1e1e2f;border:1px solid ${d.enabled ? '#333' : '#2a1a1a'};border-radius:8px;padding:10px 12px;${!d.enabled ? 'opacity:0.5;' : ''}">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
                             <span style="font-size:12px;font-weight:700;color:#ddd">${icon} ${d.display_name}</span>
@@ -739,6 +759,7 @@
                             <span>${d.category} · ${d.hold_time}</span>
                         </div>
                         ${statsRow}
+                        ${meterBar}
                     </div>`;
                 }
                 html += '</div>';
@@ -797,10 +818,11 @@
 
         async function loadAllStats() {
             try {
-                const [resp, sessResp, setupResp] = await Promise.all([
+                const [resp, sessResp, setupResp, readinessResp] = await Promise.all([
                     fetch('/api/stats/full'),
                     fetch('/api/stats/sessions'),
                     fetch('/api/stats/setups'),
+                    fetch('/api/stats/setups/readiness'),
                 ]);
                 if (!resp.ok) {
                     const errText = await resp.text();
@@ -816,7 +838,8 @@
                 renderBracketTrades(data.bracket_trades);
                 if (setupResp.ok) {
                     const setupData = await setupResp.json();
-                    renderSetupLeaderboard(setupData);
+                    const readinessData = readinessResp.ok ? await readinessResp.json() : {};
+                    renderSetupLeaderboard(setupData, readinessData);
                 }
                 renderSignalCards(data.signal_stats);
                 renderPatternCards(data.pattern_accuracy, data.prediction_counts);
