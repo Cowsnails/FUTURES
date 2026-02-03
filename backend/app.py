@@ -628,6 +628,14 @@ async def lifespan(app: FastAPI):
         # Initialize setup detector manager
         setup_manager = SetupManager()
         setup_manager.register_all_defaults()
+        # Pre-seed with historical bars so confluence meters work immediately
+        if preloaded_data:
+            # Use MNQ 1min as primary seed (most active futures contract)
+            seed_symbol = 'MNQ' if 'MNQ' in preloaded_data else next(iter(preloaded_data), None)
+            if seed_symbol and '1min' in preloaded_data.get(seed_symbol, {}):
+                seed_bars = preloaded_data[seed_symbol]['1min']
+                # Take last 600 bars (or all if less)
+                setup_manager.seed_history(seed_bars[-600:])
         logger.info(f"✓ Setup detector manager initialized ({len(setup_manager.detectors)} detectors)")
 
         # Start pattern matching background loop
