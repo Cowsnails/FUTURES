@@ -197,6 +197,9 @@ class SignalResolution:
     entry_bar_index: int
     max_bars: int = 15
 
+    # Setup name (for setup detector signals)
+    setup_name: str = ""
+
     # State tracking
     outcome: ResolutionOutcome = ResolutionOutcome.PENDING
     exit_price: Optional[float] = None
@@ -225,7 +228,11 @@ class SignalResolution:
             pnl = self.exit_price - self.bracket.entry_price
         else:
             pnl = self.bracket.entry_price - self.exit_price
-        return pnl / self.bracket.initial_risk
+        raw_r = pnl / self.bracket.initial_risk
+        # Cap R-multiples at reasonable bounds to prevent extreme values
+        # from near-zero initial risk calculations
+        MAX_R = 20.0
+        return max(-MAX_R, min(MAX_R, raw_r))
 
     @property
     def is_resolved(self) -> bool:

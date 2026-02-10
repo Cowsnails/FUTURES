@@ -513,12 +513,24 @@ class SetupDetector:
         if not atr or atr <= 0:
             return None
 
+        # Minimum ATR threshold: 0.1% of price to prevent tiny stops
+        min_atr = bar.close * 0.001
+        if atr < min_atr:
+            logger.debug(f"ATR {atr:.4f} below minimum {min_atr:.4f}, skipping signal")
+            return None
+
         bracket = confidence_to_bracket(confidence, atr)
         if not bracket["trade"]:
             return None
 
         stop_dist = bracket["stop_atr"] * atr
         target_dist = stop_dist * bracket["rr"]
+
+        # Minimum stop distance: at least 0.5 points (for futures)
+        min_stop_dist = 0.5
+        if stop_dist < min_stop_dist:
+            logger.debug(f"Stop distance {stop_dist:.4f} below minimum, skipping signal")
+            return None
 
         if direction == "LONG":
             stop = bar.close - stop_dist
@@ -776,7 +788,7 @@ class VWAPMeanReversionDetector(SetupDetector):
     def score_momentum(self, bar: BarInput, ind: IndicatorState,
                        bars: List[BarInput]) -> float:
         score = 0.5
-        if ind.rsi14:
+        if ind.rsi14 and ind.vwap is not None:
             if bar.close < ind.vwap and ind.rsi14 < 30:
                 score += 0.3  # Oversold for long
             elif bar.close > ind.vwap and ind.rsi14 > 70:
@@ -951,7 +963,7 @@ class EMA20PullbackDetector(SetupDetector):
                 score += 0.25
             elif ind.adx14 > 30:
                 score += 0.15
-        if ind.plus_di and ind.minus_di:
+        if ind.plus_di and ind.minus_di and ind.ema20:
             if bar.close > ind.ema20 and ind.plus_di > ind.minus_di:
                 score += 0.15
             elif bar.close < ind.ema20 and ind.minus_di > ind.plus_di:
@@ -1385,7 +1397,7 @@ class VWAPCrossMomentumDetector(SetupDetector):
         s = 0.5
         if ind.adx14 and ind.adx14 > 25:
             s += 0.2
-        if ind.rsi14:
+        if ind.rsi14 and ind.vwap is not None:
             if bar.close > ind.vwap and 50 < ind.rsi14 < 70:
                 s += 0.15
             elif bar.close < ind.vwap and 30 < ind.rsi14 < 50:
@@ -1474,7 +1486,7 @@ class FirstVWAPTouchAfterGapDetector(SetupDetector):
     def score_momentum(self, bar: BarInput, ind: IndicatorState,
                        bars: List[BarInput]) -> float:
         s = 0.5
-        if ind.rsi14:
+        if ind.rsi14 and ind.vwap is not None:
             if bar.close > ind.vwap and ind.rsi14 < 60:
                 s += 0.2
             elif bar.close < ind.vwap and ind.rsi14 > 40:
