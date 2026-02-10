@@ -25,7 +25,7 @@ contracts:
     symbol: MNQ
     exchange: CME
     currency: USD
-    last_trade_date: "202503"  # March 2025
+    last_trade_date: "202603"  # March 2026
     description: "Micro E-mini Nasdaq-100"
     tick_size: 0.25
     multiplier: 2
@@ -34,7 +34,7 @@ contracts:
     symbol: MES
     exchange: CME
     currency: USD
-    last_trade_date: "202503"  # March 2025
+    last_trade_date: "202603"  # March 2026
     description: "Micro E-mini S&P 500"
     tick_size: 0.25
     multiplier: 5
@@ -43,7 +43,7 @@ contracts:
     symbol: MGC
     exchange: COMEX
     currency: USD
-    last_trade_date: "202502"  # February 2025
+    last_trade_date: "202604"  # April 2026
     description: "Micro Gold"
     tick_size: 0.10
     multiplier: 10
