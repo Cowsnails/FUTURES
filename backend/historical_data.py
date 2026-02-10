@@ -100,14 +100,15 @@ class HistoricalDataFetcher:
                 logger.info(f"[{symbol}] Cache is fresh ({gap_seconds:.0f}s old) - skipping fetch")
                 return existing_data
 
-            # Calculate gap in days
-            gap_days = gap.days + 1  # Add 1 to ensure overlap
+            # Calculate gap in days with margin for session boundaries
+            # Always fetch at least 2 days to handle RTH/overnight transitions
+            gap_days = max(2, gap.days + 2)
 
             if gap_days <= 5:
                 # Small gap - use single request via fetch_recent logic
                 logger.info(
                     f"[{symbol}] Incremental update: cache has {len(existing_data)} bars, "
-                    f"gap is {gap_days} days - using quick fetch"
+                    f"gap is {gap.days}d - fetching {gap_days} days"
                 )
                 return await self.fetch_recent(
                     contract,
@@ -515,12 +516,17 @@ class HistoricalDataFetcher:
 
                 # Calculate gap in days
                 gap = now - last_datetime
-                gap_days = gap.days + 1  # Add 1 to ensure overlap
+                gap_seconds = gap.total_seconds()
 
-                if gap_days <= 0 or gap.total_seconds() < 120:
+                if gap_seconds < 120:
                     # Data is very fresh (less than 2 minutes old), no need to fetch
-                    logger.info(f"[{symbol}] Cache is fresh (last update: {gap.total_seconds():.0f}s ago) - skipping fetch")
+                    logger.info(f"[{symbol}] Cache is fresh (last update: {gap_seconds:.0f}s ago) - skipping fetch")
                     return existing_data
+
+                # Calculate gap in days with extra margin
+                # Always fetch at least 2 days to handle session boundaries properly
+                # (IB session data can have gaps at RTH/overnight transitions)
+                gap_days = max(2, gap.days + 2)  # Add 2 days margin for safety
 
                 # Determine fetch approach based on gap
                 if gap_days <= 5:
@@ -534,7 +540,7 @@ class HistoricalDataFetcher:
                 logger.info(
                     f"[{symbol}] Incremental update: cache has {len(existing_data)} bars "
                     f"(last: {last_datetime.strftime('%Y-%m-%d %H:%M')}), "
-                    f"gap is {gap_days} days"
+                    f"gap is {gap.days}d {gap_seconds % 86400 / 3600:.1f}h, fetching {gap_days} days"
                 )
 
                 if use_chunked:
