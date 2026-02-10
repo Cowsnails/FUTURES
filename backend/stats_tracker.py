@@ -1846,6 +1846,54 @@ class TradingStatsDB:
             logger.error(f"Error reading setup leaderboard: {e}")
             return []
 
+    def delete_setup_history(self, setup_name: str) -> int:
+        """Delete all trade history for a specific setup.
+
+        Args:
+            setup_name: The setup name to delete history for
+
+        Returns:
+            Number of trades deleted
+        """
+        try:
+            cursor = self.conn.cursor()
+
+            # First, get the signal IDs for this setup
+            cursor.execute("""
+                SELECT signal_id FROM bracket_signals
+                WHERE setup_name = ?
+            """, (setup_name,))
+            signal_ids = [row[0] for row in cursor.fetchall()]
+
+            if not signal_ids:
+                logger.info(f"No signals found for setup: {setup_name}")
+                return 0
+
+            # Delete resolutions for these signals
+            placeholders = ','.join('?' * len(signal_ids))
+            cursor.execute(f"""
+                DELETE FROM bracket_resolutions
+                WHERE signal_id IN ({placeholders})
+            """, signal_ids)
+            resolutions_deleted = cursor.rowcount
+
+            # Delete the signals
+            cursor.execute("""
+                DELETE FROM bracket_signals
+                WHERE setup_name = ?
+            """, (setup_name,))
+            signals_deleted = cursor.rowcount
+
+            self.conn.commit()
+
+            logger.info(f"Deleted {signals_deleted} signals and {resolutions_deleted} resolutions for setup: {setup_name}")
+            return signals_deleted
+
+        except Exception as e:
+            logger.error(f"Error deleting setup history for {setup_name}: {e}")
+            self.conn.rollback()
+            raise
+
     # ── Lifecycle ──
 
     def flush(self):
