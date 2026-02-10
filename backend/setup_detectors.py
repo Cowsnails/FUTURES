@@ -831,7 +831,7 @@ class PDHPDLBreakoutDetector(SetupDetector):
 
     def score_price_action(self, bar: BarInput, ind: IndicatorState,
                            bars: List[BarInput]) -> float:
-        if not ind.atr14:
+        if not ind.atr14 or ind.pdh is None or ind.pdl is None:
             return 0.0
         # How far through the level
         if bar.close > ind.pdh:
@@ -859,16 +859,16 @@ class PDHPDLBreakoutDetector(SetupDetector):
                        bars: List[BarInput]) -> float:
         score = 0.5
         if ind.ema9 and ind.ema20:
-            if bar.close > ind.pdh and ind.ema9 > ind.ema20:
+            if ind.pdh is not None and bar.close > ind.pdh and ind.ema9 > ind.ema20:
                 score += 0.2
-            elif bar.close < ind.pdl and ind.ema9 < ind.ema20:
+            elif ind.pdl is not None and bar.close < ind.pdl and ind.ema9 < ind.ema20:
                 score += 0.2
         if ind.adx14 and ind.adx14 > 25:
             score += 0.15
         if ind.rsi14:
-            if bar.close > ind.pdh and 50 < ind.rsi14 < 75:
+            if ind.pdh is not None and bar.close > ind.pdh and 50 < ind.rsi14 < 75:
                 score += 0.1
-            elif bar.close < ind.pdl and 25 < ind.rsi14 < 50:
+            elif ind.pdl is not None and bar.close < ind.pdl and 25 < ind.rsi14 < 50:
                 score += 0.1
         return min(1.0, score)
 
@@ -1085,7 +1085,7 @@ class ONHLSweepDetector(SetupDetector):
 
     def score_price_action(self, bar: BarInput, ind: IndicatorState,
                            bars: List[BarInput]) -> float:
-        if not ind.atr14:
+        if not ind.atr14 or ind.onh is None or ind.onl is None:
             return 0.0
         # Wick through level = sweep quality
         if bar.high > ind.onh:
@@ -1113,9 +1113,9 @@ class ONHLSweepDetector(SetupDetector):
                        bars: List[BarInput]) -> float:
         score = 0.5
         if ind.rsi14:
-            if bar.close > ind.onl and ind.rsi14 < 40:
+            if ind.onl is not None and bar.close > ind.onl and ind.rsi14 < 40:
                 score += 0.2
-            elif bar.close < ind.onh and ind.rsi14 > 60:
+            elif ind.onh is not None and bar.close < ind.onh and ind.rsi14 > 60:
                 score += 0.2
         return min(1.0, score)
 
@@ -1523,7 +1523,7 @@ class ORBFailureReversalDetector(SetupDetector):
 
     def score_price_action(self, bar: BarInput, ind: IndicatorState,
                            bars: List[BarInput]) -> float:
-        if not ind.atr14 or ind.orh is None:
+        if not ind.atr14 or ind.orh is None or ind.orl is None:
             return 0.0
         or_mid = (ind.orh + ind.orl) / 2
         # How far back inside OR did it close?
@@ -1549,9 +1549,9 @@ class ORBFailureReversalDetector(SetupDetector):
                        bars: List[BarInput]) -> float:
         s = 0.5
         if ind.rsi14:
-            if bar.close < ind.orh and ind.rsi14 > 60:
+            if ind.orh is not None and bar.close < ind.orh and ind.rsi14 > 60:
                 s += 0.2  # Overbought rejection
-            elif bar.close > ind.orl and ind.rsi14 < 40:
+            elif ind.orl is not None and bar.close > ind.orl and ind.rsi14 < 40:
                 s += 0.2
         return min(1.0, s)
 
@@ -1700,7 +1700,7 @@ class NR7ORBDetector(SetupDetector):
 
     def score_price_action(self, bar: BarInput, ind: IndicatorState,
                            bars: List[BarInput]) -> float:
-        if not ind.atr14 or ind.orh is None:
+        if not ind.atr14 or ind.orh is None or ind.orl is None:
             return 0.0
         if bar.close > ind.orh:
             pen = (bar.close - ind.orh) / ind.atr14
@@ -1795,9 +1795,9 @@ class PDHPDLRejectionDetector(SetupDetector):
                        bars: List[BarInput]) -> float:
         s = 0.5
         if ind.rsi14:
-            if bar.close < ind.pdh and ind.rsi14 > 65:
+            if ind.pdh is not None and bar.close < ind.pdh and ind.rsi14 > 65:
                 s += 0.2
-            elif bar.close > ind.pdl and ind.rsi14 < 35:
+            elif ind.pdl is not None and bar.close > ind.pdl and ind.rsi14 < 35:
                 s += 0.2
         return min(1.0, s)
 
