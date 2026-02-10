@@ -443,6 +443,103 @@
             font-weight: 600;
         }
         .dash-toggle:hover { border-color: #3a3e49; }
+
+        /* Setup Signal Panel - Bottom Right */
+        .signal-panel {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            max-height: 400px;
+            background: rgba(22, 26, 35, 0.95);
+            border: 1px solid #2a2e39;
+            border-radius: 8px;
+            z-index: 100;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .signal-panel-header {
+            padding: 10px 14px;
+            background: rgba(30, 34, 45, 0.9);
+            border-bottom: 1px solid #2a2e39;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .signal-panel-title {
+            font-size: 12px;
+            font-weight: 700;
+            color: #d1d4dc;
+        }
+        .signal-panel-count {
+            font-size: 11px;
+            color: #758696;
+        }
+        .signal-panel-body {
+            max-height: 350px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #333 transparent;
+        }
+        .signal-card {
+            padding: 10px 14px;
+            border-bottom: 1px solid #1e222d;
+            transition: background 0.2s;
+        }
+        .signal-card:hover { background: rgba(40, 44, 55, 0.5); }
+        .signal-card.long { border-left: 3px solid #26a69a; }
+        .signal-card.short { border-left: 3px solid #ef5350; }
+        .signal-card.expired { opacity: 0.5; }
+        .signal-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        .signal-setup-name {
+            font-size: 12px;
+            font-weight: 700;
+            color: #e0e3eb;
+        }
+        .signal-direction {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .signal-direction.long { background: rgba(38,166,154,0.2); color: #26a69a; }
+        .signal-direction.short { background: rgba(239,83,80,0.2); color: #ef5350; }
+        .signal-details {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 4px;
+            font-size: 10px;
+        }
+        .signal-detail { color: #758696; }
+        .signal-detail-val { color: #d1d4dc; font-weight: 600; }
+        .signal-time {
+            font-size: 9px;
+            color: #555;
+            margin-top: 6px;
+        }
+        .signal-progress {
+            height: 3px;
+            background: #1e222d;
+            border-radius: 2px;
+            margin-top: 6px;
+            overflow: hidden;
+        }
+        .signal-progress-bar {
+            height: 100%;
+            background: #26a69a;
+            transition: width 0.5s;
+        }
+        .signal-empty {
+            padding: 30px;
+            text-align: center;
+            color: #555;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
@@ -514,6 +611,17 @@
 
         <!-- Error Message -->
         <div class="error-message" id="error-message"></div>
+
+        <!-- Setup Signal Panel -->
+        <div class="signal-panel" id="signal-panel">
+            <div class="signal-panel-header">
+                <span class="signal-panel-title">Setup Signals</span>
+                <span class="signal-panel-count" id="signal-count">0 active</span>
+            </div>
+            <div class="signal-panel-body" id="signal-panel-body">
+                <div class="signal-empty">No active signals</div>
+            </div>
+        </div>
 
         <!-- Info Panel -->
         <div class="info-panel" id="info-panel">
@@ -1014,8 +1122,152 @@
                     // Keepalive - ignore
                     break;
 
+                case 'setup_signal':
+                    handleSetupSignal(msg);
+                    break;
+
                 default:
                     console.warn('Unknown message type:', msg.type);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // SETUP SIGNAL PANEL
+        // ═══════════════════════════════════════════════════════════
+        const activeSignals = new Map();  // signal_id -> signal data
+        const recentSignals = [];  // Last 10 resolved signals
+        const MAX_RECENT = 10;
+
+        function handleSetupSignal(msg) {
+            const sig = msg.signal;
+            const signalId = `${sig.setup_name}_${sig.bar_time}`;
+
+            activeSignals.set(signalId, {
+                ...sig,
+                symbol: msg.symbol,
+                startTime: Date.now(),
+                expiresAt: Date.now() + (sig.max_bars * 60 * 1000),  // max_bars in minutes
+            });
+
+            renderSignalPanel();
+            console.log(`Setup signal: ${sig.setup_name} ${sig.direction} @ ${sig.entry_price}`);
+        }
+
+        function checkExpiredSignals() {
+            const now = Date.now();
+            for (const [id, sig] of activeSignals.entries()) {
+                if (now >= sig.expiresAt) {
+                    // Move to recent history
+                    sig.expired = true;
+                    recentSignals.unshift(sig);
+                    if (recentSignals.length > MAX_RECENT) recentSignals.pop();
+                    activeSignals.delete(id);
+                }
+            }
+            renderSignalPanel();
+        }
+
+        // Check for expired signals every 10 seconds
+        setInterval(checkExpiredSignals, 10000);
+
+        function formatSignalTime(timestamp) {
+            const d = new Date(timestamp * 1000);
+            return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function renderSignalPanel() {
+            const body = document.getElementById('signal-panel-body');
+            const countEl = document.getElementById('signal-count');
+
+            const activeCount = activeSignals.size;
+            countEl.textContent = `${activeCount} active`;
+
+            if (activeCount === 0 && recentSignals.length === 0) {
+                body.innerHTML = '<div class="signal-empty">No active signals</div>';
+                return;
+            }
+
+            let html = '';
+
+            // Active signals first
+            for (const [id, sig] of activeSignals.entries()) {
+                const elapsed = Math.floor((Date.now() - sig.startTime) / 60000);
+                const remaining = sig.max_bars - elapsed;
+                const progress = Math.max(0, Math.min(100, (elapsed / sig.max_bars) * 100));
+                const dirClass = sig.direction.toLowerCase();
+
+                html += `
+                <div class="signal-card ${dirClass}">
+                    <div class="signal-card-header">
+                        <span class="signal-setup-name">${formatSetupName(sig.setup_name)}</span>
+                        <span class="signal-direction ${dirClass}">${sig.direction}</span>
+                    </div>
+                    <div class="signal-details">
+                        <div><span class="signal-detail">Entry</span><br><span class="signal-detail-val">${sig.entry_price.toFixed(2)}</span></div>
+                        <div><span class="signal-detail">Stop</span><br><span class="signal-detail-val">${sig.stop_price.toFixed(2)}</span></div>
+                        <div><span class="signal-detail">Target</span><br><span class="signal-detail-val">${sig.target_price.toFixed(2)}</span></div>
+                    </div>
+                    <div class="signal-progress">
+                        <div class="signal-progress-bar" style="width: ${progress}%"></div>
+                    </div>
+                    <div class="signal-time">${formatSignalTime(sig.bar_time)} · ${remaining}m remaining · ${(sig.confidence * 100).toFixed(0)}% conf</div>
+                </div>`;
+            }
+
+            // Recent (expired) signals
+            if (recentSignals.length > 0) {
+                html += '<div style="padding:8px 14px;color:#555;font-size:10px;border-bottom:1px solid #1e222d;background:#12151c;">Recent History</div>';
+                for (const sig of recentSignals.slice(0, 5)) {
+                    const dirClass = sig.direction.toLowerCase();
+                    html += `
+                    <div class="signal-card ${dirClass} expired">
+                        <div class="signal-card-header">
+                            <span class="signal-setup-name">${formatSetupName(sig.setup_name)}</span>
+                            <span class="signal-direction ${dirClass}">${sig.direction}</span>
+                        </div>
+                        <div class="signal-time">${formatSignalTime(sig.bar_time)} · Expired</div>
+                    </div>`;
+                }
+            }
+
+            body.innerHTML = html;
+        }
+
+        function formatSetupName(name) {
+            // Convert snake_case to Title Case
+            return name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        // Load active signals on page load
+        async function loadActiveSignals() {
+            try {
+                const resp = await fetch('/api/stats/setups/active');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    for (const sig of data.signals || []) {
+                        const signalId = `${sig.setup_name}_${sig.entry_time}`;
+                        const elapsed = Math.floor((Date.now() / 1000 - sig.entry_time) / 60);
+                        const remaining = sig.max_bars - elapsed;
+                        if (remaining > 0) {
+                            activeSignals.set(signalId, {
+                                setup_name: sig.setup_name,
+                                direction: sig.direction,
+                                entry_price: sig.entry_price,
+                                stop_price: sig.stop_price,
+                                target_price: sig.target_price,
+                                confidence: sig.confidence,
+                                max_bars: sig.max_bars,
+                                bar_time: sig.entry_time,
+                                symbol: sig.symbol,
+                                startTime: sig.entry_time * 1000,
+                                expiresAt: (sig.entry_time + sig.max_bars * 60) * 1000,
+                            });
+                        }
+                    }
+                    renderSignalPanel();
+                }
+            } catch (e) {
+                console.warn('Could not load active signals:', e);
             }
         }
 
@@ -2205,6 +2457,9 @@
 
             // Connect to WebSocket
             connect(currentSymbol);
+
+            // Load any existing active signals
+            loadActiveSignals();
 
             console.log('Application initialized');
         });

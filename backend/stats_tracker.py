@@ -1980,6 +1980,7 @@ class StatsManager:
             entry_time=sig.bar_time,
             entry_bar_index=0,
             max_bars=sig.max_bars,
+            setup_name=sig.setup_name,
             indicator_data=sig.indicator_snapshot,
         )
 

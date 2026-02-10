@@ -544,6 +544,22 @@ async def _start_background_streams():
                             signals = setup_manager.process_bar(bar_data)
                             for sig in signals:
                                 stats_manager.process_setup_signal(sym, sig)
+                                # Broadcast signal to frontend
+                                await connection_manager.broadcast(sym, {
+                                    'type': 'setup_signal',
+                                    'signal': {
+                                        'setup_name': sig.setup_name,
+                                        'direction': sig.direction,
+                                        'entry_price': sig.entry_price,
+                                        'stop_price': sig.stop_price,
+                                        'target_price': sig.target_price,
+                                        'confidence': sig.confidence,
+                                        'reason': sig.reason,
+                                        'max_bars': sig.max_bars,
+                                        'bar_time': sig.bar_time,
+                                    },
+                                    'symbol': sym
+                                }, immediate=True)
                         except Exception as e:
                             logger.error(f"[BG-{sym}] Setup detector error: {e}", exc_info=True)
 
@@ -942,6 +958,35 @@ async def get_setup_readiness():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.get("/api/stats/setups/active")
+async def get_active_signals():
+    """Get currently active (pending) setup signals."""
+    if not stats_manager:
+        return {"signals": []}
+    try:
+        active = []
+        for symbol, tracker in stats_manager.trade_trackers.items():
+            for sig_id, sig in tracker.active_bracket_signals.items():
+                if sig.outcome.value == "PENDING":
+                    active.append({
+                        "signal_id": sig_id,
+                        "symbol": symbol,
+                        "setup_name": sig.setup_name if hasattr(sig, 'setup_name') else "unknown",
+                        "direction": sig.direction.value,
+                        "entry_price": sig.bracket.entry_price,
+                        "stop_price": sig.bracket.stop_price,
+                        "target_price": sig.bracket.target_price,
+                        "entry_time": sig.entry_time,
+                        "max_bars": sig.max_bars,
+                        "bars_held": sig.entry_bar_index,
+                        "confidence": getattr(sig, 'confluence_score', 0),
+                    })
+        return {"signals": active}
+    except Exception as e:
+        logger.error(f"Error in /api/stats/setups/active: {e}", exc_info=True)
+        return {"signals": []}
+
+
 @app.get("/stats")
 async def stats_page():
     """Serve the stats dashboard page."""
@@ -1153,6 +1198,22 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str, timeframe: str =
                             signals = setup_manager.process_bar(bar_data)
                             for sig in signals:
                                 stats_manager.process_setup_signal(symbol, sig)
+                                # Broadcast signal to frontend
+                                await connection_manager.broadcast(symbol, {
+                                    'type': 'setup_signal',
+                                    'signal': {
+                                        'setup_name': sig.setup_name,
+                                        'direction': sig.direction,
+                                        'entry_price': sig.entry_price,
+                                        'stop_price': sig.stop_price,
+                                        'target_price': sig.target_price,
+                                        'confidence': sig.confidence,
+                                        'reason': sig.reason,
+                                        'max_bars': sig.max_bars,
+                                        'bar_time': sig.bar_time,
+                                    },
+                                    'symbol': symbol
+                                }, immediate=True)
                         except Exception as e:
                             logger.error(f"Error in setup detectors: {e}", exc_info=True)
 
