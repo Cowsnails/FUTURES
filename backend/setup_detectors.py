@@ -1091,11 +1091,15 @@ class ONHLSweepDetector(SetupDetector):
         if bar.high > ind.onh:
             wick = bar.high - ind.onh
             rejection = ind.onh - bar.close
-        else:
+        elif bar.low < ind.onl:
             wick = ind.onl - bar.low
             rejection = bar.close - ind.onl
-        wick_score = min(wick / (0.5 * ind.atr14), 1.0)
-        rej_score = min(rejection / (0.3 * ind.atr14), 1.0)
+        else:
+            # Price between ONH and ONL, no sweep
+            return 0.0
+        # Clamp to 0-1 range
+        wick_score = max(0.0, min(wick / (0.5 * ind.atr14), 1.0))
+        rej_score = max(0.0, min(rejection / (0.3 * ind.atr14), 1.0))
         return min(1.0, wick_score * 0.4 + rej_score * 0.4 + 0.2)
 
     def score_volume(self, bar: BarInput, ind: IndicatorState,
@@ -2301,13 +2305,19 @@ class LiquiditySweepDetector(SetupDetector):
         if bar.low < swing_low:
             sweep_depth = (swing_low - bar.low) / ind.atr14
             rejection = (bar.close - swing_low) / ind.atr14
-        else:
+        elif bar.high > swing_high:
             sweep_depth = (bar.high - swing_high) / ind.atr14
             rejection = (swing_high - bar.close) / ind.atr14
+        else:
+            # No sweep occurred
+            return 0.0
         body = abs(bar.close - bar.open)
         full = bar.high - bar.low
         br = body / full if full > 0 else 0
-        return min(1.0, min(sweep_depth / 0.3, 1.0) * 0.3 + min(rejection / 0.2, 1.0) * 0.3 + br * 0.2 + 0.1)
+        # Clamp all scores to 0-1
+        sweep_score = max(0.0, min(sweep_depth / 0.3, 1.0))
+        rej_score = max(0.0, min(rejection / 0.2, 1.0))
+        return min(1.0, sweep_score * 0.3 + rej_score * 0.3 + br * 0.2 + 0.1)
 
     def score_volume(self, bar: BarInput, ind: IndicatorState,
                      bars: List[BarInput]) -> float:
