@@ -987,6 +987,20 @@ async def get_active_signals():
         return {"signals": []}
 
 
+@app.delete("/api/stats/setups/{setup_name}/history")
+async def delete_setup_history(setup_name: str):
+    """Delete all trade history for a specific setup."""
+    if not stats_manager:
+        return JSONResponse(status_code=503, content={"error": "Stats manager not initialized"})
+    try:
+        deleted_count = stats_manager.db.delete_setup_history(setup_name)
+        logger.info(f"Deleted {deleted_count} trades for setup: {setup_name}")
+        return {"success": True, "setup_name": setup_name, "deleted_count": deleted_count}
+    except Exception as e:
+        logger.error(f"Error deleting setup history for {setup_name}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/stats")
 async def stats_page():
     """Serve the stats dashboard page."""
