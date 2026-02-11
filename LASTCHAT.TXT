@@ -1,0 +1,407 @@
+can you add this to my system and make sure its like genuinely added internally to the system to be connected to the rest of it?: # TastyTrade API for live futures delta streaming
+
+The TastyTrade DXLink streaming API can deliver tick-by-tick futures trade data with exchange-native aggressor side flags — everything needed to calculate volume delta, cumulative delta, and footprint charts. The critical event is TimeAndSale, which provides lossless trade prints with CME's aggressorSide field (BUY/SELL/UNDEFINED), embedded bidPrice/askPrice at time of trade, and nanosecond-precision timestamps. The data flows through dxFeed's infrastructure and uses the Stream delivery contract, meaning every trade is delivered without conflation. However, a significant caveat remains: the /api-quote-tokens endpoint — the only TOS-compliant path for API users — has historically had limited instrument coverage, and while futures support has expanded through 2025, you should verify that TimeAndSale events actually fire for your specific futures symbols before building production infrastructure around it.
+
+OAuth2 authentication replaced session tokens in December 2025
+Session-token authentication was discontinued on December 1, 2025. All API access now requires OAuth2 with a client secret and refresh token. The setup is straightforward and only needs to be done once, because refresh tokens never expire.
+
+Setup steps:
+
+Navigate to https://my.tastytrade.com/app.html#/manage/api-access/oauth-applications
+Create a new OAuth application, check all scopes (read, trade), and add a redirect URL (e.g., http://localhost:8000)
+Save the client ID and client secret
+Generate a refresh token: go to OAuth Applications → Manage → Create Grant ("New Personal OAuth Grant") — this produces a refresh token directly, no authorization code flow needed
+Store client_secret and refresh_token securely — these are your permanent credentials
+Python SDK authentication (v11.1.0):
+
+from tastytrade import Session
+
+session = Session('your_client_secret', 'your_refresh_token')
+
+# For sandbox/cert environment:
+session = Session('your_client_secret', 'your_refresh_token', is_test=True)
+
+# Access tokens last ~15 minutes; refresh manually if needed:
+from tastytrade.utils import now_in_new_york
+if now_in_new_york() > session.session_expiration:
+    session.refresh()
+
+The production API host is https://api.tastyworks.com. After authentication, call GET /api-quote-tokens to obtain a DXLink streaming token and WebSocket URL (wss://tasty-openapi-ws.dxfeed.com/realtime). The Python SDK handles this internally when you create a DXLinkStreamer.
+
+TimeAndSale is the event that unlocks volume delta
+The DXLink protocol provides several event types for futures, but for volume delta calculation, TimeAndSale is the only event that matters. It uses the Stream delivery contract (lossless, no conflation) and carries the exchange-native aggressor flag from CME Globex.
+
+Complete TimeAndSale field list for futures
+Field	Type	Delta relevance
+eventSymbol	str	Symbol identifier
+time	int	Millisecond timestamp
+timeNanoPart	int	Sub-millisecond precision
+sequence	int	Distinguishes same-timestamp events
+price	Decimal	Trade price
+size	int	Trade size (contracts)
+aggressorSide	str	"BUY", "SELL", or "UNDEFINED" — the key field
+bidPrice	Decimal	NBBO bid at time of trade (quote-rule fallback)
+askPrice	Decimal	NBBO ask at time of trade (quote-rule fallback)
+exchangeCode	str	Exchange code
+exchangeSaleConditions	str	CME sale condition codes
+validTick	bool	Whether valid for charting
+type	str	"NEW", "CORRECTION", or "CANCEL"
+spreadLeg	bool	Whether this is a spread leg trade
+extendedTradingHours	bool	ETH session flag
+tradeThroughExempt	str	Trade-through exemption
+buyer / seller	None	Always None through TastyTrade
+The aggressorSide field comes directly from CME Globex MDP 3.0 tag 5797 (AggressorSide). This is the exchange's own determination of which side initiated the trade — not an inference. It is the gold standard for volume delta on CME products. When aggressorSide is UNDEFINED (which occurs at market open, post-halt, and for implied-order-only fills), fall back to the quote rule using the embedded bidPrice/askPrice fields, which are already synchronized by dxFeed to the moment of the trade.
+
+How the other event types complement TimeAndSale
+Event	Delivery	Key fields for futures	Use case
+Quote	Ticker (conflated)	bidPrice, bidSize, askPrice, askSize, bidTime, askTime	Real-time BBO display
+Trade	Ticker (conflated)	price, size, tickDirection, dayVolume, dayTurnover, change	Session statistics, VWAP (dayTurnover/dayVolume)
+Summary	Ticker	dayOpen, dayHigh, dayLow, dayClose, prevDayClose, openInterest	Session OHLC, OI tracking
+Profile	Ticker	description, tradingStatus, highLimitPrice, lowLimitPrice	Instrument metadata, limit levels
+Candle	History	open, high, low, close, volume, vwap, count, bidVolume, askVolume	Pre-aggregated OHLCV with bid/ask volume split
+Greeks	Ticker	N/A for futures contracts	Options only — not applicable
+Order (MBP/DOM)	History	price, size, orderCount, side	Not available through API token
+The Candle event deserves special attention: it includes bidVolume and askVolume fields, which represent pre-aggregated buy-side and sell-side volume per candle period. This gives you delta-per-bar without processing individual TimeAndSale ticks, though at lower granularity than building it yourself from tick data.
+
+Futures symbol format requires the DXLink streamer symbol
+TastyTrade and DXLink use different symbologies. The TastyTrade REST API uses short symbols like /ESH6, but DXLink streaming requires the full streamer format with two-digit year and exchange namespace.
+
+Instrument	TastyTrade symbol	DXLink streamer symbol
+E-mini S&P 500 Mar 2026	/ESH6	/ESH26:XCME
+Micro E-mini S&P Mar 2026	/MESH6	/MESH26:XCME
+E-mini Nasdaq Mar 2026	/NQH6	/NQH26:XCME
+Micro E-mini Nasdaq Mar 2026	/MNQH6	/MNQH26:XCME
+Gold Jun 2026	/GCM6	/GCM26:XCME
+Micro Gold Jun 2026	/MGCM6	/MGCM26:XCME
+The formula is: /{root}{monthCode}{2-digit-year}:{exchange}. Month codes follow the standard: F=Jan, G=Feb, H=Mar, J=Apr, K=May, M=Jun, N=Jul, Q=Aug, U=Sep, V=Oct, X=Nov, Z=Dec. CME Group products (CME, CBOT, NYMEX, COMEX) all use XCME.
+
+Never hardcode streamer symbols. Instead, call the REST API and use the streamer-symbol field from the response:
+
+from tastytrade.instruments import Future
+
+# Get the exact streamer symbol from the API
+futures = Future.get_futures(session, product_codes=['ES'])
+for f in futures:
+    print(f.symbol, f.streamer_symbol)
+    # /ESH6  →  /ESH26:XCME
+
+For candle subscriptions, append the period in braces: /ESH26:XCME{=5m} for 5-minute candles, /ESH26:XCME{=1m} for 1-minute candles. Available periods include 1m, 5m, 15m, 1h, 1d, 1w, 1mo, and even tick-based like 133t.
+
+The api-quote-tokens limitation is the critical risk factor
+TastyTrade exposes two streaming token endpoints, and this distinction is the single most important architectural constraint for API users:
+
+GET /api-quote-tokens — The only TOS-compliant endpoint for external developers. Returns a token for wss://tasty-openapi-ws.dxfeed.com/realtime. Initially supported equities only. Has been progressively expanded.
+GET /quote-streamer-tokens — Used internally by TastyTrade's own web/desktop apps. Provides unrestricted access to all instruments and event types. Using this endpoint as an API user violates dxFeed's Terms of Service and will result in being flagged and placed on delayed quotes.
+The restriction exists because of dxFeed's data licensing agreements — TastyTrade cannot control how API users redistribute quote data, so dxFeed requires a restricted token tier for third-party distribution.
+
+Current status (2025–2026): The official tastytrade-api-js SDK README now shows working examples for futures option quotes via /api-quote-tokens, and Issue #7 (which documented the equities-only limitation) has been closed. This strongly indicates that Quote and Trade events for futures now work through the API token. However, there is no definitive public documentation confirming that every event type — especially TimeAndSale — works for futures through this endpoint. The practical approach is to test it: subscribe to TimeAndSale for /ESH26:XCME using the API token and verify data flows.
+
+The Python SDK exposes this choice through the dxfeed_tos_compliant parameter (defaulting to True, which uses /api-quote-tokens). Setting it to False uses the internal endpoint — functional but risky.
+
+Building volume delta from TastyTrade tick data
+Here is a complete, working approach to calculating volume delta from TastyTrade's DXLink stream. The implementation uses a three-tier aggressor classification: direct exchange flag first, quote rule second, tick rule as last resort.
+
+import asyncio
+from collections import defaultdict
+from decimal import Decimal
+from tastytrade import Session, DXLinkStreamer
+from tastytrade.dxfeed import TimeAndSale, Quote, Trade
+from tastytrade.instruments import Future
+
+
+async def stream_volume_delta():
+    # 1. Authenticate via OAuth2
+    session = Session('your_client_secret', 'your_refresh_token')
+
+    # 2. Look up the streamer symbol
+    futures = Future.get_futures(session, product_codes=['ES'])
+    # Find the active front-month contract
+    active = [f for f in futures if f.active_month]
+    es_streamer = active[0].streamer_symbol  # e.g., "/ESH26:XCME"
+    print(f"Subscribing to: {es_streamer}")
+
+    # 3. Connect to DXLink and subscribe
+    async with DXLinkStreamer(session) as streamer:
+        await streamer.subscribe(TimeAndSale, [es_streamer])
+        await streamer.subscribe(Quote, [es_streamer])  # optional: live BBO
+        await streamer.subscribe(Trade, [es_streamer])   # optional: session stats
+
+        # 4. Process tick-by-tick trades
+        cumulative_delta = 0
+        bar_buy_vol = 0
+        bar_sell_vol = 0
+        prev_price = None
+        prev_side = None
+        trade_count = 0
+
+        async for tns in streamer.listen(TimeAndSale):
+            # Skip corrections, cancellations, and invalid ticks
+            if tns.type != "NEW" or not tns.validTick:
+                continue
+
+            # Optionally filter out spread legs
+            if tns.spreadLeg:
+                continue
+
+            # Classify aggressor side (three-tier)
+            side = classify_aggressor(tns, prev_price, prev_side)
+
+            if side == "buy":
+                bar_buy_vol += tns.size
+            else:
+                bar_sell_vol += tns.size
+
+            delta = bar_buy_vol - bar_sell_vol
+            cumulative_delta += (tns.size if side == "buy" else -tns.size)
+            trade_count += 1
+
+            prev_price = tns.price
+            prev_side = side
+
+            if trade_count % 100 == 0:
+                print(f"Trade #{trade_count}: price={tns.price} "
+                      f"size={tns.size} side={side} "
+                      f"CVD={cumulative_delta} bar_delta={delta}")
+
+
+def classify_aggressor(tns, prev_price, prev_side):
+    """Three-tier aggressor classification for CME futures."""
+    # Tier 1: Direct exchange flag (CME MDP 3.0 tag 5797)
+    if tns.aggressorSide == "BUY":
+        return "buy"
+    elif tns.aggressorSide == "SELL":
+        return "sell"
+
+    # Tier 2: Quote rule using embedded NBBO
+    if tns.bidPrice and tns.askPrice and tns.bidPrice > 0 and tns.askPrice > 0:
+        if tns.price >= tns.askPrice:
+            return "buy"
+        elif tns.price <= tns.bidPrice:
+            return "sell"
+        else:
+            mid = (tns.bidPrice + tns.askPrice) / 2
+            return "buy" if tns.price >= mid else "sell"
+
+    # Tier 3: Tick rule (least accurate)
+    if prev_price is not None:
+        if tns.price > prev_price:
+            return "buy"
+        elif tns.price < prev_price:
+            return "sell"
+
+    return prev_side or "buy"
+
+
+asyncio.run(stream_volume_delta())
+
+Key implementation notes for production use:
+
+Filter validTick == True to exclude non-trade events and invalid prints
+Filter type == "NEW" to skip corrections and cancellations. For maximum accuracy, also process CORRECTION and CANCEL events to adjust previously recorded delta
+Handle spreadLeg == True carefully — spread leg fills often have aggressorSide == UNDEFINED and may distort delta. Consider filtering them out or tracking separately
+Reset cumulative delta at the session boundary (5:00 PM CT for the next CME session start, or 8:30 AM CT if tracking day session only)
+The bidPrice/askPrice fields in TimeAndSale are already synchronized by dxFeed to the prevailing quote at trade time — do not subscribe to Quote separately for the quote-rule classification
+Historical data is available through candles, not tick replay
+TastyTrade does not offer a REST endpoint for historical trade ticks or time-and-sales history. Historical data access works through the Candle event with a fromTime parameter, which retrieves historical OHLCV bars and then transitions to live updates.
+
+# Subscribe to historical + live 5-minute candles
+await streamer.subscribe_candle(
+    [f"{es_streamer}{{=5m}}"],
+    from_time=datetime(2026, 2, 9)  # start time
+)
+candle = await streamer.get_event(Candle)
+# candle.open, candle.high, candle.low, candle.close
+# candle.volume, candle.vwap, candle.bidVolume, candle.askVolume
+
+The Candle's bidVolume and askVolume fields provide pre-computed delta per bar: delta = askVolume - bidVolume. This is useful for backtesting volume delta strategies without tick replay, though it lacks the price-level granularity needed for footprint charts.
+
+For true historical tick data, dxFeed maintains 500+ TB of tick-level archives going back to 2009, but this requires a direct dxFeed subscription separate from TastyTrade. Through the TastyTrade API, your streaming is effectively real-time with historical candle backfill.
+
+What the API cannot provide
+Three notable gaps exist in TastyTrade's API data for futures order flow analysis:
+
+Market depth (MBP/DOM) is not available through the API token. dxFeed supports up to 10 levels of price-aggregated depth for futures through its Order event type and a dedicated DOM service, but this requires premium licensing. The TastyTrade /api-quote-tokens does not expose Order events. The user's observation about "MBP-10 missing" is correct — this data exists in dxFeed's infrastructure but is not accessible through TastyTrade's API tier.
+
+Market-by-Order (MBO) data is absent entirely. Even direct dxFeed subscriptions provide only Market-by-Price (aggregate volume at each price level), not individual order queue positions. For queue-position analysis or iceberg detection, Rithmic remains the standard for CME futures.
+
+The api-quote-tokens coverage gap may still affect specific event types. While Quote and Trade events for futures appear to work as of late 2025 (based on official SDK examples), the completeness of TimeAndSale delivery for futures through this endpoint has not been explicitly confirmed in public documentation. If TimeAndSale events don't fire for futures via the API token, the fallback options are: (a) use the Trade event's tickDirection field for a tick-rule-only delta (least accurate), (b) simultaneously subscribe to Quote and Trade and apply the quote rule manually (timing mismatch risk), or (c) contact api.support@tastytrade.com to request expanded event type access for your account.
+
+Conclusion
+TastyTrade's DXLink streaming stack, powered by dxFeed, provides production-quality data for futures volume delta calculation. The TimeAndSale event delivers every trade losslessly with CME's native aggressor flag, embedded bid/ask for fallback classification, and nanosecond timestamps — the same data pipeline that professional order-flow platforms like ATAS and Bookmap use. The Python SDK (pip install tastytrade, v11.1.0) wraps this cleanly with async streaming and Pydantic models.
+
+The practical risk is the /api-quote-tokens endpoint's coverage scope. The recommended first step is a simple verification test: authenticate via OAuth2, subscribe to TimeAndSale for an active futures symbol like /ESH26:XCME, and confirm that events arrive with populated aggressorSide fields. If they do, you have a zero-cost, exchange-native order flow data source. If they don't, contact TastyTrade API support — the trend has been toward expanding coverage, and individual accounts may be granted broader access. The dxfeed_tos_compliant=False escape hatch exists in the SDK but carries the risk of delayed-quote enforcement and should be treated as a temporary diagnostic tool, not a production solution.
+
+Show less
+
+
+Let me start by understanding the existing codebase structure so I can integrate this properly.
+
+
+Explored FUTURES codebase structure and architecture thoroughly
+Show more
+Show more
+Show more
+Show more
+Show more
+Show more
+Show more
+Show more
+Show more
+Show more
+
+Now let me read the key files to understand the exact implementation patterns.
+
+
+Read IB Gateway configuration and service files for futures trading application
+
+Let me read more key files to understand the integration points.
+
+
+Reviewed FastAPI WebSocket backend architecture and technical indicator system codebase
+
+Now I have a comprehensive understanding of the codebase. Let me plan this integration and start building.
+
+
+Updated todo list for TastyTrade backend implementation tasks
+
+Now let me create all the core modules. I'll start with the TastyTrade service, streaming, and volume delta engine.
+
+
+Updated task tracking with completed TastyTrade backend modules
+
+Now let me update the config, requirements, and indicator registry.
+
+
+Updated todo list tracking backend service modules and streaming setup
+
+Now for the most critical part - wiring everything into app.py. I need to add the TastyTrade imports, global instances, lifespan initialization, API endpoints, and WebSocket integration.
+
+
+Updated import statements in backend app.py file
+
+Now add the global instances for TastyTrade:
+
+
+Refactored background stream task tracking in app.py
+
+Now add the TastyTrade initialization in the lifespan, after the IB setup and before yield:
+
+
+Added TastyTrade volume delta streaming initialization to application startup
+
+Now add TastyTrade shutdown to the shutdown section:
+
+
+Updated shutdown logic in Flask application backend
+
+Now add the TastyTrade API endpoints. Let me find the right place to add them, after the existing stats endpoints and before the data grabber endpoints:
+
+
+Added TastyTrade connection status endpoint to backend
+
+Now add TastyTrade to the health check and statistics endpoints:
+
+
+Updated health check endpoint response format in app.py
+
+Now update the statistics endpoint to include TastyTrade data:
+
+
+Updated health status endpoint in Flask app
+
+Now update the readiness check to include TastyTrade:
+
+
+Fixed indentation in app.py health check logic
+
+Now update the metrics endpoint to include TastyTrade metrics:
+
+
+Updated todo list tracking TastyTrade service implementation progress
+
+Let me verify the app.py still has proper imports and that the Response import is available (needed for metrics endpoint):
+
+
+Searched for FastAPI response imports in app.py
+
+The Response class is used in the metrics endpoint but isn't imported. Let me check the original code to see if it was imported elsewhere:
+
+
+Searched backend for Response usage patterns in app.py
+Show more
+Show more
+
+The original code at line 1704 uses Response( - this was pre-existing in the original file. The Response import must exist. Let me check if it's imported from fastapi directly or from starlette:
+
+
+Searched for FastAPI/Starlette Response imports in app.py
+
+The Response class is used but not explicitly imported. Since FileResponse and JSONResponse are subclasses of Response, and FastAPI automatically makes Response available through starlette, this was likely working through an implicit import. But to be safe, let me add it:
+
+
+Added Response import to FastAPI responses in app.py
+
+Now let me do a quick syntax check to make sure everything parses correctly:
+
+
+Verified syntax of seven Python backend files
+Show more
+
+All files parse cleanly. Now let me commit and push.
+
+
+Checked git status and reviewed recent changes for TastyTrade API integration
+Show more
+Show more
+Show more
+
+Everything looks good. Let me stage and commit:
+
+
+Updated todo list tracking TastyTrade service and streaming modules
+Show more
+Show more
+
+All done. Here's a summary of everything that was integrated:
+
+What was added
+4 new modules (genuinely wired into the system):
+backend/tastytrade_service.py - OAuth2 session management
+
+Handles authentication with client secret + refresh token (which never expire)
+Auto-refreshes access tokens (~15 min expiry)
+Resolves your internal symbols (MNQ, MES, MGC) to DXLink streamer symbols (e.g., /MNQH26:XCME) via the REST API
+Connection state machine mirroring the pattern from ib_service.py
+backend/tastytrade_streaming.py - DXLink TimeAndSale streaming
+
+Connects to dxFeed via the tastytrade SDK's DXLinkStreamer
+Processes every TimeAndSale event (lossless Stream delivery, no conflation)
+Three-tier aggressor classification: exchange flag (CME MDP 3.0 tag 5797) -> quote rule (embedded bid/ask) -> tick rule (fallback)
+Filters invalid ticks, corrections, cancellations, and optionally spread legs
+Per-symbol callback dispatch to the delta engine
+backend/volume_delta.py - Volume delta calculation engine
+
+VolumeDeltaEngine: Per-bar delta (buy_vol - sell_vol), cumulative delta (CVD), and per-price-level footprint data
+SymbolDeltaState: Tracks running state per symbol with CVD high/low watermarks
+SessionResetScheduler: Auto-resets CVD at CME session boundaries (6:00 PM ET)
+Archives completed delta bars for historical retrieval
+backend/indicators/volume_delta.py - 3 new indicators registered in the indicator system
+
+VolumeDelta: Per-bar histogram (green = net buying, red = net selling)
+CumulativeDelta: Session CVD line for divergence analysis
+DeltaDivergence: Automatic price/delta divergence detection
+Integrated into existing system:
+app.py: Full lifecycle wiring - TastyTrade initializes at startup (after IB), streams alongside IB, shuts down cleanly. Delta updates broadcast to WebSocket clients as delta_update messages. Added to health checks, readiness, statistics, and Prometheus metrics.
+6 new API endpoints: /api/tastytrade/status, /api/delta/{symbol}, /api/delta/{symbol}/history, /api/delta/{symbol}/footprint, /api/delta/{symbol}/reset
+indicators/manager.py: Delta indicators registered as volume_delta, cvd, delta_divergence - usable via the same indicator API as SMA/RSI/etc.
+config.yaml: New tastytrade section with credentials, symbol list, and settings (disabled by default)
+requirements.txt: Added tastytrade>=11.1.0
+To activate:
+pip install tastytrade
+Set up OAuth2 credentials at TastyTrade's developer portal
+In config.yaml, set tastytrade.enabled: true and fill in client_secret and refresh_token
+Restart the app - delta streaming starts automatically alongside IB
+can we replace all of the ibkr data like historical and live with tastytrades?
+
+
+Reticulating
