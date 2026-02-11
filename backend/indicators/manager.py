@@ -11,6 +11,7 @@ import pandas as pd
 from .base import Indicator
 from .moving_averages import SMA, EMA, WMA, VWAP, BollingerBands
 from .oscillators import RSI, MACD, Stochastic, CCI, ROC
+from .volume_delta import VolumeDelta, CumulativeDelta, DeltaDivergence
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,13 @@ INDICATOR_REGISTRY: Dict[str, Type[Indicator]] = {
     'stochastic': Stochastic,
     'cci': CCI,
     'roc': ROC,
+
+    # Volume Delta (TastyTrade order flow)
+    'volume_delta': VolumeDelta,
+    'delta': VolumeDelta,
+    'cvd': CumulativeDelta,
+    'cumulative_delta': CumulativeDelta,
+    'delta_divergence': DeltaDivergence,
 }
 
 

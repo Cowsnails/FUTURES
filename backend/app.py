@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Set, Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import yaml
 from pathlib import Path
@@ -98,6 +98,9 @@ from .setup_detectors import SetupManager
 from .data_grabber import (
     get_grabber_status, start_grab, stop_grab, update_all_day_counts
 )
+from .tastytrade_service import TastyTradeService
+from .tastytrade_streaming import TastyTradeStreamer
+from .volume_delta import VolumeDeltaEngine, SessionResetScheduler
 
 # Configure logging
 logging.basicConfig(
@@ -132,6 +135,12 @@ setup_manager: Optional[SetupManager] = None
 background_stream_task: Optional[asyncio.Task] = None
 # Track which symbols have background streams running
 _background_streams_active: set = set()
+
+# TastyTrade / Volume Delta instances
+tt_service: Optional[TastyTradeService] = None
+tt_streamer: Optional[TastyTradeStreamer] = None
+delta_engine: Optional[VolumeDeltaEngine] = None
+session_reset_scheduler: Optional[SessionResetScheduler] = None
 
 
 class ConnectionManager:
@@ -665,10 +674,93 @@ async def lifespan(app: FastAPI):
 
         logger.info("Application started successfully")
 
+    # Initialize TastyTrade volume delta streaming (runs alongside IB)
+    global tt_service, tt_streamer, delta_engine, session_reset_scheduler
+    tt_config = config.get('tastytrade', {})
+    tt_enabled = tt_config.get('enabled', False)
+
+    if tt_enabled:
+        logger.info("Initializing TastyTrade volume delta streaming...")
+
+        tt_service = TastyTradeService(
+            client_secret=tt_config.get('client_secret', ''),
+            refresh_token=tt_config.get('refresh_token', ''),
+            is_sandbox=tt_config.get('is_sandbox', False),
+            enabled=True,
+        )
+
+        tt_authenticated = await tt_service.connect()
+
+        if tt_authenticated:
+            # Create volume delta engine
+            delta_engine = VolumeDeltaEngine(bar_size_seconds=60)
+
+            # Create streamer
+            tt_streamer = TastyTradeStreamer(tt_service)
+
+            # Register tick callbacks to feed the delta engine
+            delta_symbols = tt_config.get('delta_symbols', ['MNQ', 'MES', 'MGC'])
+            for symbol in delta_symbols:
+                tt_streamer.register_tick_callback(symbol, delta_engine.process_tick)
+
+                # Register delta callback to broadcast to WebSocket clients
+                async def _make_delta_broadcast(sym):
+                    async def _on_delta_update(update):
+                        await connection_manager.broadcast(sym, {
+                            'type': 'delta_update',
+                            'symbol': sym,
+                            'data': {
+                                'bar_time': update.get('bar_time', 0),
+                                'buy_volume': update.get('buy_volume', 0),
+                                'sell_volume': update.get('sell_volume', 0),
+                                'delta': update.get('delta', 0),
+                                'cumulative_delta': update.get('cumulative_delta', 0),
+                                'trade_count': update.get('trade_count', 0),
+                                'last_price': update.get('last_price', 0),
+                                'last_side': update.get('last_side', ''),
+                            }
+                        }, immediate=True)
+                    return _on_delta_update
+
+                delta_cb = await _make_delta_broadcast(symbol)
+                delta_engine.register_delta_callback(symbol, delta_cb)
+
+            # Start streaming
+            await tt_streamer.start(delta_symbols)
+
+            # Start session reset scheduler (resets CVD at CME session boundaries)
+            session_reset_scheduler = SessionResetScheduler(delta_engine)
+            await session_reset_scheduler.start()
+
+            logger.info(
+                f"TastyTrade volume delta streaming active for: "
+                f"{', '.join(delta_symbols)}"
+            )
+        else:
+            logger.warning(
+                "TastyTrade authentication failed - volume delta not available. "
+                "Check credentials in config.yaml"
+            )
+    else:
+        logger.info(
+            "TastyTrade integration disabled. "
+            "Set tastytrade.enabled=true in config.yaml to enable volume delta."
+        )
+
     yield
 
     # Shutdown
     logger.info("Shutting down application...")
+
+    # Shutdown TastyTrade components
+    if session_reset_scheduler:
+        await session_reset_scheduler.stop()
+
+    if tt_streamer:
+        await tt_streamer.stop()
+
+    if tt_service:
+        tt_service.disconnect()
 
     if background_stream_task:
         background_stream_task.cancel()
@@ -774,7 +866,8 @@ async def health_check():
             "realtime_streams": (
                 len(realtime_manager.streamers) if realtime_manager else 0
             ),
-            "cache_info": cache.get_cache_size() if cache else {}
+            "cache_info": cache.get_cache_size() if cache else {},
+            "tastytrade": tt_service.get_health_status() if tt_service else {"enabled": False},
         }
     )
 
@@ -1367,7 +1460,12 @@ async def get_statistics():
         "active_connections": {
             symbol: len(connections)
             for symbol, connections in connection_manager.active_connections.items()
-        }
+        },
+        "tastytrade": {
+            "service": tt_service.get_health_status() if tt_service else {"enabled": False},
+            "streaming": tt_streamer.get_statistics() if tt_streamer else {"streaming": False},
+            "delta": delta_engine.get_all_states() if delta_engine else {},
+        },
     }
 
     return stats
@@ -1489,7 +1587,11 @@ async def readiness_check():
     if indicator_manager:
         checks["indicators"] = True
 
-    all_ready = all(checks.values())
+    # TastyTrade is optional - report status but don't block readiness
+    if tt_service and tt_service.enabled:
+        checks["tastytrade"] = tt_service.is_authenticated()
+
+    all_ready = checks["ib_gateway"] and checks["cache"] and checks["indicators"]
     status_code = 200 if all_ready else 503
 
     return JSONResponse(
@@ -1582,6 +1684,23 @@ async def metrics():
         metrics_text.append("# TYPE indicators_active_total gauge")
         metrics_text.append(f"indicators_active_total {indicator_count}")
 
+    # TastyTrade streaming metrics
+    if tt_streamer:
+        tt_stats = tt_streamer.get_statistics()
+        metrics_text.append("# HELP tastytrade_ticks_total Total ticks received from TastyTrade")
+        metrics_text.append("# TYPE tastytrade_ticks_total counter")
+        metrics_text.append(f"tastytrade_ticks_total {tt_stats.get('ticks_received', 0)}")
+
+        metrics_text.append("# HELP tastytrade_streaming TastyTrade streaming status")
+        metrics_text.append("# TYPE tastytrade_streaming gauge")
+        metrics_text.append(f"tastytrade_streaming {1 if tt_stats.get('streaming') else 0}")
+
+        metrics_text.append("# HELP tastytrade_classification Classification breakdown")
+        metrics_text.append("# TYPE tastytrade_classification counter")
+        metrics_text.append(f'tastytrade_classification{{method="exchange"}} {tt_stats.get("ticks_classified_exchange", 0)}')
+        metrics_text.append(f'tastytrade_classification{{method="quote"}} {tt_stats.get("ticks_classified_quote", 0)}')
+        metrics_text.append(f'tastytrade_classification{{method="tick"}} {tt_stats.get("ticks_classified_tick", 0)}')
+
     return Response(
         content="\n".join(metrics_text) + "\n",
         media_type="text/plain; version=0.0.4"
@@ -1600,6 +1719,109 @@ async def rate_limit_info():
         },
         "note": "Rate limits are per IP address"
     }
+
+
+# --- TastyTrade / Volume Delta Endpoints ---
+
+@app.get("/api/tastytrade/status")
+async def tastytrade_status():
+    """Get TastyTrade connection and streaming status."""
+    result = {
+        'enabled': tt_service is not None and tt_service.enabled,
+        'service': tt_service.get_health_status() if tt_service else {'enabled': False},
+        'streaming': tt_streamer.get_statistics() if tt_streamer else {'streaming': False},
+        'delta_engine': delta_engine.get_all_states() if delta_engine else {},
+    }
+    return result
+
+
+@app.get("/api/delta/{symbol}")
+async def get_volume_delta(symbol: str):
+    """Get current volume delta state for a symbol."""
+    if not delta_engine:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Volume delta not available",
+                "reason": "TastyTrade integration not enabled. Set tastytrade.enabled=true in config.yaml"
+            }
+        )
+
+    state = delta_engine.get_current_state(symbol)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No delta data for {symbol}"}
+        )
+    return state
+
+
+@app.get("/api/delta/{symbol}/history")
+async def get_delta_history(symbol: str, limit: int = 500):
+    """Get historical volume delta bars for a symbol."""
+    if not delta_engine:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Volume delta not available"}
+        )
+
+    history = delta_engine.get_delta_history(symbol, limit=limit)
+    return {
+        "symbol": symbol,
+        "bars": history,
+        "count": len(history),
+    }
+
+
+@app.get("/api/delta/{symbol}/footprint")
+async def get_footprint_data(symbol: str):
+    """
+    Get current bar's footprint (price-level delta) data.
+
+    Returns buy/sell volume at each traded price level for the current bar.
+    """
+    if not delta_engine:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Volume delta not available"}
+        )
+
+    state = delta_engine._state.get(symbol)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No delta data for {symbol}"}
+        )
+
+    footprint = {}
+    for price, vols in sorted(state.price_levels.items()):
+        total = vols['buy'] + vols['sell']
+        if total > 0:
+            footprint[str(price)] = {
+                'buy': vols['buy'],
+                'sell': vols['sell'],
+                'delta': vols['buy'] - vols['sell'],
+                'total': total,
+            }
+
+    return {
+        "symbol": symbol,
+        "bar_time": state.current_bar_time,
+        "footprint": footprint,
+    }
+
+
+@app.post("/api/delta/{symbol}/reset")
+async def reset_delta_session(symbol: str):
+    """Manually reset CVD for a symbol (useful for session boundary testing)."""
+    if not delta_engine:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Volume delta not available"}
+        )
+
+    delta_engine.reset_session(symbol)
+    return {"success": True, "symbol": symbol, "message": "CVD reset"}
 
 
 # --- Data Grabber Endpoints ---
