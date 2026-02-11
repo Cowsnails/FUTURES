@@ -61,6 +61,21 @@ performance:
   max_historical_requests_per_minute: 50
   websocket_max_updates_per_second: 20
 
+tastytrade:
+  enabled: false  # Set to true after configuring credentials
+  client_secret: ""    # OAuth2 client secret from TastyTrade developer portal
+  refresh_token: ""    # OAuth2 refresh token (never expires)
+  is_sandbox: false    # true = cert/sandbox environment, false = production
+  # Symbols to stream volume delta for (must match contracts section above)
+  # These are resolved to DXLink streamer symbols via the REST API
+  delta_symbols:
+    - MNQ
+    - MES
+    - MGC
+  # Volume delta settings
+  filter_spread_legs: true   # Filter out spread leg trades from delta
+  session_reset_hour_et: 18  # Hour (ET) to reset CVD (18 = 6:00 PM ET = CME new session)
+
 indicators:
   defaults:
     sma_period: 20
