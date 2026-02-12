@@ -101,6 +101,8 @@ from .data_grabber import (
 from .tastytrade_service import TastyTradeService
 from .tastytrade_streaming import TastyTradeStreamer
 from .volume_delta import VolumeDeltaEngine, SessionResetScheduler
+from .tastytrade_bars import TastyTradeBarBuilder, TastyTradeBarManager
+from .tastytrade_historical import TastyTradeHistoricalFetcher
 
 # Configure logging
 logging.basicConfig(
@@ -141,6 +143,11 @@ tt_service: Optional[TastyTradeService] = None
 tt_streamer: Optional[TastyTradeStreamer] = None
 delta_engine: Optional[VolumeDeltaEngine] = None
 session_reset_scheduler: Optional[SessionResetScheduler] = None
+tt_bar_manager: Optional[TastyTradeBarManager] = None
+tt_historical: Optional[TastyTradeHistoricalFetcher] = None
+
+# Data source: "ib" (default) or "tastytrade"
+data_source: str = "ib"
 
 
 class ConnectionManager:
@@ -398,6 +405,150 @@ async def prefetch_all_tickers():
     logger.info(f"✓ Preloaded {total_bars:,} total bars into memory for instant switching")
 
 
+async def prefetch_all_tickers_tastytrade():
+    """
+    Pre-fetch historical data for all tickers from TastyTrade Candle events.
+
+    TastyTrade replacement for prefetch_all_tickers().
+    Uses DXLink Candle events with fromTime instead of IB historical data.
+    """
+    global preloaded_data
+    symbols = list(config.get('contracts', {}).keys()) or ['MNQ', 'MES', 'MGC']
+    duration = config['data']['default_duration']
+
+    for symbol in symbols:
+        try:
+            logger.info(f"Pre-fetching {symbol} from TastyTrade ({duration})...")
+
+            data = await tt_historical.fetch_recent(
+                symbol=symbol,
+                duration=duration,
+                cache_all_timeframes=True,
+            )
+
+            if data is not None and len(data) > 0:
+                logger.info(f"✓ {symbol}: {len(data)} total bars from TastyTrade")
+            else:
+                logger.warning(f"⚠ No data fetched for {symbol} from TastyTrade")
+
+        except Exception as e:
+            logger.error(f"Error pre-fetching {symbol} from TastyTrade: {e}")
+            continue
+
+    # Load ALL timeframes into memory (same logic as IB path)
+    logger.info("Loading all timeframes into memory...")
+    for symbol in symbols:
+        preloaded_data[symbol] = {}
+        for tf in TIMEFRAMES:
+            try:
+                tf_data = cache.load(symbol, bar_size=tf, max_age_hours=None)
+                if tf_data is not None and len(tf_data) > 0:
+                    records = tf_data.to_dict('records')
+                    preloaded_data[symbol][tf] = [
+                        {k: (int(v) if k in ('time', 'volume', 'buy_volume', 'sell_volume') else float(v))
+                         for k, v in row.items()}
+                        for row in records
+                    ]
+                    logger.info(f"  ✓ {symbol}/{tf}: {len(preloaded_data[symbol][tf])} bars")
+                else:
+                    preloaded_data[symbol][tf] = []
+                    logger.warning(f"  ⚠ {symbol}/{tf}: no data")
+            except Exception as e:
+                logger.error(f"  ✗ {symbol}/{tf}: error loading - {e}")
+                preloaded_data[symbol][tf] = []
+
+    total_bars = sum(
+        len(preloaded_data[s][tf])
+        for s in preloaded_data for tf in preloaded_data[s]
+    )
+    logger.info(f"✓ Preloaded {total_bars:,} bars into memory (data source: TastyTrade)")
+
+
+async def _start_background_streams_tastytrade():
+    """
+    Start TastyTrade live bar building for all symbols.
+
+    TastyTrade replacement for _start_background_streams().
+    Uses TastyTradeBarManager to build bars from TimeAndSale ticks,
+    feeding the same pipeline (preloaded_data, setup detectors, stats, WebSocket).
+    """
+    global _background_streams_active
+
+    await asyncio.sleep(3)
+
+    symbols = list(config.get('contracts', {}).keys()) or ['MNQ', 'MES', 'MGC']
+    logger.info(f"Starting TastyTrade background bar streams for: {symbols}")
+
+    for symbol in symbols:
+        try:
+            async def make_bg_callback(sym):
+                async def on_background_bar(bar_data: dict, is_new_bar: bool):
+                    # Update preloaded data
+                    if sym in preloaded_data and '1min' in preloaded_data[sym]:
+                        if is_new_bar:
+                            preloaded_data[sym]['1min'].append(bar_data)
+                        _update_higher_timeframes(sym, bar_data, is_new_bar)
+
+                    # Feed to stats tracker for bracket resolution
+                    if stats_manager and is_new_bar:
+                        stats_manager.update_pending_outcomes(
+                            symbol=sym,
+                            bar_time=bar_data.get('time', 0),
+                            price=bar_data.get('close', 0),
+                            bar_open=bar_data.get('open', 0),
+                            bar_high=bar_data.get('high', 0),
+                            bar_low=bar_data.get('low', 0),
+                        )
+
+                    # Run setup detectors
+                    if setup_manager and stats_manager and is_new_bar:
+                        try:
+                            signals = setup_manager.process_bar(bar_data)
+                            for sig in signals:
+                                stats_manager.process_setup_signal(sym, sig)
+                                await connection_manager.broadcast(sym, {
+                                    'type': 'setup_signal',
+                                    'signal': {
+                                        'setup_name': sig.setup_name,
+                                        'direction': sig.direction,
+                                        'entry_price': sig.entry_price,
+                                        'stop_price': sig.stop_price,
+                                        'target_price': sig.target_price,
+                                        'confidence': sig.confidence,
+                                        'reason': sig.reason,
+                                        'max_bars': sig.max_bars,
+                                        'bar_time': sig.bar_time,
+                                    },
+                                    'symbol': sym
+                                }, immediate=True)
+                        except Exception as e:
+                            logger.error(f"[BG-{sym}] Setup detector error: {e}", exc_info=True)
+
+                    # Broadcast to connected WebSocket clients
+                    await connection_manager.broadcast(sym, {
+                        'type': 'bar_update',
+                        'data': bar_data,
+                        'is_new_bar': is_new_bar,
+                        'symbol': sym
+                    }, immediate=True)
+
+                return on_background_bar
+
+            callback = await make_bg_callback(symbol)
+            success = tt_bar_manager.start_stream(symbol, callback)
+
+            if success:
+                _background_streams_active.add(symbol)
+                logger.info(f"✓ TastyTrade bar stream started for {symbol}")
+            else:
+                logger.error(f"✗ Failed to start TastyTrade bar stream for {symbol}")
+
+        except Exception as e:
+            logger.error(f"✗ Error starting TastyTrade bar stream for {symbol}: {e}", exc_info=True)
+
+    logger.info(f"TastyTrade background streams active: {_background_streams_active}")
+
+
 def initialize_pattern_engines():
     """
     Build DailyPatternEngine for each symbol from preloaded 1-min data.
@@ -601,6 +752,11 @@ async def _start_background_streams():
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown"""
     global ib_manager, realtime_manager, historical_fetcher, cache, indicator_manager
+    global data_source
+    global stats_manager, setup_manager
+    global pattern_task, background_stream_task
+    global tt_service, tt_streamer, delta_engine, session_reset_scheduler
+    global tt_bar_manager, tt_historical
 
     logger.info("Starting application...")
 
@@ -610,100 +766,185 @@ async def lifespan(app: FastAPI):
     # Initialize indicator manager
     indicator_manager = IndicatorManager()
 
-    # Connect to IB Gateway
-    ib_manager = IBConnectionManager(
-        host=config['ib_gateway']['host'],
-        port=config['ib_gateway']['port'],
-        client_id=config['ib_gateway']['client_id'],
-        timeout=config['ib_gateway']['timeout']
-    )
-
-    connected = await ib_manager.connect()
-
-    if not connected:
-        logger.error("Failed to connect to IB Gateway - application will not function")
-        # Continue anyway to allow health checks
-    else:
-        # Initialize real-time manager (use tick-by-tick with L2 data)
-        realtime_manager = RealtimeManager(
-            ib=ib_manager.ib,
-            use_tick_by_tick=True,  # User has CME Real-Time L2 subscription
-            bar_size_minutes=1
-        )
-
-        # Initialize historical data fetcher
-        historical_fetcher = HistoricalDataFetcher(
-            ib=ib_manager.ib,
-            cache=cache
-        )
-
-        # Pre-fetch all tickers at startup to avoid fetching on ticker switch
-        logger.info("Pre-fetching historical data for all tickers...")
-        await prefetch_all_tickers()
-
-        # Initialize pattern matching engines from preloaded data
-        logger.info("Initializing pattern matching engines...")
-        initialize_pattern_engines()
-
-        # Initialize stats tracking system
-        global stats_manager, setup_manager
-        stats_manager = StatsManager()
-        logger.info("✓ Stats tracking system initialized")
-
-        # Initialize setup detector manager
-        setup_manager = SetupManager()
-        setup_manager.register_all_defaults()
-        # Pre-seed with historical bars so confluence meters work immediately
-        if preloaded_data:
-            # Use MNQ 1min as primary seed (most active futures contract)
-            seed_symbol = 'MNQ' if 'MNQ' in preloaded_data else next(iter(preloaded_data), None)
-            if seed_symbol and '1min' in preloaded_data.get(seed_symbol, {}):
-                seed_bars = preloaded_data[seed_symbol]['1min']
-                # Take last 600 bars (or all if less)
-                setup_manager.seed_history(seed_bars[-600:])
-        logger.info(f"✓ Setup detector manager initialized ({len(setup_manager.detectors)} detectors)")
-
-        # Start pattern matching background loop
-        global pattern_task
-        pattern_task = asyncio.create_task(pattern_match_loop())
-
-        # Start background streams for all symbols — runs setup detectors
-        # and stats resolution continuously, independent of frontend connections
-        global background_stream_task
-        background_stream_task = asyncio.create_task(_start_background_streams())
-
-        logger.info("Application started successfully")
-
-    # Initialize TastyTrade volume delta streaming (runs alongside IB)
-    global tt_service, tt_streamer, delta_engine, session_reset_scheduler
+    # Determine data source from config
+    data_source = config.get('data', {}).get('source', 'ib')
     tt_config = config.get('tastytrade', {})
     tt_enabled = tt_config.get('enabled', False)
 
-    if tt_enabled:
-        logger.info("Initializing TastyTrade volume delta streaming...")
+    # If data_source is "tastytrade" but TastyTrade is not enabled, fall back to IB
+    if data_source == 'tastytrade' and not tt_enabled:
+        logger.warning(
+            "data.source=tastytrade but tastytrade.enabled=false. "
+            "Falling back to IB. Enable TastyTrade or set data.source=ib"
+        )
+        data_source = 'ib'
 
+    logger.info(f"Data source: {data_source}")
+
+    # ============================================================
+    # Initialize TastyTrade service (needed for both modes if enabled)
+    # ============================================================
+    if tt_enabled:
         tt_service = TastyTradeService(
             client_secret=tt_config.get('client_secret', ''),
             refresh_token=tt_config.get('refresh_token', ''),
             is_sandbox=tt_config.get('is_sandbox', False),
             enabled=True,
         )
-
         tt_authenticated = await tt_service.connect()
+    else:
+        tt_authenticated = False
 
-        if tt_authenticated:
-            # Create volume delta engine
+    # ============================================================
+    # DATA SOURCE: TastyTrade (replaces IB for historical + live)
+    # ============================================================
+    if data_source == 'tastytrade' and tt_authenticated:
+        logger.info("Using TastyTrade as primary data source (IB not required)")
+
+        # Historical data fetcher (replaces HistoricalDataFetcher)
+        tt_historical = TastyTradeHistoricalFetcher(
+            tastytrade_service=tt_service,
+            cache=cache,
+        )
+
+        # Resolve streamer symbols upfront
+        delta_symbols = tt_config.get('delta_symbols', ['MNQ', 'MES', 'MGC'])
+        await tt_service.resolve_streamer_symbols(delta_symbols)
+
+        # Pre-fetch historical candles
+        logger.info("Pre-fetching historical data from TastyTrade...")
+        await prefetch_all_tickers_tastytrade()
+
+        # Create streamer for live data
+        tt_streamer = TastyTradeStreamer(tt_service)
+
+        # Volume delta engine
+        delta_engine = VolumeDeltaEngine(bar_size_seconds=60)
+        for symbol in delta_symbols:
+            tt_streamer.register_tick_callback(symbol, delta_engine.process_tick)
+
+            # Register delta broadcast callback
+            async def _make_delta_broadcast(sym):
+                async def _on_delta_update(update):
+                    await connection_manager.broadcast(sym, {
+                        'type': 'delta_update',
+                        'symbol': sym,
+                        'data': {
+                            'bar_time': update.get('bar_time', 0),
+                            'buy_volume': update.get('buy_volume', 0),
+                            'sell_volume': update.get('sell_volume', 0),
+                            'delta': update.get('delta', 0),
+                            'cumulative_delta': update.get('cumulative_delta', 0),
+                            'trade_count': update.get('trade_count', 0),
+                            'last_price': update.get('last_price', 0),
+                            'last_side': update.get('last_side', ''),
+                        }
+                    }, immediate=True)
+                return _on_delta_update
+
+            delta_cb = await _make_delta_broadcast(symbol)
+            delta_engine.register_delta_callback(symbol, delta_cb)
+
+        # Bar manager (replaces RealtimeManager)
+        tt_bar_manager = TastyTradeBarManager(tt_streamer, bar_size_minutes=1)
+
+        # Start streaming (this starts the DXLink WebSocket)
+        await tt_streamer.start(delta_symbols)
+
+        # Session reset scheduler
+        session_reset_scheduler = SessionResetScheduler(delta_engine)
+        await session_reset_scheduler.start()
+
+        # Initialize pattern matching, stats, setup detectors
+        logger.info("Initializing pattern matching engines...")
+        initialize_pattern_engines()
+
+        stats_manager = StatsManager()
+        logger.info("✓ Stats tracking system initialized")
+
+        setup_manager = SetupManager()
+        setup_manager.register_all_defaults()
+        if preloaded_data:
+            seed_symbol = 'MNQ' if 'MNQ' in preloaded_data else next(iter(preloaded_data), None)
+            if seed_symbol and '1min' in preloaded_data.get(seed_symbol, {}):
+                setup_manager.seed_history(preloaded_data[seed_symbol]['1min'][-600:])
+        logger.info(f"✓ Setup detector manager initialized ({len(setup_manager.detectors)} detectors)")
+
+        pattern_task = asyncio.create_task(pattern_match_loop())
+
+        # Start TastyTrade background bar streams
+        background_stream_task = asyncio.create_task(_start_background_streams_tastytrade())
+
+        logger.info("Application started successfully (data source: TastyTrade)")
+
+    # ============================================================
+    # DATA SOURCE: IB (original path)
+    # ============================================================
+    else:
+        if data_source == 'tastytrade':
+            logger.error(
+                "TastyTrade auth failed - falling back to IB. "
+                "Check credentials in config.yaml"
+            )
+            data_source = 'ib'
+
+        # Connect to IB Gateway
+        ib_manager = IBConnectionManager(
+            host=config['ib_gateway']['host'],
+            port=config['ib_gateway']['port'],
+            client_id=config['ib_gateway']['client_id'],
+            timeout=config['ib_gateway']['timeout']
+        )
+
+        connected = await ib_manager.connect()
+
+        if not connected:
+            logger.error("Failed to connect to IB Gateway - application will not function")
+        else:
+            realtime_manager = RealtimeManager(
+                ib=ib_manager.ib,
+                use_tick_by_tick=True,
+                bar_size_minutes=1
+            )
+
+            historical_fetcher = HistoricalDataFetcher(
+                ib=ib_manager.ib,
+                cache=cache
+            )
+
+            logger.info("Pre-fetching historical data for all tickers...")
+            await prefetch_all_tickers()
+
+            logger.info("Initializing pattern matching engines...")
+            initialize_pattern_engines()
+
+            stats_manager = StatsManager()
+            logger.info("✓ Stats tracking system initialized")
+
+            setup_manager = SetupManager()
+            setup_manager.register_all_defaults()
+            if preloaded_data:
+                seed_symbol = 'MNQ' if 'MNQ' in preloaded_data else next(iter(preloaded_data), None)
+                if seed_symbol and '1min' in preloaded_data.get(seed_symbol, {}):
+                    setup_manager.seed_history(preloaded_data[seed_symbol]['1min'][-600:])
+            logger.info(f"✓ Setup detector manager initialized ({len(setup_manager.detectors)} detectors)")
+
+            pattern_task = asyncio.create_task(pattern_match_loop())
+
+            background_stream_task = asyncio.create_task(_start_background_streams())
+
+            logger.info("Application started successfully (data source: IB)")
+
+        # TastyTrade as supplemental delta overlay (if enabled and auth succeeded)
+        if tt_authenticated and data_source == 'ib':
+            logger.info("TastyTrade enabled as supplemental delta overlay...")
             delta_engine = VolumeDeltaEngine(bar_size_seconds=60)
-
-            # Create streamer
             tt_streamer = TastyTradeStreamer(tt_service)
 
-            # Register tick callbacks to feed the delta engine
             delta_symbols = tt_config.get('delta_symbols', ['MNQ', 'MES', 'MGC'])
             for symbol in delta_symbols:
                 tt_streamer.register_tick_callback(symbol, delta_engine.process_tick)
 
-                # Register delta callback to broadcast to WebSocket clients
                 async def _make_delta_broadcast(sym):
                     async def _on_delta_update(update):
                         await connection_manager.broadcast(sym, {
@@ -725,27 +966,16 @@ async def lifespan(app: FastAPI):
                 delta_cb = await _make_delta_broadcast(symbol)
                 delta_engine.register_delta_callback(symbol, delta_cb)
 
-            # Start streaming
             await tt_streamer.start(delta_symbols)
-
-            # Start session reset scheduler (resets CVD at CME session boundaries)
             session_reset_scheduler = SessionResetScheduler(delta_engine)
             await session_reset_scheduler.start()
 
+            logger.info(f"TastyTrade delta overlay active for: {', '.join(delta_symbols)}")
+        elif not tt_enabled:
             logger.info(
-                f"TastyTrade volume delta streaming active for: "
-                f"{', '.join(delta_symbols)}"
+                "TastyTrade integration disabled. "
+                "Set tastytrade.enabled=true in config.yaml to enable volume delta."
             )
-        else:
-            logger.warning(
-                "TastyTrade authentication failed - volume delta not available. "
-                "Check credentials in config.yaml"
-            )
-    else:
-        logger.info(
-            "TastyTrade integration disabled. "
-            "Set tastytrade.enabled=true in config.yaml to enable volume delta."
-        )
 
     yield
 
@@ -753,6 +983,9 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
 
     # Shutdown TastyTrade components
+    if tt_bar_manager:
+        tt_bar_manager.stop_all_streams()
+
     if session_reset_scheduler:
         await session_reset_scheduler.stop()
 
@@ -837,39 +1070,56 @@ async def health_check():
     """
     Health check endpoint.
 
-    Returns application health status including IB Gateway connection.
+    Returns application health status for the active data source.
     """
-    if not ib_manager:
+    if data_source == 'tastytrade':
+        # TastyTrade-primary mode
+        is_healthy = tt_service is not None and tt_service.is_authenticated()
+
+        status_code = 200 if is_healthy else 503
         return JSONResponse(
-            status_code=503,
+            status_code=status_code,
             content={
-                "status": "unhealthy",
-                "reason": "IB manager not initialized"
+                "status": "healthy" if is_healthy else "unhealthy",
+                "data_source": "tastytrade",
+                "tastytrade": tt_service.get_health_status() if tt_service else {"enabled": False},
+                "streaming": tt_streamer.get_statistics() if tt_streamer else {},
+                "cache_info": cache.get_cache_size() if cache else {},
             }
         )
+    else:
+        # IB-primary mode
+        if not ib_manager:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "data_source": "ib",
+                    "reason": "IB manager not initialized"
+                }
+            )
 
-    health = ib_manager.get_health_status()
+        health = ib_manager.get_health_status()
+        is_healthy = health.get('connected', False)
 
-    is_healthy = health.get('connected', False)
+        if 'data_stale' in health and health['data_stale']:
+            is_healthy = False
 
-    # Check data staleness if we have subscriptions
-    if 'data_stale' in health and health['data_stale']:
-        is_healthy = False
+        status_code = 200 if is_healthy else 503
 
-    status_code = 200 if is_healthy else 503
-
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "healthy" if is_healthy else "unhealthy",
-            "ib_gateway": health,
-            "realtime_streams": (
-                len(realtime_manager.streamers) if realtime_manager else 0
-            ),
-            "cache_info": cache.get_cache_size() if cache else {},
-            "tastytrade": tt_service.get_health_status() if tt_service else {"enabled": False},
-        }
-    )
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "status": "healthy" if is_healthy else "unhealthy",
+                "data_source": "ib",
+                "ib_gateway": health,
+                "realtime_streams": (
+                    len(realtime_manager.streamers) if realtime_manager else 0
+                ),
+                "cache_info": cache.get_cache_size() if cache else {},
+                "tastytrade": tt_service.get_health_status() if tt_service else {"enabled": False},
+            }
+        )
 
 
 @app.get("/api/contracts")

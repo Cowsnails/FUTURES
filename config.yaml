@@ -12,6 +12,9 @@ server:
   log_level: info
 
 data:
+  source: ib  # "ib" = Interactive Brokers (default), "tastytrade" = TastyTrade DXLink
+              # When "tastytrade": IB Gateway not required, all data comes from TastyTrade
+              # When "ib": IB Gateway for historical+live, TastyTrade optional for delta overlay
   cache_dir: C:\Users\jacem\Downloads\futures_data
   max_bars_in_memory: 10000
   cache_max_age_hours: 8760  # 365 days - keep data for a year
